@@ -4,13 +4,21 @@
 #include "core/evolve.hpp"
 #include "core/fft.hpp"
 #include "core/spectrum.hpp"
+#include "core/thread_pool.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
 
 namespace ocean {
 namespace {
+
+// Work below this many cells is faster on one thread than spread across
+// several; see the note in Impl's constructor and BENCHMARKS.md. It is a
+// measured heuristic, not a law - it trades a little throughput on very small
+// grids for never being slower than the serial path.
+constexpr std::size_t kMinCellsForThreading = 8192;
 
 constexpr bool is_power_of_two(std::uint32_t v) noexcept
 {
@@ -63,45 +71,175 @@ struct Ocean::Impl {
     detail::SpectrumTables spectrum;
     detail::FftPlan        plan;
     detail::FieldSet       fields;
+
+    // Scheduling. `dispatch` is the host hook when one was supplied and the
+    // built-in pool otherwise; there is deliberately no second code path, so
+    // the hook is exercised by every test run.
+    std::unique_ptr<detail::ThreadPool> pool;
+    ParallelForFn dispatch      = nullptr;
+    void*         dispatch_user = nullptr;
+    std::uint32_t task_count    = 1;
+
+    // One FFT scratch block per TASK INDEX, not per thread.
+    //
+    // We cannot know which thread a host scheduler will run a given task on,
+    // and we do not need to: two tasks with the same index never run
+    // concurrently, so indexing scratch by task index is sufficient and works
+    // with any scheduler. It also avoids thread_local, which would allocate
+    // lazily on first touch - inside the per-frame path.
     detail::AlignedBuffer<float> fft_scratch;
+    std::size_t                  scratch_stride = 0;
 
     // Public outputs, GPU-texture-shaped: 4 floats per cell.
     detail::AlignedBuffer<float> displacement;
     detail::AlignedBuffer<float> normal;
 
+    [[nodiscard]] float* scratch_for(std::uint32_t task) noexcept
+    {
+        return fft_scratch.data() +
+               static_cast<std::size_t>(task) * scratch_stride;
+    }
+
     explicit Impl(const OceanDesc& d)
         : desc(d),
           cells(static_cast<std::size_t>(d.size) * d.size),
           plan(d.size),
-          fft_scratch(plan.scratch_floats()),
           displacement(cells * 4),
           normal(cells * 4)
     {
         detail::build_spectrum(desc, spectrum);
         fields.allocate(d.size);
-    }
 
-    void run(double t) noexcept
-    {
-        const std::uint32_t n = desc.size;
+        // Work out the decomposition first, so we can decide whether a pool
+        // is worth creating at all.
+        unsigned workers = desc.thread_count;
+        if (workers == 0) workers = std::thread::hardware_concurrency();
+        if (workers == 0) workers = 1;
 
-        // 1. Advance every wavenumber to absolute time t and pack the eight
-        //    field spectra into four complex fields.
-        detail::evolve_rows(spectrum, t, fields, 0, n);
+        // Several tasks per worker so work stealing can even out the imbalance
+        // between fast and slow chunks. Capped at N because the evolve and
+        // finalise stages cannot be split finer than one row.
+        task_count = std::min(d.size, std::max(1u, workers * 4u));
 
-        // 2. Four inverse 2D transforms. No 1/N^2 normalisation: Tessendorf's
-        //    surface is literally the unnormalised inverse sum
-        //    h(x) = sum_k h(k) e^{i k.x}, and the spectrum amplitudes already
-        //    carry the correct physical scale.
-        for (int f = 0; f < 4; ++f) {
-            plan.transform_2d(fields.re(f), fields.im(f), fft_scratch.data(),
-                              detail::FftSign::Inverse);
+        // Below a threshold, run serially.
+        //
+        // A frame costs four dispatches and each is a real barrier. Measured
+        // on this machine, 64^2 got *slower* when threaded (0.243 ms serial vs
+        // 0.296 ms threaded): the condition-variable round trips cost more
+        // than the work they were distributing. 128^2 was 2.3x faster. The
+        // crossover sits between them, so we take the serial path below 8192
+        // cells.
+        //
+        // Results are bit-identical either way, so this is purely a
+        // performance switch and cannot change behaviour.
+        if (cells < kMinCellsForThreading) {
+            task_count = 1;
         }
 
-        // 3. Unpack, build the displaced-surface normal, the Jacobian and foam,
-        //    and write the interleaved output in one sweep.
-        detail::finalize_rows(fields, desc.choppiness, desc.foam_threshold,
-                              displacement.data(), normal.data(), 0, n);
+        if (desc.parallel_for != nullptr) {
+            // The host owns its threads; we just hand it work.
+            dispatch      = desc.parallel_for;
+            dispatch_user = desc.parallel_for_user;
+        } else if (task_count > 1) {
+            pool = std::make_unique<detail::ThreadPool>(desc.thread_count);
+            dispatch      = &detail::pool_dispatch;
+            dispatch_user = pool.get();
+        } else {
+            // No pool at all rather than a pool we would never dispatch to:
+            // spawning worker threads that only ever sleep still costs memory
+            // and scheduler attention.
+            dispatch      = &detail::serial_dispatch;
+            dispatch_user = nullptr;
+        }
+
+        scratch_stride = plan.scratch_floats();
+        fft_scratch = detail::AlignedBuffer<float>(
+            static_cast<std::size_t>(task_count) * scratch_stride);
+    }
+
+    // --- task entry points -------------------------------------------------
+    //
+    // Plain static functions, so they convert to the public TaskFn pointer type
+    // directly. State travels through the `ctx` pointer, exactly as it will
+    // have to across the C boundary.
+
+    struct StageCtx {
+        Impl*  self;
+        double t;
+    };
+
+    static void task_evolve(void* ctx, std::uint32_t i) noexcept
+    {
+        StageCtx& sc = *static_cast<StageCtx*>(ctx);
+        Impl& m = *sc.self;
+        std::uint32_t begin, end;
+        detail::chunk_range(i, m.task_count, m.desc.size, begin, end);
+        if (begin < end) {
+            detail::evolve_rows(m.spectrum, sc.t, m.fields, begin, end);
+        }
+    }
+
+    // The row pass is 4 fields x N rows of independent 1D transforms, so we
+    // flatten that into a single index space and chunk it once, rather than
+    // issuing four separate dispatches and paying four barriers.
+    static void task_fft_rows(void* ctx, std::uint32_t i) noexcept
+    {
+        Impl& m = *static_cast<StageCtx*>(ctx)->self;
+        const std::uint32_t n = m.desc.size;
+        std::uint32_t begin, end;
+        detail::chunk_range(i, m.task_count, 4u * n, begin, end);
+        float* scratch = m.scratch_for(i);
+        for (std::uint32_t idx = begin; idx < end; ++idx) {
+            const int         f   = static_cast<int>(idx / n);
+            const std::size_t off = static_cast<std::size_t>(idx % n) * n;
+            m.plan.transform(m.fields.re(f) + off, m.fields.im(f) + off, 1,
+                             scratch, detail::FftSign::Inverse);
+        }
+    }
+
+    static void task_fft_cols(void* ctx, std::uint32_t i) noexcept
+    {
+        Impl& m = *static_cast<StageCtx*>(ctx)->self;
+        const std::uint32_t n = m.desc.size;
+        std::uint32_t begin, end;
+        detail::chunk_range(i, m.task_count, 4u * n, begin, end);
+        float* scratch = m.scratch_for(i);
+        for (std::uint32_t idx = begin; idx < end; ++idx) {
+            const int         f = static_cast<int>(idx / n);
+            const std::size_t c = idx % n;
+            m.plan.transform(m.fields.re(f) + c, m.fields.im(f) + c,
+                             static_cast<std::ptrdiff_t>(n), scratch,
+                             detail::FftSign::Inverse);
+        }
+    }
+
+    static void task_finalize(void* ctx, std::uint32_t i) noexcept
+    {
+        Impl& m = *static_cast<StageCtx*>(ctx)->self;
+        std::uint32_t begin, end;
+        detail::chunk_range(i, m.task_count, m.desc.size, begin, end);
+        if (begin < end) {
+            detail::finalize_rows(m.fields, m.desc.choppiness,
+                                  m.desc.foam_threshold, m.displacement.data(),
+                                  m.normal.data(), begin, end);
+        }
+    }
+
+    void run(double t)
+    {
+        StageCtx ctx{this, t};
+
+        // Four dispatches, four barriers. The barriers are real data
+        // dependencies, not caution: the column pass reads what the row pass
+        // wrote, and finalisation reads what the column pass wrote. Because
+        // each stage is a pure function of the previous stage's COMPLETE
+        // output, the result cannot depend on how the scheduler interleaved
+        // anything - which is what keeps determinism intact under someone
+        // else's job system.
+        dispatch(dispatch_user, &task_evolve,    &ctx, task_count);
+        dispatch(dispatch_user, &task_fft_rows,  &ctx, task_count);
+        dispatch(dispatch_user, &task_fft_cols,  &ctx, task_count);
+        dispatch(dispatch_user, &task_finalize,  &ctx, task_count);
 
         time = t;
     }

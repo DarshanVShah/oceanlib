@@ -22,6 +22,7 @@ add_library(ocean STATIC
   src/core/fft.cpp
   src/core/spectrum.cpp
   src/core/evolve.cpp
+  src/core/thread_pool.cpp
   src/ocean.cpp
 )
 add_library(ocean::ocean ALIAS ocean)

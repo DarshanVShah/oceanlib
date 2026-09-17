@@ -661,3 +661,76 @@ would invent a flat shelf outside the patch. A test checks that
 Normals are renormalised after interpolation: bilinear blending of unit vectors
 does not preserve length, and a renderer that skipped this would show darkened
 bands between texels.
+
+---
+
+## ADR-012 — Threading: implementation
+
+### One dispatch path, not two
+
+The built-in pool is plugged in through a `pool_dispatch` adapter with exactly
+the public `ParallelForFn` signature, and `run()` calls `dispatch(...)` with no
+idea which it is using. There is deliberately no "if we own the threads" branch.
+That means the host-scheduler hook is exercised by every test run and every
+benchmark, rather than being a lightly-tested side path that breaks the first
+time an engine actually uses it.
+
+### Four dispatches, four barriers
+
+```
+evolve  ->  FFT rows  ->  FFT columns  ->  finalise
+```
+
+The barriers are real data dependencies, not caution: the column pass reads
+what the row pass wrote, and finalisation reads what the column pass wrote.
+Because each stage is a pure function of the previous stage's **complete**
+output, the result cannot depend on how the scheduler interleaved anything.
+
+The FFT row pass is `4 fields x N rows` of independent 1D transforms, flattened
+into one index space and chunked once, rather than four separate dispatches
+paying four extra barriers.
+
+### Scratch is indexed by task index, not by thread
+
+We cannot know which thread a host scheduler will run a given task on. We do
+not need to: two tasks with the same index never run concurrently, so one
+scratch block per task index is sufficient and works with any scheduler.
+
+The alternative, `thread_local`, would allocate lazily on first touch — inside
+the per-frame path, violating the no-allocation rule the first time a new
+thread picked up work.
+
+### The serial threshold, and why it exists
+
+An earlier build threaded unconditionally, and 64² got **slower**: 0.243 ms
+serial against 0.296 ms threaded. Four condition-variable round trips cost more
+than the work they were distributing. Below 8192 cells the library now runs
+serially, through a `serial_dispatch` function so `run()` still needs no branch,
+and it does not create a thread pool it would never dispatch to.
+
+8192 is a measured heuristic for this machine, not a law: 64² (4096 cells) lost,
+128² (16384 cells) won by 2.3x. The principle is the defensible part —
+*threading must never make things worse* — and a threshold is the cheapest way
+to guarantee it.
+
+### Verification
+
+Determinism under threading is not assumed, it is tested from three directions:
+
+1. **Bit-identical across thread counts** — 1, 2, 3, 4, 8, 16, 32 workers all
+   produce byte-equal buffers.
+2. **A reverse-order hook.** A host scheduler that runs indices from `count-1`
+   down to `0` still satisfies the contract, and must give identical results.
+   This is sharper than a serial hook: it proves there is no hidden dependency
+   on task ordering.
+3. **A chaotic hook** that scatters indices across raw `std::thread`s in
+   whatever order they win the race, repeated across frames.
+
+Plus the pool's own contract: every index runs exactly once, and `parallel_for`
+does not return until every slot has been written.
+
+### Measured
+
+512²: **25.6 ms serial → 2.92 ms threaded, 8.76x.** Full table in
+BENCHMARKS.md, including why 8.76x rather than 28x (memory-bound workload,
+hybrid P/E core CPU, hyperthreading, and four barriers per frame).
