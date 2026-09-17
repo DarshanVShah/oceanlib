@@ -823,3 +823,85 @@ It is written, reviewed and structurally identical to the SSE2 kernel, but it
 has never been executed: the development machine is x86-64. The bit-exactness
 test will validate it the first time the suite runs on ARM hardware, and *that
 run* is what should be trusted — not the code review.
+
+---
+
+## ADR-014 — The C API
+
+### The handle is the C++ object
+
+`ocean_sim` is declared but never defined, and the implementation is a
+`reinterpret_cast` to `ocean::Ocean`. No wrapper struct, no extra allocation,
+no indirection. This is the payoff of ADR-005: because the C++ class is already
+a single pimpl pointer, the C API costs nothing on top of it.
+
+### No exception may cross the boundary
+
+Every entry point catches. `std::invalid_argument` becomes a null handle plus
+`OCEAN_ERROR_INVALID_ARG`, `std::bad_alloc` becomes `OCEAN_ERROR_OUT_OF_MEMORY`,
+and a catch-all covers the rest.
+
+The catch-all is not defensive padding — it is mandatory. Letting an exception
+unwind through a C caller's frame is undefined behaviour, and a Rust or C#
+caller has no way to catch one regardless.
+
+`ocean_create` returns the handle rather than a status, with the status as an
+optional out-parameter. That keeps the common path terse while still letting a
+caller that cares distinguish a bad descriptor from an allocation failure.
+
+### `struct_size` is the version tag
+
+`ocean_desc` starts with `size_t struct_size`, which the caller sets to
+`sizeof(ocean_desc)`.
+
+Without it, adding one field to the descriptor would make the library read past
+the end of an older caller's smaller allocation — garbage at best, a page fault
+at worst — and the only fix would be recompiling every binding in the world
+against the new header. With it, the library copies exactly the bytes the
+caller provided and leaves its own defaults in the rest, so an old binary keeps
+working against a new shared library.
+
+A `struct_size` **larger** than we know about is an error, not a truncation:
+that caller was built against a newer header, we cannot guess what the extra
+fields mean, and silently ignoring a field the caller believes it set would be
+worse than refusing.
+
+Tested with a `LegacyDesc` that models the struct as it stood before the
+threading fields existed, and requires it to produce byte-identical output to a
+current caller using defaults.
+
+### Defaults are read, not duplicated
+
+`ocean_desc_init` fills from a default-constructed `ocean::OceanDesc` rather
+than restating the numbers. Duplicated defaults are a classic source of silent
+divergence between an API and its wrapper, and a test pins every field.
+
+### Callback types are layout-identical by construction
+
+`ocean_parallel_for_fn` and `ocean::ParallelForFn` are the same signature, so
+the translation is a `reinterpret_cast` and a host scheduler pays no trampoline
+on the hot path. A test checks that a hook supplied through the C API gives
+byte-identical results to the built-in pool.
+
+### Null handles are tolerated everywhere
+
+`ocean_destroy(NULL)` is a no-op like `free()`, and every accessor returns a
+sane zero value. Bindings in other languages routinely call into a handle that
+failed to construct; crashing inside the library turns a caller-side bug into a
+support ticket.
+
+### The header is compiled as real C
+
+`tests/c_header_check.c` is built by the **C** compiler and linked against the
+C++ objects. The value is in the build, not the assertions: a "C API" header
+that is only ever included from C++ drifts into C++-only constructs within a
+release or two, and an `extern "C"` that goes missing shows up as a link error
+here rather than in a user's project.
+
+### Verification
+
+The load-bearing test compares the C and C++ APIs with `memcmp` across several
+times, plus direct comparison of query results. Anything that changed the
+numbers — a float narrowed somewhere, a defaulted field diverging — would mean
+bindings quietly simulate a *different ocean* from the C++ API, which is the
+kind of discrepancy nobody finds for months.

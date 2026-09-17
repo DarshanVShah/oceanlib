@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(oceanlib VERSION 0.1.0 LANGUAGES CXX)
+project(oceanlib VERSION 0.1.0 LANGUAGES CXX C)
 
 option(OCEAN_BUILD_TESTS    "Build oceanlib tests"      ON)
 option(OCEAN_BUILD_BENCH    "Build oceanlib benchmarks" ON)
@@ -29,6 +29,7 @@ add_library(ocean STATIC
   src/core/evolve.cpp
   src/core/thread_pool.cpp
   src/ocean.cpp
+  src/c_api.cpp
 )
 add_library(ocean::ocean ALIAS ocean)
 

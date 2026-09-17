@@ -18,12 +18,21 @@ add_executable(ocean_tests
   test_query.cpp
   test_threading.cpp
   test_simd.cpp
+  test_c_api.cpp
+  c_header_check.c
 )
 target_link_libraries(ocean_tests PRIVATE ocean doctest::doctest)
 target_include_directories(ocean_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# The C file is built as C on purpose: a "C API" header that is only ever
+# included from C++ drifts into C++-only constructs within a release or two.
+set_source_files_properties(c_header_check.c PROPERTIES LANGUAGE C)
+
 if(MSVC)
-  target_compile_options(ocean_tests PRIVATE /W4 /permissive- /fp:precise)
+  target_compile_options(ocean_tests PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:/W4> $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+    $<$<COMPILE_LANGUAGE:CXX>:/fp:precise>
+    $<$<COMPILE_LANGUAGE:C>:/W4>)
 else()
   target_compile_options(ocean_tests PRIVATE -Wall -Wextra -fno-fast-math -ffp-contract=off)
 endif()
