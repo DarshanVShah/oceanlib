@@ -20,6 +20,11 @@ endif()
 add_library(ocean STATIC
   src/core/rng.cpp
   src/core/fft.cpp
+  src/core/cpu_features.cpp
+  src/core/fft_kernel_scalar.cpp
+  src/core/fft_kernel_sse2.cpp
+  src/core/fft_kernel_avx2.cpp
+  src/core/fft_kernel_neon.cpp
   src/core/spectrum.cpp
   src/core/evolve.cpp
   src/core/thread_pool.cpp
@@ -33,6 +38,22 @@ target_include_directories(ocean
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_features(ocean PUBLIC cxx_std_20)
+
+# The AVX2 kernel is the only file built with AVX2 enabled. Everything else
+# stays at the architectural baseline, so the binary still boots on a CPU
+# without AVX2 and reaches this code only through the runtime dispatch in
+# cpu_features.cpp. Compiling the whole library with /arch:AVX2 would let the
+# compiler emit AVX2 anywhere it liked and produce a binary that crashes on
+# older hardware - which would break promise #1.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|i[3-6]86|X86)")
+  if(MSVC)
+    set_source_files_properties(src/core/fft_kernel_avx2.cpp
+      PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  else()
+    set_source_files_properties(src/core/fft_kernel_avx2.cpp
+      PROPERTIES COMPILE_OPTIONS "-mavx2")
+  endif()
+endif()
 
 # Determinism policy: strict IEEE semantics, never fast-math. Reassociation or
 # contraction of float ops would make results depend on compiler version and

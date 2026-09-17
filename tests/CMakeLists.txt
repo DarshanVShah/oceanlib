@@ -17,6 +17,7 @@ add_executable(ocean_tests
   test_simulation.cpp
   test_query.cpp
   test_threading.cpp
+  test_simd.cpp
 )
 target_link_libraries(ocean_tests PRIVATE ocean doctest::doctest)
 target_include_directories(ocean_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

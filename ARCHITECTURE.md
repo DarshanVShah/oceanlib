@@ -734,3 +734,92 @@ does not return until every slot has been written.
 512²: **25.6 ms serial → 2.92 ms threaded, 8.76x.** Full table in
 BENCHMARKS.md, including why 8.76x rather than 28x (memory-bound workload,
 hybrid P/E core CPU, hyperthreading, and four barriers per frame).
+
+---
+
+## ADR-013 — SIMD: runtime dispatch, and bit-exactness as a hard requirement
+
+### One binary, runtime dispatch
+
+The library ships scalar, SSE2, AVX2 and NEON stage kernels and chooses at
+startup via CPUID. Promise #1 is "runs on anything", which rules out asking
+users to build a separate binary per instruction set.
+
+Only `fft_kernel_avx2.cpp` is compiled with `/arch:AVX2` (or `-mavx2`);
+everything else stays at the architectural baseline. Compiling the whole
+library with AVX2 enabled would let the compiler emit AVX2 anywhere it liked,
+including in the startup path, producing a binary that crashes on older
+hardware before it ever reaches the dispatch.
+
+**The OSXSAVE/XGETBV check is not optional.** A CPU can report AVX2 support
+while the OS does not save and restore the upper halves of the YMM registers
+across a context switch. Using them then silently corrupts state on
+preemption — rare, irreproducible garbage. We check XCR0 bits 1 and 2 before
+believing the CPUID feature bit.
+
+SSE2 needs no detection (it is part of x86-64) and neither does NEON (mandatory
+on AArch64).
+
+### Bit-exactness is part of the kernel contract
+
+Every kernel must match `stage_scalar` **to the last bit**, not merely closely.
+That forbids FMA, forbids reassociation, and requires the same operations in
+the same order — just several lanes at a time.
+
+The FMA point is the counter-intuitive one: `fmsub` would be *more* accurate
+than separate multiply and subtract, because it rounds once instead of twice.
+That is exactly why it is banned. If the vector path were more accurate than
+the scalar path, the ocean a player sees would depend on which CPU rendered it,
+and promise #3 would quietly degrade to "deterministic per machine".
+
+Enforced by a test that `memcmp`s scalar against every kernel in the build, at
+every stage and every value of `s`, across sizes from 2 to 1024. It passes on
+MSVC with `/fp:precise`, which confirms MSVC does not contract intrinsics into
+FMA — something worth verifying rather than assuming.
+
+### Measure before concluding
+
+The first AVX2 build sped the FFT up by only 1.62x, far short of the 8x the
+vector width suggests. Timing the row and column passes separately showed the
+column pass gaining just 1.27x against the row pass's 1.66x, despite running
+identical butterfly code — so the difference had to be memory access, not
+arithmetic.
+
+The column pass walks with stride N. Gathering one column touched a separate
+cache line per element and used 4 bytes of each 64-byte line.
+
+### The fix: batch 8 adjacent columns
+
+Transforming 8 columns side by side makes each element 8 contiguous floats, so
+a fetched cache line is fully used. It also fixes the second problem for free:
+batching multiplies the memory stride by 8, so `s >= 8` from the first stage,
+and the three early stages that previously fell back to scalar (s = 1, 2, 4,
+all below the vector width) now vectorise like the rest.
+
+The elegant part is that **no new kernel was needed**. Batching B interleaved
+sequences multiplies every address by B while the twiddles, which depend only
+on position within a sequence, stay put. Splitting the *memory* stride from the
+*logical* twiddle step was the entire change — one extra parameter — and the
+same kernel now serves both the single-sequence row pass and the batched column
+pass.
+
+FFT: 11.974 ms to 7.071 ms serial at 512², a further 1.69x. Overall 512²
+threaded went 23.620 ms (scalar, single-threaded) to **1.913 ms**, 12.3x.
+
+### What is left, measured rather than guessed
+
+At 512² the serial split is now evolve 5.33 ms (40%), FFT 7.07 ms (53%),
+finalise 0.62 ms (5%). Spectrum evolution is still entirely scalar: one `sinf`
+and one `cosf` per cell, 262 144 of each per frame.
+
+A vectorised polynomial sine/cosine is the obvious next step, and it carries a
+second benefit — a polynomial we evaluate ourselves is bit-identical on every
+platform, where libm is not. That would close the last cross-runtime
+determinism gap noted in ADR-003.
+
+### The NEON kernel is unverified
+
+It is written, reviewed and structurally identical to the SSE2 kernel, but it
+has never been executed: the development machine is x86-64. The bit-exactness
+test will validate it the first time the suite runs on ARM hardware, and *that
+run* is what should be trusted — not the code review.

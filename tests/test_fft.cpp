@@ -22,7 +22,7 @@ struct Field {
         : n(size),
           re(static_cast<std::size_t>(size) * size, 0.0f),
           im(static_cast<std::size_t>(size) * size, 0.0f),
-          scratch(4u * static_cast<std::size_t>(size), 0.0f)
+          scratch(4u * static_cast<std::size_t>(size) * kColumnBatch, 0.0f)
     {}
 };
 
@@ -52,7 +52,7 @@ TEST_CASE("forward transform of a pure exponential lands entirely in one bin")
     constexpr std::uint32_t n  = 64;
     constexpr std::uint32_t k0 = 7;
 
-    std::vector<float> re(n), im(n), scratch(4 * n);
+    std::vector<float> re(n), im(n), scratch(4 * n * kColumnBatch);
     for (std::uint32_t j = 0; j < n; ++j) {
         const double a = refdft::kTwoPi * k0 * j / n;
         re[j] = static_cast<float>(std::cos(a));
@@ -73,7 +73,7 @@ TEST_CASE("an impulse transforms to a constant, and a constant to an impulse")
 {
     constexpr std::uint32_t n = 32;
     FftPlan plan{n};
-    std::vector<float> scratch(4 * n);
+    std::vector<float> scratch(4 * n * kColumnBatch);
 
     SUBCASE("impulse -> constant") {
         std::vector<float> re(n, 0.0f), im(n, 0.0f);
@@ -103,7 +103,7 @@ TEST_CASE("1D FFT matches the naive DFT")
 {
     for (std::uint32_t n : {2u, 4u, 8u, 16u, 32u, 64u, 128u, 256u}) {
         CAPTURE(n);
-        std::vector<float> re(n), im(n), scratch(4 * n);
+        std::vector<float> re(n), im(n), scratch(4 * n * kColumnBatch);
         fill_random(re, im, 0xC0FFEEu + n);
 
         const std::vector<float> in_re = re;
@@ -176,7 +176,7 @@ TEST_CASE("forward then inverse recovers N*x in 1D")
 {
     for (std::uint32_t n : {8u, 64u, 512u}) {
         CAPTURE(n);
-        std::vector<float> re(n), im(n), scratch(4 * n);
+        std::vector<float> re(n), im(n), scratch(4 * n * kColumnBatch);
         fill_random(re, im, 4242u + n);
         const std::vector<float> in_re = re, in_im = im;
 
@@ -261,7 +261,7 @@ TEST_CASE("the transform is linear")
 {
     constexpr std::uint32_t n = 64;
     FftPlan plan{n};
-    std::vector<float> scratch(4 * n);
+    std::vector<float> scratch(4 * n * kColumnBatch);
 
     std::vector<float> ar(n), ai(n), br(n), bi(n);
     fill_random(ar, ai, 11u);
@@ -291,7 +291,7 @@ TEST_CASE("strided transforms agree bit-for-bit with contiguous ones")
     // code, the results must be identical, not merely close.
     constexpr std::uint32_t n = 64;
     FftPlan plan{n};
-    std::vector<float> scratch(4 * n);
+    std::vector<float> scratch(4 * n * kColumnBatch);
 
     std::vector<float> re(n), im(n);
     fill_random(re, im, 9090u);

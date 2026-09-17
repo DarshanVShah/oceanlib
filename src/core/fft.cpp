@@ -6,7 +6,10 @@
 
 namespace ocean::detail {
 
-FftPlan::FftPlan(std::uint32_t n) : n_(n)
+FftPlan::FftPlan(std::uint32_t n) : FftPlan(n, detect_simd_level()) {}
+
+FftPlan::FftPlan(std::uint32_t n, SimdLevel level)
+    : n_(n), level_(level), kernel_(select_stage_kernel(level))
 {
     if (n == 0 || (n & (n - 1)) != 0) {
         throw std::invalid_argument("FftPlan: size must be a power of two");
@@ -59,34 +62,13 @@ void FftPlan::transform(float* re, float* im, std::ptrdiff_t stride,
     // stage. Reading from x and writing to y (then swapping) is what removes
     // the bit-reversal pass: the permutation is folded into the write indices
     // 2p and 2p+1, and both the read and the write walk memory sequentially in
-    // q - which is the property that lets a SIMD version load whole vectors.
+    // q - which is the property that lets the SIMD kernels load whole vectors.
+    //
+    // The per-stage work lives behind `kernel_`, chosen once when the plan was
+    // built. Every kernel is required to be bit-identical to the scalar one,
+    // so this dispatch changes speed and nothing else.
     for (std::uint32_t len = n, s = 1; len > 1; len >>= 1, s <<= 1) {
-        const std::uint32_t m = len >> 1;
-        for (std::uint32_t p = 0; p < m; ++p) {
-            const float wr = twr[static_cast<std::size_t>(p) * s];
-            const float wi = twi[static_cast<std::size_t>(p) * s];
-
-            const std::uint32_t src0 = s * p;
-            const std::uint32_t src1 = s * (p + m);
-            const std::uint32_t dst0 = s * (2u * p);
-            const std::uint32_t dst1 = s * (2u * p + 1u);
-
-            for (std::uint32_t q = 0; q < s; ++q) {
-                const float ar = xr[src0 + q];
-                const float ai = xi[src0 + q];
-                const float br = xr[src1 + q];
-                const float bi = xi[src1 + q];
-
-                // Sum leg needs no twiddle; difference leg is rotated by w.
-                yr[dst0 + q] = ar + br;
-                yi[dst0 + q] = ai + bi;
-
-                const float dr = ar - br;
-                const float di = ai - bi;
-                yr[dst1 + q] = dr * wr - di * wi;
-                yi[dst1 + q] = dr * wi + di * wr;
-            }
-        }
+        kernel_(xr, xi, yr, yi, twr, twi, len, s, s);
         std::swap(xr, yr);
         std::swap(xi, yi);
     }
@@ -110,13 +92,78 @@ void FftPlan::transform_row_range(float* re, float* im, std::uint32_t begin,
     }
 }
 
+void FftPlan::transform_batch(float* re, float* im, std::ptrdiff_t stride,
+                              std::uint32_t batch, float* scratch,
+                              FftSign sign) const noexcept
+{
+    const std::uint32_t n = n_;
+    const std::size_t   lanes = static_cast<std::size_t>(batch);
+    const std::size_t   span  = static_cast<std::size_t>(n) * lanes;
+
+    float* a_re = scratch;
+    float* a_im = scratch + span;
+    float* b_re = scratch + 2u * span;
+    float* b_im = scratch + 3u * span;
+
+    // Gather: element j of every sequence in the batch, side by side. Each
+    // inner run is contiguous in memory, so a whole cache line gets used
+    // instead of one float out of sixteen.
+    for (std::uint32_t j = 0; j < n; ++j) {
+        const float* src_re = re + static_cast<std::ptrdiff_t>(j) * stride;
+        const float* src_im = im + static_cast<std::ptrdiff_t>(j) * stride;
+        float* dst_re = a_re + static_cast<std::size_t>(j) * lanes;
+        float* dst_im = a_im + static_cast<std::size_t>(j) * lanes;
+        for (std::uint32_t c = 0; c < batch; ++c) {
+            dst_re[c] = src_re[c];
+            dst_im[c] = src_im[c];
+        }
+    }
+
+    const float* twr = tw_re_.data();
+    const float* twi = (sign == FftSign::Forward) ? tw_im_fwd_.data()
+                                                  : tw_im_inv_.data();
+
+    float* xr = a_re;
+    float* xi = a_im;
+    float* yr = b_re;
+    float* yi = b_im;
+
+    // Identical Stockham schedule, with every address scaled by `batch`. The
+    // twiddle step stays unscaled because a twiddle depends only on the
+    // position within a sequence, not on which lane of the batch it is.
+    for (std::uint32_t len = n, s = 1; len > 1; len >>= 1, s <<= 1) {
+        kernel_(xr, xi, yr, yi, twr, twi, len, s * batch, s);
+        std::swap(xr, yr);
+        std::swap(xi, yi);
+    }
+
+    for (std::uint32_t j = 0; j < n; ++j) {
+        float* dst_re = re + static_cast<std::ptrdiff_t>(j) * stride;
+        float* dst_im = im + static_cast<std::ptrdiff_t>(j) * stride;
+        const float* src_re = xr + static_cast<std::size_t>(j) * lanes;
+        const float* src_im = xi + static_cast<std::size_t>(j) * lanes;
+        for (std::uint32_t c = 0; c < batch; ++c) {
+            dst_re[c] = src_re[c];
+            dst_im[c] = src_im[c];
+        }
+    }
+}
+
 void FftPlan::transform_col_range(float* re, float* im, std::uint32_t begin,
                                   std::uint32_t end, float* scratch,
                                   FftSign sign) const noexcept
 {
     const std::ptrdiff_t n = static_cast<std::ptrdiff_t>(n_);
-    for (std::uint32_t c = begin; c < end; ++c) {
-        transform(re + c, im + c, n, scratch, sign);
+
+    std::uint32_t c = begin;
+    for (; c + kColumnBatch <= end; c += kColumnBatch) {
+        transform_batch(re + c, im + c, n, kColumnBatch, scratch, sign);
+    }
+    // Remainder, when the caller's range is not a multiple of the batch.
+    // Handled by the same batched routine with a smaller batch rather than by
+    // a second code path, so there is only one thing to get right.
+    if (c < end) {
+        transform_batch(re + c, im + c, n, end - c, scratch, sign);
     }
 }
 

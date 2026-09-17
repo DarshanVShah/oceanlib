@@ -104,3 +104,75 @@ noise), which is the correct outcome: threading should never make things worse.
 single-threaded baseline above, as they should be - threading moves the wall
 clock, not the arithmetic. The FFT is still ~75% of the work, so it remains
 the target for SIMD.
+
+---
+
+## SIMD (AVX2) + multithreaded
+
+Measured 2026-09-17, same settings. Detected SIMD level: AVX2.
+
+| N     | serial (ms) | threaded (ms) | speedup | evolve (ms) | FFT (ms) | finalise (ms) | Mcell/s |
+|------:|------------:|--------------:|--------:|------------:|---------:|--------------:|--------:|
+| 64x   |       0.178 |         0.179 |   0.99x |       0.083 |    0.091 |         0.009 |    22.8 |
+| 128x  |       0.726 |         0.386 |   1.88x |       0.352 |    0.345 |         0.037 |    42.5 |
+| 256x  |       2.980 |         0.588 |   5.07x |       1.335 |    1.485 |         0.150 |   111.4 |
+| 512x  |      13.371 |         1.913 |   6.99x |       5.334 |    7.071 |         0.623 |   137.0 |
+
+### Progress at 512 squared
+
+| build                          | serial (ms) | threaded (ms) |
+|--------------------------------|------------:|--------------:|
+| scalar, single-threaded        |      23.620 |             - |
+| scalar + threads               |      25.558 |         2.919 |
+| AVX2 (naive) + threads         |      18.301 |         2.422 |
+| AVX2 + batched columns + threads |    13.371 |     **1.913** |
+
+**12.3x overall from where we started.** The FFT stage went 17.176 ms to
+7.071 ms serial, a 2.43x improvement.
+
+### Why AVX2 gave 1.62x, not 8x - and what fixed it
+
+The first AVX2 build sped the FFT up by only 1.62x. Rather than accept that,
+the row and column passes were timed separately, per field, at 512 squared:
+
+| pass    | scalar | AVX2 (naive) | gain  |
+|---------|-------:|-------------:|------:|
+| rows    | 1.608  |        0.970 | 1.66x |
+| columns | 2.632  |        2.074 | 1.27x |
+
+The butterflies are the same code in both passes, so the difference had to be
+memory access. The column pass walks with stride N - 2 KB at 512 squared - so
+gathering one column touched a separate cache line for every one of its N
+elements, used 4 bytes of each 64-byte line, and could not be vectorised at all.
+
+**The fix: transform 8 adjacent columns at once.** Each element then becomes 8
+contiguous floats, so a fetched cache line is actually used. It also removes
+the other weakness: batching multiplies the memory stride by 8, so the stride
+is at least 8 from the very first stage, and the three early stages that
+previously fell back to scalar (s = 1, 2, 4 are below the 8-float vector width)
+now vectorise like the rest.
+
+One kernel serves both cases. The only change needed was splitting the
+*memory* stride from the *logical* twiddle step, because a twiddle depends on
+position within a sequence and not on which lane of the batch it sits in.
+
+Result: FFT 11.974 ms to 7.071 ms serial, a further 1.69x.
+
+### A bug the benchmark caught
+
+Immediately after the batching landed, the stage columns summed to 12.9 ms
+while the serial total read 18.2 ms. The 5.3 ms gap was real: the threaded
+pipeline's column task still called the single-column `transform()`, so only
+the benchmark's own `transform_2d` path was using the batched routine. The
+arithmetic not adding up is what exposed it - a reason to print a stage
+breakdown rather than one total.
+
+### Where the time goes now
+
+At 512 squared, serial: **evolve 5.33 ms (40%)**, FFT 7.07 ms (53%),
+finalise 0.62 ms (5%). Spectrum evolution is now the largest single stage per
+unit of remaining opportunity, and it is still entirely scalar - one `sinf` and
+one `cosf` per cell, 262 144 of each per frame. A vectorised polynomial
+sine/cosine is the next lever, and it would also close the cross-runtime
+determinism gap from ADR-003, since a polynomial we evaluate ourselves is
+bit-identical everywhere while libm is not.

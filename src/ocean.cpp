@@ -197,19 +197,26 @@ struct Ocean::Impl {
         }
     }
 
+    // Columns are transformed in groups of kColumnBatch, so the index space
+    // here is 4 fields x (N / kColumnBatch) groups rather than 4 x N columns.
+    // N is a power of two of at least 16 and the batch is 8, so the division
+    // is always exact and there is never a partial group to special-case.
     static void task_fft_cols(void* ctx, std::uint32_t i) noexcept
     {
         Impl& m = *static_cast<StageCtx*>(ctx)->self;
-        const std::uint32_t n = m.desc.size;
+        const std::uint32_t n      = m.desc.size;
+        const std::uint32_t groups = n / detail::kColumnBatch;
         std::uint32_t begin, end;
-        detail::chunk_range(i, m.task_count, 4u * n, begin, end);
+        detail::chunk_range(i, m.task_count, 4u * groups, begin, end);
         float* scratch = m.scratch_for(i);
         for (std::uint32_t idx = begin; idx < end; ++idx) {
-            const int         f = static_cast<int>(idx / n);
-            const std::size_t c = idx % n;
-            m.plan.transform(m.fields.re(f) + c, m.fields.im(f) + c,
-                             static_cast<std::ptrdiff_t>(n), scratch,
-                             detail::FftSign::Inverse);
+            const int         f = static_cast<int>(idx / groups);
+            const std::size_t c =
+                static_cast<std::size_t>(idx % groups) * detail::kColumnBatch;
+            m.plan.transform_batch(m.fields.re(f) + c, m.fields.im(f) + c,
+                                   static_cast<std::ptrdiff_t>(n),
+                                   detail::kColumnBatch, scratch,
+                                   detail::FftSign::Inverse);
         }
     }
 
