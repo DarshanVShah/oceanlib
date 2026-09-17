@@ -70,6 +70,32 @@ inline double next_open01(Pcg32& rng) noexcept
     return (static_cast<double>(next_u32(rng)) + 0.5) * (1.0 / 4294967296.0);
 }
 
+// SplitMix64 finaliser (Steele et al. 2014). Used to derive independent
+// per-row seeds from one user seed.
+//
+// We deliberately do NOT use PCG's `stream` parameter for that. Distinct
+// streams are guaranteed to be *different* sequences, but not to be
+// statistically independent - nearby increments are known to produce
+// correlated output. Running a strong mixer over the seed instead scatters
+// adjacent row indices to unrelated points in state space, which is what we
+// actually need: visible structure correlated between grid rows would show up
+// as banding in the wave field.
+inline std::uint64_t mix64(std::uint64_t x) noexcept
+{
+    x += 0x9E3779B97F4A7C15ULL;  // golden-ratio odd constant
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+// An independent generator for row `row` of the grid, derived from `seed`.
+// Because the generator is a pure function of (seed, row), rows can be built
+// in any order, on any thread, with bit-identical results.
+inline Pcg32 row_rng(std::uint64_t seed, std::uint32_t row) noexcept
+{
+    return seed_pcg32(mix64(seed ^ (0x9E3779B97F4A7C15ULL * (row + 1u))), 0);
+}
+
 struct GaussianPair {
     float a;
     float b;

@@ -13,6 +13,7 @@ add_executable(ocean_tests
   test_rng.cpp
   test_api.cpp
   test_fft.cpp
+  test_spectrum.cpp
 )
 target_link_libraries(ocean_tests PRIVATE ocean doctest::doctest)
 target_include_directories(ocean_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

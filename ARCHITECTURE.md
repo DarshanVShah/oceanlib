@@ -365,3 +365,133 @@ N=2 to 1.4e-7 at N=64. That is float epsilon (1.19e-7) growing roughly as
 √(log₂N), which is the textbook error bound for a radix-2 FFT. Test tolerances
 are set at 1e-6 — about 7× the measured error, tight enough that a wrong
 twiddle index or flipped sign (both O(1) errors) cannot slip through.
+
+---
+
+## ADR-009 — Spectrum: JONSWAP + Hasselmann spreading, mapped into k-space
+
+### Why JONSWAP rather than Tessendorf's Phillips
+
+Phillips (what Tessendorf 2001 uses) describes a *fully developed* sea: wind has
+blown long enough, over enough open water, that the waves have stopped growing.
+Real water is usually fetch-limited, and a fetch-limited sea has a sharper,
+taller spectral peak than Phillips predicts. JONSWAP adds the peak-enhancement
+factor `gamma^r` to model exactly that, and takes **fetch** as a parameter —
+which is the knob Phillips simply does not have. It is what separates a young,
+steep, short-crested wind sea from mature swell.
+
+Constants used (Hasselmann et al. 1973), with the dimensionless fetch
+`x~ = gF/U^2`:
+
+```
+alpha   = 0.076 * x~^(-0.22)          omega_p = 22 * (g/U) * x~^(-1/3)
+S(w)    = (alpha g^2 / w^5) * exp(-5/4 (w_p/w)^4) * gamma^r
+r       = exp(-(w - w_p)^2 / (2 sigma^2 w_p^2))
+sigma   = 0.07 below the peak, 0.09 above
+```
+
+The asymmetric sigma is not a typo: the measured JONSWAP peak is skewed, rising
+more steeply than it falls. Note also that although the `w^-5` equilibrium tail
+looks singular as `w -> 0`, the exponential kills it far faster, so the density
+goes to zero there. The only guard needed is `w == 0` exactly.
+
+### Directional spreading: the half-angle cosine form
+
+`D(w, theta) = Q(s) * cos^(2s)((theta - theta_w)/2)` with Hasselmann's
+frequency-dependent exponent `s(w)`.
+
+Two details that matter:
+
+**The half angle.** `cos^(2s)(theta - theta_w)` would be symmetric front-to-back
+and would generate waves travelling *into* the wind carrying the same energy as
+waves travelling with it. The half-angle form vanishes at
+`theta = theta_w +/- pi`, so upwind waves get zero energy for free — no extra
+suppression term is needed.
+
+**The normalisation `Q(s)` cannot be skipped.** It looks like a pure scale
+factor, but `s` varies with frequency, so without it the *relative* energy
+between frequencies is wrong, not merely the overall level. From
+`integral of cos^(2s)(theta/2) dtheta = 2 sqrt(pi) Gamma(s+1/2)/Gamma(s+1)`
+over `[-pi, pi]`, we get `Q(s) = Gamma(s+1) / (2 sqrt(pi) Gamma(s+1/2))`,
+evaluated through `lgamma` because `Gamma(s+1)` itself overflows a double at
+modest `s`.
+
+**Unverified: the swell term.** `s += 16 * tanh(w_p/w) * swell^2` is a
+*plausible reconstruction* of Horvath 2015's swell parameter, not a verified
+transcription. The character is right (a tanh-weighted boost to the spreading
+exponent, strongest below the peak, scaling with the square of the control) but
+the constant 16 should be checked against the paper before this is described as
+"the Horvath model". It behaves correctly as an artist control regardless.
+
+### The change of variables, which is where the bugs live
+
+Going from `S(omega)` to a 2D wavenumber density needs two changes of variable,
+and both are easy to get silently wrong:
+
+1. **Frequency to wavenumber.** `S(k) dk = S(omega) domega`, so multiply by the
+   Jacobian `domega/dk = g/(2 omega)` for deep water.
+2. **Polar to Cartesian.** `dkx dkz = k dk dtheta`, so
+   `Psi(kx,kz) = S(k) D(theta) / k`.
+
+Forgetting the `1/k` is the classic failure. The surface still looks like an
+ocean — it just carries the wrong energy balance across scales, so it never
+quite matches a real sea state at any wind speed, and no amount of parameter
+tuning fixes it.
+
+This is validated directly: a polar quadrature of `Psi` over the whole plane
+must reproduce `integral of S(omega) domega`, with both sides truncated at the
+same wavenumber. That single test covers the `domega/dk` Jacobian, the `1/k`
+factor and the `D` normalisation at once.
+
+### Amplitude normalisation and the factor of 1/2
+
+`h0(k) = (1/sqrt 2)(xi_r + i xi_i) sqrt(P(k))` with `P(k) = Psi(k) dkx dkz / 2`,
+which collects to `amp = 0.5 * sqrt(Psi) * dk`.
+
+The `/2` is the part people drop. The time-dependent amplitude is
+`h(k,t) = h0(k) e^{iwt} + conj(h0(-k)) e^{-iwt}`, and since `h0(k)` and `h0(-k)`
+are independent zero-mean draws, the cross terms vanish in expectation and
+`E|h(k,t)|^2 = P(k) + P(-k) = 2 P(k)`. Summing that over the grid must equal the
+surface variance, so each bin gets half the density it would otherwise carry.
+**Drop the `/2` and the entire ocean comes out sqrt(2) times too tall** — a bug
+that looks completely plausible on screen and survives visual inspection
+indefinitely. A test compares the realised grid energy against the continuous
+prediction to catch exactly this.
+
+### Bin ordering: standard DFT, not centred
+
+Grid index `i` maps to wavenumber index `i` for `i < N/2` and `i - N` above —
+standard DFT bin ordering, so the FFT output needs no fftshift. The "centred"
+convention `(i - N/2)` would offset the result by half a period, which appears
+as a checkerboard sign flip across the grid.
+
+### Per-row RNG streams, via a mixer not a PCG stream
+
+Each row draws from `seed_pcg32(mix64(seed ^ golden*(row+1)), 0)`. Because the
+generator is a pure function of `(seed, row)`, rows can be built in any order on
+any thread with bit-identical output — the property that makes the build
+parallelisable later without touching determinism.
+
+We deliberately do **not** use PCG's `stream` parameter for this. Distinct
+streams are guaranteed to be *different* sequences but not statistically
+independent; nearby increments are known to produce correlated output, and
+correlation between adjacent grid rows would show up as visible banding in the
+wave field. A SplitMix64 finaliser scatters adjacent row indices to unrelated
+points in state space instead.
+
+### Verification highlights
+
+- Directional spreading integrates to 1 at every frequency tested.
+- Polar integral of `Psi` matches `integral of S domega` to 1%.
+- **Significant wave height follows the analytically derived fetch-limited
+  scaling law.** At fixed fetch, `H_s ~ U^0.886667` (from `alpha ~ U^0.44` and
+  `omega_p^-4 ~ U^(4/3)`). Measured across U = 10 -> 20 m/s: **0.8867**. That
+  one number validates the exponents inside both `alpha` and `omega_p` plus the
+  `omega^-5` tail simultaneously; a single-magnitude check would pass with any
+  of them subtly wrong.
+- Independent reality check: `H_s = 2.14 m` at U = 10 m/s (about 20 kt,
+  Beaufort 5), which is what is actually measured at sea for that wind. This
+  catches a units error that a pure scaling test would sail past.
+- Note this is far below the `U^2` of a fully developed sea — with fetch pinned
+  at 100 km a 20 m/s wind is fetch-limited. Expecting `U^2` is the intuitive
+  mistake, and it was the one wrong assertion in the first draft of these tests.
