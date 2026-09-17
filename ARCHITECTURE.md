@@ -1097,3 +1097,69 @@ from 23.620 ms single-threaded scalar to **1.426 ms**, a 16.6x improvement, with
 the FFT now 84% of what remains. BENCHMARKS.md records the specific remaining
 opportunity — the row pass still runs its first three stages scalar, where the
 stride is below the vector width.
+
+---
+
+## ADR-017 — Testing low-end hardware without owning it
+
+### The problem
+
+Promise #1 is "runs on anything," but the only machine available for
+development is a 2024 28-thread AVX2 laptop. Claiming the library works on
+weak hardware without any way to check it would be exactly the kind of
+unverified claim this project otherwise avoids.
+
+### The mechanism: force, don't guess
+
+`core/cpu_features.hpp` already had `force_simd_level()` for the SIMD
+bit-exactness tests (ADR-013). It is now exposed publicly as
+`ocean_force_simd_level()` in the C API, and both `ocean_bench` and the viewer
+gained `--simd` / `--threads` flags that call it before constructing anything.
+
+This is a real feature, not just a testing convenience: it is a QA/support
+hook. "Does this bug repro on scalar?" is now answerable without different
+hardware, for any integrator, in production. `force_simd_level` clamps to what
+the CPU can actually execute, so requesting AVX2 on a machine without it falls
+back rather than faulting - the same safety property the internal version
+always had.
+
+### What this can and cannot tell you
+
+It is a **lower bound** on real slowdown. Dropping SIMD width and thread count
+measures the *algorithmic* cost on today's clock speed and cache hierarchy. A
+real budget or decade-old CPU is also clocked lower and has a smaller cache,
+both of which cost more on top of what this measures. Treat the numbers as
+"at least this much slower," not "exactly this much slower."
+
+It also cannot simulate a weak *GPU* for the viewer - only the CPU-side
+simulation cost is under this library's control, and the viewer's Vulkan
+device selection can be pointed at the integrated GPU with a future flag if
+that comparison becomes useful.
+
+### Verifying the render pipeline end to end, not just the buffers
+
+The existing tests prove the *library's output buffers* are bit-identical
+across SIMD levels and thread counts. That is necessary but not sufficient for
+the promise as stated to users: "the ocean looks the same regardless of your
+hardware" is a claim about pixels, not about `float` arrays nobody looks at
+directly.
+
+To check that, `--screenshot` was run twice with identical scene settings -
+once native (AVX2, 28 threads), once forced to worst case (scalar, 1 thread) -
+and the two captures were byte-compared: **zero differing bytes** across a
+4.3 MB image. This demonstrates the determinism chain all the way from kernel
+dispatch through the render pipeline to the final pixel, which is a stronger
+claim than the unit tests alone establish.
+
+### A real bug found along the way
+
+Making that comparison meaningful required fixing `--screenshot` first: it
+advanced simulation time using measured wall-clock `dt`, so the same
+`--frames N` landed at a different simulated time depending on how fast the
+machine rendered the earlier frames. Two screenshots from different
+configurations - or even the same configuration on two different machines -
+were not comparable by construction, regardless of anything about the ocean
+simulation itself. Screenshot mode now advances by a fixed virtual 1/60 s
+timestep, decoupled from wall-clock render speed. This is a general
+correctness fix for reproducible visual regression testing, independent of the
+SIMD-forcing feature that surfaced it.

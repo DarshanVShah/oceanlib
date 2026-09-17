@@ -260,3 +260,56 @@ Two ways to fix it, neither yet attempted:
 
 Finalisation at 7% is memory-bound (it writes 8 MB per frame at 512 squared)
 and is not worth vectorising.
+
+---
+
+## Simulated low-end hardware
+
+Measured 2026-09-18, same machine (i7-14700HX), using `--simd` and `--threads`
+to force a weaker configuration rather than needing weaker hardware. Same
+settings as above (patch 200 m, wind 12 m/s, choppiness 1.0).
+
+| configuration                          | 256x256 update | vs. native | 512x512 update | vs. native |
+|-----------------------------------------|----------------:|-----------:|-----------------:|-----------:|
+| native (AVX2, 28 threads)               |         0.492 ms |       1.0x |          1.692 ms |       1.0x |
+| AVX2, 4 threads (old quad-core)         |         0.557 ms |       1.1x |          3.818 ms |       2.3x |
+| SSE2, 2 threads (budget dual-core)      |         1.957 ms |       4.0x |          8.980 ms |       5.3x |
+| **scalar, 1 thread (circa-2008 laptop)**|     **5.290 ms** |  **10.8x** |     **26.396 ms** |  **15.6x** |
+
+Run with `ocean_bench.exe --simd <scalar\|sse2\|avx2\|neon\|max> --threads N`.
+
+### Reading this honestly
+
+This is a **lower bound** on the real-world slowdown, not a prediction of
+actual performance on old hardware. It measures the algorithmic cost of
+dropping SIMD width and core count on *today's* clock speed, cache sizes and
+memory bandwidth. A real 2008 CPU is also clocked lower and has a much smaller
+cache, both of which cost more on top of what is shown here.
+
+What it does tell us reliably: at 256x256, even the worst case fits inside a
+60 Hz budget (5.29 ms of 16.7 ms). At 512x512 it does not (26.4 ms) - a
+low-end target should either stay at 256x256 or accept a lower update rate for
+the ocean specifically (it does not need to update every rendered frame; see
+the V2 plan).
+
+### The determinism claim, demonstrated end to end
+
+The unit tests already prove the *output buffers* are bit-identical across
+SIMD levels and thread counts (ADR-012, ADR-013, ADR-016). To check this holds
+all the way through the renderer too - not just the library's own buffers -
+the viewer's `--screenshot` mode was run twice with identical scene settings:
+once at native speed (AVX2, 28 threads) and once forced to the worst case
+(scalar, 1 thread), and the two captured frames were byte-compared.
+
+**Result: 0 differing bytes across a 4 320 054-byte capture.** The rendered
+image is pixel-for-pixel identical despite an 11-16x difference in how long it
+took to compute. That is the promise made concrete: a game running on a weak
+CPU shows the exact same ocean as one on a fast CPU, just less often.
+
+This required a real fix first: `--screenshot` was advancing simulation time
+by measured wall-clock `dt`, so the same `--frames N` reached a different
+simulated time depending on how fast the machine rendered the warmup frames -
+making two screenshots from different configurations incomparable by
+construction, independent of anything about the library itself. Screenshot
+mode now advances by a fixed 1/60 s virtual timestep instead, which also makes
+it usable for visual regression testing across machines generally.
