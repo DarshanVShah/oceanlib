@@ -19,6 +19,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(ocean STATIC
   src/core/rng.cpp
+  src/core/fft.cpp
   src/ocean.cpp
 )
 add_library(ocean::ocean ALIAS ocean)

@@ -237,3 +237,131 @@ This matters because a per-frame allocation is not a small inefficiency: it is
 a frame-time spike under lock contention, and on a console with a fixed heap it
 is a fragmentation bug that shows up hours in. Code review does not reliably
 catch an accidental `std::vector` temporary; a counter does.
+
+---
+
+## ADR-008 — FFT: split storage, Stockham auto-sort, two real fields per transform
+
+### Storage: split `re[]` / `im[]`, not interleaved `Complex{re,im}`
+
+The radix-2 butterfly is
+
+```
+t  = w * b                 tr = wr*br - wi*bi
+b' = a - t                 ti = wr*bi + wi*br
+a' = a + t
+```
+
+With split arrays, a SIMD register holds eight *reals* or eight *imaginaries*,
+so every lane performs the same operation on the same component. The whole
+butterfly is vertical multiplies, adds and subtracts — no shuffles, no
+`addsub`, no horizontal operations — and porting between SSE2, AVX2 and NEON
+changes only the vector width and the intrinsic spelling.
+
+With interleaved storage a register holds `(r0,i0,r1,i1,…)`, so each complex
+multiply needs `moveldup`/`movehdup`-style duplication plus a shuffle and an
+`addsub`: roughly three extra operations per butterfly, and a formulation that
+does not carry over to NEON at all.
+
+The usual argument for interleaved storage is interoperability — real code
+often hands you `std::complex` arrays. That does not apply here: we generate
+the spectrum ourselves and we write the interleaved output ourselves, so we
+control both ends of the pipeline.
+
+The cost of split storage is two open memory streams instead of one, which
+costs a little prefetcher and TLB pressure. At our sizes (N ≤ 1024, so a row is
+at most 4 KB per component) both streams sit in L1, so this is not a real cost.
+
+### Algorithm: Stockham auto-sort, not in-place Cooley–Tukey
+
+Textbook Cooley–Tukey permutes the input into bit-reversed order and then runs
+`log2(N)` in-place butterfly stages. Two things make that a poor fit here:
+
+1. The bit-reversal pass is a pure scatter — every element moves to an
+   unrelated address, with no locality to exploit and nothing to vectorise.
+2. The butterfly stride changes every stage. Early stages pair elements that
+   are far apart, so loads are gather-shaped rather than contiguous.
+
+Stockham auto-sort removes both. It ping-pongs between two buffers and folds
+the permutation into the *write* indices (`2p` and `2p+1`), so there is no
+separate reordering pass at all, and within a stage both the read and the write
+walk memory sequentially in `q`. That sequential access is precisely what lets
+a SIMD version issue full-width loads and stores.
+
+The price is a second buffer — which we were allocating as scratch anyway — and
+the fact that the result ends in a different physical buffer depending on the
+parity of `log2(N)`. We absorb the parity for free: the final scatter back to
+the caller's array reads from whichever buffer the swaps left the data in, so
+no copy-back pass is ever needed.
+
+**One twiddle table for all stages.** At the stage with sub-transform length
+`len` and stride `s`, we have `len * s == N` at every stage, and the twiddle
+for butterfly `p` is `exp(-2πi·p/len)`, which is exactly entry `p*s` of a
+single table of `exp(-2πi·j/N)` for `j ∈ [0, N/2)`. So the whole plan needs
+`N/2` entries, not one table per stage. The inverse table is the conjugate,
+stored separately so the inner loop never spends an instruction negating.
+
+### Strided transforms gather first
+
+A 2D transform is separable, so it is N row transforms followed by N column
+transforms. The column pass walks memory with stride N. Rather than thread that
+stride through every butterfly, `transform()` gathers the strided input into
+contiguous scratch, runs entirely contiguously, and scatters back at the end.
+The strided walk therefore happens twice per 1D transform instead of once per
+stage — `2` sweeps instead of `log2(N)`.
+
+A bonus verified by test: because the strided and contiguous cases run the
+*same* butterfly code on the same contiguous scratch, their results are
+bit-identical, not merely close.
+
+### Two real fields per complex transform
+
+Per frame we need eight real fields: height, the two horizontal displacements
+`Dx`/`Dz`, two slopes for the normals, and three displacement derivatives for
+the Jacobian. Every one of their spectra is Hermitian-symmetric
+(`S(-k) = conj(S(k))`), which is exactly the condition for the inverse
+transform to be purely real. Running eight complex transforms would mean half
+the arithmetic computes imaginary parts that are zero by construction.
+
+By linearity, if `S_a` and `S_b` are both Hermitian then
+
+```
+IFFT(S_a + i·S_b) = f_a + i·f_b
+```
+
+with `f_a` and `f_b` both real. So one complex transform yields two real
+fields: read `f_a` off the real part and `f_b` off the imaginary part. Eight
+fields become four transforms — an exact 2× saving, not an approximation, for
+about ten lines of packing code.
+
+The alternative that saves the same 2× is a true real-to-complex transform
+exploiting Hermitian symmetry to store only `N/2+1` columns. It would also
+halve spectrum memory, but it needs its own pre/post twiddle pass, its own
+index bookkeeping and its own SIMD path, and symmetry bugs there are subtle.
+Packing gets the same speedup with none of that risk. If memory ever becomes
+the binding constraint, R2C is the upgrade path.
+
+### Validation strategy
+
+The reference is a **true O(N⁴) quadruple sum**, not a row-column DFT. That
+matters: `transform_2d` *assumes* the kernel is separable. Validating it
+against a reference that made the same assumption would let a bug in that
+assumption cancel on both sides and pass. Summing over all four indices
+independently shares no structure with the code under test.
+
+The reference runs in `double` while the FFT runs in `float`, so a disagreement
+is unambiguously the FFT's error rather than a contest between two equally
+shaky float computations.
+
+Separately, one test pins the **sign convention against theory**, not against
+our own reference: the forward transform of `exp(+2πi·k₀j/N)` must be exactly
+`N` in bin `k₀` and zero elsewhere. Without it, a sign error in both the FFT
+and the reference DFT would cancel and every comparison test would still pass —
+while the ocean ran backwards in time.
+
+**Measured accuracy** (MSVC 19.44, `/O2 /fp:precise`, relative to peak
+magnitude): 1D rises from 3.6e-8 at N=2 to 1.4e-7 at N=256; 2D from 4.9e-8 at
+N=2 to 1.4e-7 at N=64. That is float epsilon (1.19e-7) growing roughly as
+√(log₂N), which is the textbook error bound for a radix-2 FFT. Test tolerances
+are set at 1e-6 — about 7× the measured error, tight enough that a wrong
+twiddle index or flipped sign (both O(1) errors) cannot slip through.

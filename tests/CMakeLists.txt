@@ -12,6 +12,7 @@ add_executable(ocean_tests
   alloc_probe.cpp
   test_rng.cpp
   test_api.cpp
+  test_fft.cpp
 )
 target_link_libraries(ocean_tests PRIVATE ocean doctest::doctest)
 target_include_directories(ocean_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
