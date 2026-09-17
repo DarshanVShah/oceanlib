@@ -905,3 +905,102 @@ times, plus direct comparison of query results. Anything that changed the
 numbers — a float narrowed somewhere, a defaulted field diverging — would mean
 bindings quietly simulate a *different ocean* from the C++ API, which is the
 kind of discrepancy nobody finds for months.
+
+---
+
+## ADR-015 — The Vulkan viewer
+
+### It is a demo, not a rendering library
+
+The viewer lives in `examples/viewer/` behind `OCEAN_BUILD_VIEWER=OFF`. The
+core library still builds with no Vulkan SDK present.
+
+The alternative considered was a reusable `ocean_render` library. It was
+rejected because it contradicts the project's own positioning: an engine
+already has a render graph, a material system and a swapchain, and is never
+going to adopt ours. Shipping a renderer would put Vulkan in the public
+headers to serve a user who does not exist. A *demo*, on the other hand, proves
+the library works and doubles as the reference integration — which is exactly
+what an engine-agnostic library should ship.
+
+The dependency policy is the one `tests/` already established: an optional
+target may have dependencies, the library may not.
+
+### The integration is two memcpys
+
+This is the payoff of ADR-004, and it is worth stating plainly because it is
+the whole argument for that decision:
+
+```cpp
+memcpy(staging,                  b.displacement, N*N*16);
+memcpy(staging + texture_bytes,  b.normal,       N*N*16);
+// two vkCmdCopyBufferToImage. Done.
+```
+
+No repacking pass, no per-component conversion, no quantisation. The textures
+are `R32G32B32A32_SFLOAT` because that is literally what the library hands
+over. Everything else in `ocean_view.cpp` is Vulkan object creation.
+
+### Tiling is free because the surface is exactly periodic
+
+Seven-by-seven tiles are a single instanced draw; the instance index becomes
+the tile offset in the vertex shader. A `REPEAT` sampler is *correct* rather
+than approximate here — a wrapped sample at u = 1.05 is genuinely the right
+value, because the FFT surface has period `patch_length` exactly. There is no
+blending, no overlap and no edge fixup anywhere, and the wireframe capture
+confirms the mesh is continuous across tile boundaries.
+
+### Vulkan 1.3: dynamic rendering and synchronization2
+
+Both are core in 1.3 and together they delete a large amount of boilerplate —
+no `VkRenderPass`, no `VkFramebuffer`, and the modern barrier API instead of
+the legacy one. Every GPU that can run this demo supports 1.3.
+
+Two synchronisation details that are easy to get wrong and only fail on some
+drivers:
+
+- **One texture set per frame in flight.** We wait only on the fence for *our*
+  frame index, so the other in-flight submission may still be sampling the
+  textures when we overwrite them. Double-buffering is cheaper and simpler than
+  the barriers a single set would need.
+- **One render-finished semaphore per swapchain image, not per frame.** The
+  semaphore a present waits on must belong to the image being presented, or a
+  fast-recycling swapchain can end up waiting on one that is still pending.
+
+### Shaders are compiled at build time and embedded
+
+`glslc` produces SPIR-V, and a CMake script turns it into a `uint32_t` array in
+a generated header. No runtime asset paths — which are the usual reason a demo
+fails to launch from a different working directory — and no way to run a shader
+that does not match the binary it shipped with.
+
+The sky model lives in a shared `common.glsl` because the water reflects it. If
+the sky pass and the reflection disagreed, the horizon would visibly seam where
+the ocean meets the sky.
+
+### No back-face culling on the water
+
+A choppy surface genuinely folds over itself at breaking crests. Culled
+triangles would punch visible holes exactly where the most interesting geometry
+is, so the water draws double-sided and the fragment shader flips normals that
+face away from the viewer.
+
+### Verified by looking at it
+
+A `--screenshot` mode renders N frames, copies the swapchain image back and
+writes a BMP. The renderer was checked by inspecting those images, not by
+assuming that "it compiled and did not crash" meant it worked. Validation
+layers report no errors.
+
+What the captures confirm: the sun glitter path is emergent from the wave
+slopes rather than faked; Fresnel behaves correctly (transparent near, mirror
+at grazing angles); foam appears along crest lines at high wind, driven by the
+Jacobian; and there are no tile seams.
+
+### Known limitation
+
+The mesh has no level of detail — every tile is the same resolution, so distant
+triangles collapse to sub-pixel size and waste vertex work. Tessellation
+shaders with distance-based tessellation levels are the fix, and were rejected
+for now because two extra pipeline stages would obscure the integration story
+the demo exists to tell.
