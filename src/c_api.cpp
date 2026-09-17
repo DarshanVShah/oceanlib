@@ -9,8 +9,10 @@
 #include "core/cpu_features.hpp"
 #include "ocean/ocean.hpp"
 
+#include <cctype>
 #include <cstring>
 #include <new>
+#include <string>
 #include <stdexcept>
 
 namespace {
@@ -210,6 +212,27 @@ ocean_surface ocean_sample_at(const ocean_sim* sim, float world_x, float world_z
 const char* ocean_simd_level(void)
 {
     return ocean::detail::simd_level_name(ocean::detail::detect_simd_level());
+}
+
+const char* ocean_force_simd_level(const char* name)
+{
+    ocean::detail::SimdLevel level;
+    if (name == nullptr) {
+        level = ocean::detail::max_simd_level();
+    } else {
+        std::string s(name);
+        for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (s == "scalar")      level = ocean::detail::SimdLevel::Scalar;
+        else if (s == "sse2")   level = ocean::detail::SimdLevel::Sse2;
+        else if (s == "avx2")   level = ocean::detail::SimdLevel::Avx2;
+        else if (s == "neon")   level = ocean::detail::SimdLevel::Neon;
+        else {
+            // Unrecognised name: leave the current level untouched rather than
+            // guessing, and report what is actually active.
+            return ocean_simd_level();
+        }
+    }
+    return ocean::detail::simd_level_name(ocean::detail::force_simd_level(level));
 }
 
 void ocean_version(uint32_t* major, uint32_t* minor, uint32_t* patch)

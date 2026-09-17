@@ -294,3 +294,57 @@ TEST_CASE("status strings and version are reported")
     CHECK(major == 0);
     CHECK(minor == 1);
 }
+
+TEST_CASE("forcing the SIMD level is reflected by ocean_simd_level")
+{
+    // Every build can run scalar, regardless of what the host CPU supports -
+    // this is the QA hook's most basic promise: "does this repro on scalar?"
+    // must always be answerable.
+    const char* got = ocean_force_simd_level("scalar");
+    REQUIRE(got != nullptr);
+    CHECK(std::strcmp(got, "scalar") == 0);
+    CHECK(std::strcmp(ocean_simd_level(), "scalar") == 0);
+
+    // Case-insensitive, as documented.
+    got = ocean_force_simd_level("SCALAR");
+    CHECK(std::strcmp(got, "scalar") == 0);
+
+    // An unrecognised name is a no-op: the level stays whatever it was, and
+    // the call still returns a valid, non-null string rather than crashing or
+    // silently corrupting the active level.
+    got = ocean_force_simd_level("not-a-real-level");
+    CHECK(std::strcmp(got, "scalar") == 0);  // unchanged from the force above
+
+    // Restore whatever this machine actually supports, so later tests in this
+    // binary are not left running in forced scalar mode.
+    ocean_force_simd_level(nullptr);
+}
+
+TEST_CASE("a simulation built while a SIMD level is forced still matches scalar bit for bit")
+{
+    // The point of forcing a level is testing on hardware you do not have.
+    // That is worthless unless the forced kernel actually agrees with every
+    // other kernel - so this checks the ACTUAL simulation output, not just
+    // that the reported name changed.
+    ocean_desc d = make_c_desc(32);
+    d.seed = 555;
+
+    ocean_force_simd_level("scalar");
+    ocean_sim* scalar_sim = ocean_create(&d, nullptr);
+    REQUIRE(scalar_sim != nullptr);
+    ocean_update(scalar_sim, 4.0);
+    const ocean_buffers scalar_b = ocean_get_buffers(scalar_sim);
+
+    ocean_force_simd_level(nullptr);  // back to native max for this CPU
+    ocean_sim* native_sim = ocean_create(&d, nullptr);
+    REQUIRE(native_sim != nullptr);
+    ocean_update(native_sim, 4.0);
+    const ocean_buffers native_b = ocean_get_buffers(native_sim);
+
+    const std::size_t bytes = 32u * 32u * 4 * sizeof(float);
+    CHECK(std::memcmp(scalar_b.displacement, native_b.displacement, bytes) == 0);
+    CHECK(std::memcmp(scalar_b.normal, native_b.normal, bytes) == 0);
+
+    ocean_destroy(scalar_sim);
+    ocean_destroy(native_sim);
+}

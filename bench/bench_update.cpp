@@ -3,8 +3,24 @@
 // Prints per-frame update cost at several grid sizes, serial versus threaded,
 // plus a breakdown of the three pipeline stages so we can see where the work
 // actually is before trying to optimise anything.
+//
+// CLI flags let this same binary stand in for weaker hardware without
+// needing weaker hardware:
+//   --simd scalar|sse2|avx2|neon|max   force a SIMD kernel level (default: max
+//                                      this CPU supports - what a real user's
+//                                      "auto-detect" would pick)
+//   --threads N                       cap the thread pool (0 = hardware_concurrency)
+//   --sizes 64,128,256                comma list of grid sizes (default 64,128,256,512)
+//
+// Forcing --simd scalar --threads 1 approximates a single-core machine with no
+// vector unit worth using - roughly a 2008-era laptop, or the worst case an
+// engine integrator should plan for. It is measured on today's clock speed, so
+// it is a LOWER BOUND on the algorithmic slowdown, not a prediction of actual
+// wall-clock time on old hardware: a 2008 CPU is also clocked lower and has a
+// smaller cache, both of which cost more on top of this.
 
 #include "core/aligned.hpp"
+#include "core/cpu_features.hpp"
 #include "core/evolve.hpp"
 #include "core/fft.hpp"
 #include "core/spectrum.hpp"
@@ -13,12 +29,17 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using ocean::detail::SimdLevel;
 
 struct Timing {
     double median_ms = 0.0;
@@ -80,20 +101,99 @@ ocean::OceanDesc make_desc(std::uint32_t n, std::uint32_t threads)
     return d;
 }
 
+struct Options {
+    SimdLevel simd = SimdLevel::Avx2;  // ignored unless simd_forced
+    bool simd_forced = false;
+    std::uint32_t max_threads = 0;  // 0 = hardware_concurrency, unmodified
+    std::vector<std::uint32_t> sizes{64u, 128u, 256u, 512u};
+};
+
+bool parse_simd(const std::string& s, SimdLevel& out)
+{
+    if (s == "scalar") { out = SimdLevel::Scalar; return true; }
+    if (s == "sse2")   { out = SimdLevel::Sse2;   return true; }
+    if (s == "avx2")   { out = SimdLevel::Avx2;   return true; }
+    if (s == "neon")   { out = SimdLevel::Neon;   return true; }
+    return false;
+}
+
+Options parse_args(int argc, char** argv)
+{
+    Options o;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto next = [&]() -> std::string {
+            return (i + 1 < argc) ? std::string(argv[++i]) : std::string();
+        };
+        if (a == "--simd") {
+            const std::string v = next();
+            if (v == "max") {
+                o.simd_forced = false;
+            } else if (parse_simd(v, o.simd)) {
+                o.simd_forced = true;
+            } else {
+                std::fprintf(stderr,
+                             "unknown --simd value '%s' (want scalar|sse2|avx2|neon|max)\n",
+                             v.c_str());
+                std::exit(1);
+            }
+        } else if (a == "--threads") {
+            o.max_threads =
+                static_cast<std::uint32_t>(std::strtoul(next().c_str(), nullptr, 10));
+        } else if (a == "--sizes") {
+            o.sizes.clear();
+            std::stringstream ss(next());
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                if (!tok.empty()) {
+                    o.sizes.push_back(
+                        static_cast<std::uint32_t>(std::strtoul(tok.c_str(), nullptr, 10)));
+                }
+            }
+            if (o.sizes.empty()) o.sizes = {64u, 128u, 256u, 512u};
+        }
+    }
+    return o;
+}
+
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
-    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const Options opt = parse_args(argc, argv);
+
+    // Force the SIMD level BEFORE constructing anything: FftPlan and the
+    // evolve dispatch both read the active level at construction / first use.
+    // force_simd_level clamps to what this CPU can actually execute, so
+    // asking for AVX2 on a machine without it falls back rather than faulting.
+    if (opt.simd_forced) {
+        const SimdLevel got = ocean::detail::force_simd_level(opt.simd);
+        if (got != opt.simd) {
+            std::fprintf(stderr,
+                         "warning: this CPU cannot run %s; falling back to %s\n",
+                         ocean::detail::simd_level_name(opt.simd),
+                         ocean::detail::simd_level_name(got));
+        }
+    }
+
+    const unsigned hw_all = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned hw_capped =
+        (opt.max_threads > 0) ? std::min(opt.max_threads, hw_all) : hw_all;
+
     std::printf("oceanlib update benchmark\n");
     std::printf("-------------------------\n");
-    std::printf("hardware_concurrency = %u\n\n", hw);
+    std::printf("SIMD level          : %s%s\n",
+                ocean::detail::simd_level_name(ocean::detail::detect_simd_level()),
+                opt.simd_forced ? "  (forced)" : "  (auto - native max)");
+    std::printf("hardware_concurrency: %u\n", hw_all);
+    std::printf("threads used        : %u%s\n\n", hw_capped,
+                opt.max_threads > 0 ? "  (capped via --threads)" : "");
 
     std::printf("%6s %11s %11s %9s %11s %11s %11s %11s\n", "N", "serial(ms)",
                 "thread(ms)", "speedup", "evolve(ms)", "fft(ms)", "final(ms)",
                 "Mcell/s");
 
-    for (std::uint32_t n : {64u, 128u, 256u, 512u}) {
+    for (std::uint32_t n : opt.sizes) {
         const int iters  = iterations_for(n);
         const int warmup = std::max(10, iters / 10);
 
@@ -102,8 +202,8 @@ int main()
         const Timing serial =
             measure([&](double t) { serial_sim.update(t); }, warmup, iters);
 
-        // ---- all hardware threads ---------------------------------------
-        ocean::OceanDesc desc = make_desc(n, 0);
+        // ---- capped thread count (hw_capped workers) --------------------
+        ocean::OceanDesc desc = make_desc(n, hw_capped);
         ocean::Ocean sim{desc};
         const Timing threaded =
             measure([&](double t) { sim.update(t); }, warmup, iters);

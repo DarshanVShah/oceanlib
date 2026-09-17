@@ -12,6 +12,9 @@
 //   --chop C          choppiness / Tessendorf lambda (default 1.0)
 //   --foam F          Jacobian threshold for foam (default 0.6)
 //   --wireframe       start in wireframe mode
+//   --simd L          force a SIMD level: scalar|sse2|avx2|neon (default: native)
+//   --threads N       cap the thread pool (default: one per hardware thread) -
+//                     use 1 to simulate a single-core machine
 //   --screenshot P    render a few frames, write P as BMP, exit
 //   --frames N        frames to render before the screenshot (default 90)
 //   --no-validation   skip the Vulkan validation layer
@@ -43,6 +46,8 @@ struct Options {
     float         foam   = 0.6f;
     bool          wireframe = false;
     std::string   screenshot;
+    std::string   simd;           // "" = native max; else scalar|sse2|avx2|neon
+    std::uint32_t threads = 0;    // 0 = one worker per hardware thread
     int           frames = 90;
     bool          validation = true;
 };
@@ -62,6 +67,8 @@ Options parse_args(int argc, char** argv)
         else if (a == "--chop")        o.chop  = std::strtof(next(), nullptr);
         else if (a == "--foam")        o.foam  = std::strtof(next(), nullptr);
         else if (a == "--wireframe")   o.wireframe = true;
+        else if (a == "--simd")        o.simd = next();
+        else if (a == "--threads")     o.threads = std::strtoul(next(), nullptr, 10);
         else if (a == "--screenshot")  o.screenshot = next();
         else if (a == "--frames")      o.frames = std::atoi(next());
         else if (a == "--no-validation") o.validation = false;
@@ -266,6 +273,13 @@ int main(int argc, char** argv)
     desc.spectrum.wind_direction = 0.4f;
     desc.foam_threshold          = opt.foam;
 
+    if (!opt.simd.empty()) {
+        const char* installed = ocean_force_simd_level(opt.simd.c_str());
+        std::printf("requested SIMD level '%s' -> installed '%s'\n",
+                    opt.simd.c_str(), installed);
+    }
+    desc.thread_count = opt.threads;
+
     ocean::Ocean sim{desc};
     float active_choppiness = desc.choppiness;
     std::printf("ocean: %ux%u, patch %.0f m, wind %.1f m/s, SIMD %s\n",
@@ -296,9 +310,20 @@ int main(int argc, char** argv)
         glfwPollEvents();
 
         const auto now = std::chrono::steady_clock::now();
-        const double dt =
+        const double wall_dt =
             std::chrono::duration<double>(now - last).count();
         last = now;
+
+        // In --screenshot mode, advance by a FIXED virtual timestep instead of
+        // measured wall-clock time. Otherwise the captured frame depends on
+        // how fast this particular machine happened to render the warmup
+        // frames - the same --frames N would land at a different simulated
+        // time on a fast GPU than on a slow one, making screenshots useless
+        // for comparing configurations (or for any kind of visual regression
+        // testing across machines). A fixed 1/60s virtual step makes
+        // --screenshot fully reproducible: same flags, same seed, same pixels,
+        // regardless of how long each frame actually took to compute.
+        const double dt = opt.screenshot.empty() ? wall_dt : (1.0 / 60.0);
         if (!input.paused) sim_time += dt;
 
         // --- camera -------------------------------------------------------

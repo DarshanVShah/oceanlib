@@ -181,6 +181,19 @@ ocean_surface ocean_sample_at(const ocean_sim* sim, float world_x, float world_z
  * kernels are bit-identical, so this never changes results. */
 const char* ocean_simd_level(void);
 
+/* Forces a specific SIMD kernel level, clamped to what this CPU can actually
+ * execute (asking for AVX2 on a machine without it falls back rather than
+ * faulting). Returns the level actually installed, as ocean_simd_level()
+ * would report it afterwards.
+ *
+ * This is a QA/support hook, not something a normal integration needs: it
+ * lets you ask "does this repro on scalar?" without a different machine, and
+ * it is how this library's own benchmarks simulate weaker hardware. It
+ * affects every ocean_sim created AFTER the call, not ones already running.
+ * name is one of "scalar", "sse2", "avx2", "neon" (case-insensitive); any
+ * other value is a no-op that returns the current level unchanged. */
+const char* ocean_force_simd_level(const char* name);
+
 /* Library version, for a host that loads the shared object dynamically. */
 void ocean_version(uint32_t* major, uint32_t* minor, uint32_t* patch);
 
