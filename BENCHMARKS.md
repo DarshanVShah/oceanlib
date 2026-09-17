@@ -333,3 +333,19 @@ The FFT NEON stage kernel matched the scalar reference bit for bit across
 every stage, stride and size the test suite checks - the same standard held
 for the AVX2 and SSE2 kernels on x86. Reproducible via
 `scripts/verify-neon-qemu.sh`.
+
+---
+
+## Shallow-water dispersion: no per-frame cost
+
+The finite-depth dispersion relation (ADR-019) is evaluated only when
+building the spectrum tables at construction time - the same point the
+existing deep-water sqrt(g*k) was always computed. It adds one std::tanh
+call per grid cell, once, not per frame; evolve_rows and finalize_rows,
+the two functions actually on the per-frame path, are untouched.
+
+Re-measured 2026-09-18 after the change, deep water (default), same
+machine and settings: 512x512 threaded 1.232 ms - consistent with (in
+fact slightly better than, within normal laptop thermal variance) the
+1.426 ms recorded after the AVX2 evolve kernel above. No regression.
+

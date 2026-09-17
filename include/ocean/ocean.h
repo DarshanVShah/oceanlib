@@ -95,6 +95,21 @@ typedef struct ocean_desc {
     ocean_parallel_for_fn parallel_for;      /* NULL = built-in thread pool  */
     void*                 parallel_for_user;
     uint32_t              thread_count;      /* 0 = one per hardware thread  */
+
+    /* Water depth in metres, for the finite-depth dispersion relation
+     * omega^2 = g*k*tanh(k*water_depth). <= 0 (the default) means deep water.
+     * See ocean::SpectrumDesc::depth for the full explanation.
+     *
+     * This lives HERE, at the very end of ocean_desc, rather than inside
+     * ocean_spectrum_desc where it would sit more naturally - because
+     * ocean_spectrum_desc is embedded by value ahead of choppiness,
+     * foam_threshold, seed and the threading fields, inserting a field into
+     * it would shift every field after it to a new byte offset, and the
+     * struct_size versioning above only works because an old caller's struct
+     * is a byte-for-byte PREFIX of the current one. Only ever append new
+     * fields here, at the true end - never inside a nested struct that is not
+     * itself the last member. */
+    float water_depth;
 } ocean_desc;
 
 /* Fills `desc` with the same defaults the C++ API uses. Callers should always

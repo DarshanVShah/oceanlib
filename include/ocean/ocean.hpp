@@ -62,6 +62,18 @@ struct SpectrumDesc {
     float small_wave_cutoff = 0.5f;
 
     float gravity = 9.81f;
+
+    // Water depth in metres, for the finite-depth dispersion relation
+    // omega^2 = g*k*tanh(k*depth). <= 0 (the default) means deep water,
+    // omega = sqrt(g*k) - the classic open-ocean assumption, exact whenever
+    // depth exceeds roughly half the longest wavelength represented. Set a
+    // finite positive value for a coastal or shallow scene: waves slow down
+    // and shorten as the bottom shoals, which this changes correctly, but the
+    // JONSWAP spectral *shape* itself is not re-derived for shallow water
+    // (that would be the TMA spectrum, a further refinement this does not
+    // attempt) - only the dispersion relation used to place that shape in
+    // wavenumber space.
+    float depth = 0.0f;
 };
 
 struct OceanDesc {

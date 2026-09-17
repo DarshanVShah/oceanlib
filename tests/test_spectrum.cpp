@@ -487,3 +487,246 @@ TEST_CASE("rows are generated independently of one another")
     CAPTURE(corr);
     CHECK(std::abs(corr) < 0.5);
 }
+// ---------------------------------------------------------------------------
+// Finite-depth dispersion
+// ---------------------------------------------------------------------------
+
+TEST_CASE("depth <= 0 is the exact deep-water branch, not an approximation")
+{
+    // dispersion_omega(g, k, depth<=0) must take the literal sqrt(g*k) code
+    // path, not evaluate tanh(k*depth) for some enormous depth that happens to
+    // be numerically indistinguishable from 1. This is what guarantees every
+    // existing deep-water test and every existing deep-water ocean is
+    // completely unaffected by this feature's existence - not merely close,
+    // identical.
+    for (double k : {0.001, 0.1, 1.0, 5.0, 50.0}) {
+        for (double depth : {0.0, -1.0, -1000.0}) {
+            CAPTURE(k);
+            CAPTURE(depth);
+            const double omega = dispersion_omega(9.81, k, depth);
+            CHECK(omega == std::sqrt(9.81 * k));  // bit-exact, not approximate
+
+            const double domega_dk = dispersion_domega_dk(9.81, k, omega, depth);
+            CHECK(domega_dk == 9.81 / (2.0 * omega));
+        }
+    }
+}
+
+TEST_CASE("large finite depth converges to the deep-water dispersion relation")
+{
+    // Not a special-cased branch this time - a genuinely large depth pushed
+    // through the tanh(kh) formula should converge numerically to the same
+    // deep-water answer the exact branch gives, which is the sanity check that
+    // the two code paths actually describe the same physics rather than two
+    // unrelated formulas that happen to both be called "dispersion".
+    constexpr double g = 9.81;
+    for (double k : {0.01, 0.1, 1.0, 3.0}) {
+        CAPTURE(k);
+        const double deep_omega = dispersion_omega(g, k, 0.0);
+
+        // depth = 10000 m gives kh >= 100 for every k tested, where
+        // tanh(kh) agrees with 1 to better than 1e-86 - the discrepancy here
+        // is float/double rounding, not physics.
+        const double shallow_branch_omega = dispersion_omega(g, k, 10000.0);
+        CHECK(shallow_branch_omega == doctest::Approx(deep_omega).epsilon(1e-9));
+
+        const double deep_domega_dk = dispersion_domega_dk(g, k, deep_omega, 0.0);
+        const double converged_domega_dk =
+            dispersion_domega_dk(g, k, shallow_branch_omega, 10000.0);
+        CHECK(converged_domega_dk == doctest::Approx(deep_domega_dk).epsilon(1e-9));
+    }
+}
+
+TEST_CASE("the very-shallow limit recovers the non-dispersive wave speed sqrt(g*h)")
+{
+    // The textbook shallow-water result: as k*h -> 0, tanh(kh) -> kh, so
+    //   omega^2 = g*k*tanh(kh) -> g*k*(kh) = g*h*k^2
+    //   omega -> k*sqrt(g*h)
+    // i.e. phase speed c = omega/k -> sqrt(g*h), independent of k. This is why
+    // a tsunami (an extremely long wave over an ordinary ocean depth) is
+    // non-dispersive and travels at a speed set by depth alone - the physical
+    // fact this formula exists to reproduce.
+    constexpr double g = 9.81;
+    constexpr double depth = 4.0;  // shallow: a few metres
+    const double expected_speed = std::sqrt(g * depth);
+
+    // k small enough that k*depth << 1 (here k*depth ~ 0.004 at the smallest).
+    for (double k : {0.001, 0.002, 0.005}) {
+        CAPTURE(k);
+        const double omega = dispersion_omega(g, k, depth);
+        const double phase_speed = omega / k;
+        CAPTURE(phase_speed);
+        CAPTURE(expected_speed);
+        // 1% at k*depth = 0.005: the leading correction to the non-dispersive
+        // limit is O((kh)^2), i.e. ~2.5e-5 here, so 1% is a generous bound
+        // that would still catch a wrong formula (e.g. a forgotten tanh).
+        CHECK(phase_speed == doctest::Approx(expected_speed).epsilon(0.01));
+    }
+}
+
+TEST_CASE("domega_dk matches a central finite difference across all three regimes")
+{
+    // Validates the calculus directly, independent of any physical
+    // interpretation: this is what catches an algebra slip in differentiating
+    // omega^2 = g*k*tanh(kh), which is exactly the kind of hand-derived
+    // formula that is easy to get subtly wrong (a sign, a missing factor of 2)
+    // while still producing something that looks plausible.
+    constexpr double g = 9.81;
+    for (double depth : {0.0, 2.0, 20.0, 500.0}) {
+        for (double k : {0.02, 0.2, 1.0, 4.0}) {
+            CAPTURE(depth);
+            CAPTURE(k);
+
+            const double eps = k * 1e-5;
+            const double om_plus  = dispersion_omega(g, k + eps, depth);
+            const double om_minus = dispersion_omega(g, k - eps, depth);
+            const double numeric_domega_dk = (om_plus - om_minus) / (2.0 * eps);
+
+            const double omega = dispersion_omega(g, k, depth);
+            const double analytic_domega_dk = dispersion_domega_dk(g, k, omega, depth);
+
+            CAPTURE(numeric_domega_dk);
+            CAPTURE(analytic_domega_dk);
+            CHECK(analytic_domega_dk ==
+                  doctest::Approx(numeric_domega_dk).epsilon(1e-4));
+        }
+    }
+}
+
+TEST_CASE("shallower water never travels faster: omega(k) decreases monotonically as depth shoals")
+{
+    // tanh(kh) <= 1 always, with equality only as h -> infinity, so
+    // omega_shallow(k) = sqrt(g k tanh(kh)) <= sqrt(g k) = omega_deep(k) for
+    // every k and every finite depth. This is the direction real waves
+    // actually shoal in: for a fixed wavenumber, finite depth can only slow
+    // the wave down, never speed it up. A sign error in the tanh argument
+    // would violate this immediately and obviously.
+    constexpr double g = 9.81;
+    for (double k : {0.05, 0.5, 2.0, 8.0}) {
+        const double deep = dispersion_omega(g, k, 0.0);
+        double previous = deep;
+        for (double depth : {200.0, 50.0, 10.0, 3.0, 1.0}) {
+            CAPTURE(k);
+            CAPTURE(depth);
+            const double shallow = dispersion_omega(g, k, depth);
+            CHECK(shallow <= previous);
+            previous = shallow;
+        }
+    }
+}
+
+TEST_CASE("the polar energy-conservation identity holds in shallow water too")
+{
+    // The strongest available end-to-end check, extended from the deep-water
+    // version above to a genuinely shallow depth. It exercises the SAME
+    // JONSWAP frequency-space shape (deliberately unmodified - see the note on
+    // SpectrumDesc::depth about TMA) combined with the NEW dispersion relation
+    // and its matching Jacobian, and requires them to still integrate to the
+    // same total energy. Getting the shallow-water domega/dk formula wrong
+    // while getting dispersion_omega right (or vice versa) would break this
+    // even though each function's own unit tests above would still pass -
+    // this is what catches the two of them disagreeing with each other.
+    SpectrumDesc d = default_spectrum();
+    d.depth = 5.0f;  // genuinely shallow relative to the wavelengths below
+
+    constexpr double k_max = 2.0;  // rad/m
+    const double omega_max = dispersion_omega(9.81, k_max, 5.0);
+
+    constexpr int k_steps = 4000;
+    constexpr int t_steps = 720;
+    const double dk = k_max / k_steps;
+    const double dt = kTwoPi / t_steps;
+
+    double polar = 0.0;
+    for (int ik = 0; ik < k_steps; ++ik) {
+        const double k = (ik + 0.5) * dk;
+        for (int it = 0; it < t_steps; ++it) {
+            const double theta = -kPi + (it + 0.5) * dt;
+            const double kx = k * std::cos(theta);
+            const double kz = k * std::sin(theta);
+            polar += wave_density(d, kx, kz) * k * dk * dt;
+        }
+    }
+
+    const double spectral = integrate_jonswap(d, omega_max, 20000);
+
+    CAPTURE(polar);
+    CAPTURE(spectral);
+    CHECK(polar == doctest::Approx(spectral).epsilon(0.01));
+}
+
+TEST_CASE("build_spectrum produces finite, depth-aware tables with no NaNs")
+{
+    // A regression/plumbing check: depth actually reaches build_spectrum's
+    // per-cell omega table (not just wave_density's amplitude calculation),
+    // and the whole table stays finite even at the DC bin where k = 0 and a
+    // careless tanh(0*depth)/0 could produce a NaN.
+    OceanDesc d;
+    d.size         = 64;
+    d.patch_length = 100.0f;
+    d.spectrum     = default_spectrum();
+    d.spectrum.depth = 3.0f;  // shallow
+
+    SpectrumTables t;
+    build_spectrum(d, t);
+
+    const std::size_t cells = static_cast<std::size_t>(d.size) * d.size;
+    bool any_nonzero_omega = false;
+    for (std::size_t i = 0; i < cells; ++i) {
+        REQUIRE(std::isfinite(t.omega[i]));
+        REQUIRE(t.omega[i] >= 0.0f);
+        if (t.omega[i] > 0.0f) any_nonzero_omega = true;
+
+        // Every finite-depth omega must be <= the deep-water omega at the
+        // same k (see the monotonicity test above) - checked here on the
+        // actual production table, not just the standalone function.
+        const double k = std::sqrt(static_cast<double>(t.kx[i]) * t.kx[i] +
+                                   static_cast<double>(t.kz[i]) * t.kz[i]);
+        const double deep = dispersion_omega(9.81, k, 0.0);
+        REQUIRE(t.omega[i] <= static_cast<float>(deep) + 1e-4f);
+    }
+    CHECK(any_nonzero_omega);
+    CHECK(t.omega[0] == 0.0f);  // DC bin: k = 0, omega must be exactly 0
+}
+
+TEST_CASE("shallow water changes the sea state relative to deep water at the same wind")
+{
+    // A qualitative end-to-end sanity check at the level a reviewer would
+    // actually look at: shoaling redistributes energy in k-space (shorter
+    // waves for the same frequency), so the realised RMS surface height at
+    // the same wind speed is expected to differ measurably between deep and
+    // shallow configurations - not by an enormous amount for a moderate
+    // depth, but not by zero either. This is a coarse check that the feature
+    // does something visible, complementing the precise analytic checks above.
+    OceanDesc deep;
+    deep.size         = 128;
+    deep.patch_length = 200.0f;
+    deep.seed         = 4242;
+    deep.spectrum     = default_spectrum();
+
+    OceanDesc shallow = deep;
+    shallow.spectrum.depth = 3.0f;
+
+    SpectrumTables deep_tables, shallow_tables;
+    build_spectrum(deep, deep_tables);
+    build_spectrum(shallow, shallow_tables);
+
+    const std::size_t cells = static_cast<std::size_t>(deep.size) * deep.size;
+    double deep_energy = 0.0, shallow_energy = 0.0;
+    for (std::size_t i = 0; i < cells; ++i) {
+        deep_energy += static_cast<double>(deep_tables.h0_re[i]) * deep_tables.h0_re[i] +
+                      static_cast<double>(deep_tables.h0_im[i]) * deep_tables.h0_im[i];
+        shallow_energy +=
+            static_cast<double>(shallow_tables.h0_re[i]) * shallow_tables.h0_re[i] +
+            static_cast<double>(shallow_tables.h0_im[i]) * shallow_tables.h0_im[i];
+    }
+
+    CAPTURE(deep_energy);
+    CAPTURE(shallow_energy);
+    // Not asserting a direction here deliberately - shoaling redistributes
+    // energy across k rather than uniformly scaling it, and with a fixed
+    // small-wave cutoff and fixed grid resolution the net effect on total
+    // realised energy is not obvious without solving the integral, so the
+    // meaningful claim is simply that depth is not a no-op.
+    CHECK(deep_energy != shallow_energy);
+}

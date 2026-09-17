@@ -1296,3 +1296,99 @@ project has any.
 If this ever runs on physical ARM hardware (a Raspberry Pi 5, an AWS Graviton
 instance, an Apple Silicon Mac under Linux), running `ocean_tests` there once
 is the remaining, final word - not this ADR.
+
+---
+
+## ADR-019 - Shallow-water dispersion, and a general rule for C struct versioning
+
+### The physics: one function changes, nothing else does
+
+Deep water assumes depth exceeds roughly half the longest represented
+wavelength, which is true for open ocean but false near a coastline. The full
+relation is `omega^2 = g k tanh(k h)`, deep water being its `h -> infinity`
+limit. Everything else in the spectrum - the JONSWAP frequency-space shape,
+the directional spreading, fetch and wind - is defined in frequency space and
+is unaffected by depth; only the mapping between frequency and wavenumber
+changes. That mapping is used in exactly two places: `wave_density()`'s
+`domega/dk` Jacobian, and the per-cell `omega` table `build_spectrum()` writes
+once at construction. Both now call a shared `dispersion_omega` /
+`dispersion_domega_dk` pair instead of a hardcoded `sqrt(g*k)`.
+
+This is deliberately the *dispersion-relation* generalisation only, not the
+*spectral-shape* generalisation. A more complete treatment (the TMA spectrum)
+also reshapes the JONSWAP curve itself for shallow water; that is a further
+refinement this does not attempt, and `SpectrumDesc::depth`'s doc comment says
+so rather than implying this is the full physical picture.
+
+**The deep-water branch is a literal special case, not a numerical
+coincidence.** `depth <= 0` returns `sqrt(g*k)` directly rather than evaluating
+`tanh(k*depth)` for some very large depth that happens to be close to 1. Every
+existing deep-water test, and every existing deep-water ocean, is therefore
+provably unaffected by this feature's existence - confirmed by the build
+having identical assertion counts before and after this change landed.
+
+**`sech^2(kh)` is computed as `1 - tanh(kh)^2`, not `1/cosh(kh)^2`.** `cosh`
+overflows a double for `kh` above a few hundred, while `tanh` saturates safely
+to 1.0. A coastal depth combined with a short-wave wavenumber routinely pushes
+`kh` into the thousands, so this is a real, not theoretical, overflow risk.
+
+### Verification
+
+Beyond the usual bit-level checks, this adds tests anchored to closed-form
+textbook results, in the style of the fetch-scaling law in ADR-009:
+
+- **The very-shallow limit recovers `omega -> k sqrt(g h)`** - the classic
+  non-dispersive shallow-water wave speed (why a tsunami, an extremely long
+  wave over ordinary depth, is non-dispersive and moves at a speed set by
+  depth alone).
+- **`domega/dk` is checked against a central finite difference** across deep,
+  shallow and transitional depths - this validates the calculus directly,
+  independent of any physical interpretation, which is what catches an algebra
+  slip (a sign, a missing factor of 2) in a hand-differentiated formula.
+- **A monotonicity property**: `tanh(kh) <= 1` always, so shallow-water omega
+  can only be less than or equal to deep-water omega at the same k, never
+  greater. A sign error in the tanh argument would violate this immediately.
+- **The polar energy-conservation identity (ADR-009's strongest check)**,
+  re-run at a genuinely shallow depth. This is what catches
+  `dispersion_omega` and `dispersion_domega_dk` disagreeing with *each other*
+  even if each passed its own unit tests above.
+
+Measured, not asserted, at 12 m/s wind: switching from deep water to a 4 m
+depth raises realised spectral energy by about 15% and visibly shortens and
+compresses the wave crests in the viewer (screenshots taken with the same
+`--frames`/seed for a fair comparison) - consistent with real shoaling
+(Green's law: energy density rises as group velocity falls), though no
+specific magnitude is asserted in the test suite, since deriving the exact
+expected number would require solving the flux-conservation integral this
+project has not attempted; the test only requires the two differ.
+
+### A general finding about C struct versioning: fields can hide in padding
+
+Adding the C API's `water_depth` field surfaced something worth documenting on
+its own, independent of ocean physics: `ocean_desc` grew a field with **no
+change in `sizeof()`**. `thread_count` (the previous last field, a `uint32_t`)
+ended 4 bytes short of the struct's required 8-byte alignment - forced by the
+`size_t`/pointer/`uint64_t` members elsewhere in the struct - so the compiler
+was already inserting 4 bytes of invisible tail padding. `water_depth` (also
+4 bytes) exactly fills that padding rather than growing the struct further.
+
+This matters for ADR-014's `struct_size` mechanism generally: **a caller's
+`struct_size` cannot always distinguish "built before this field existed" from
+"built after," because the two can produce numerically identical struct
+sizes.** What still makes the old caller safe is the *other* half of the
+convention this API already documented: `ocean_desc_init()` zero-fills the
+entire struct before setting known fields, so a caller who follows that
+convention has zeros - not garbage - sitting in what was their padding, and
+zero happens to be `water_depth`'s correct default (deep water). A caller who
+hand-rolled their struct without zeroing it first would not be protected by
+`struct_size` alone in this specific case.
+
+The practical rule this yields, for every future field: **appending at the
+true end of the outermost struct keeps `struct_size` meaningful; relying on
+`struct_size` changing at all is not guaranteed; and `ocean_desc_init` is not
+a convenience, it is the load-bearing half of the compatibility promise.**
+Verified with two chained legacy-struct tests: one from before the threading
+fields existed (genuinely smaller, `struct_size` differs), and one from
+immediately before `water_depth` (numerically the same size, protected only by
+zero-initialisation) - the second is the one that actually exercises this
+finding rather than the easier case.

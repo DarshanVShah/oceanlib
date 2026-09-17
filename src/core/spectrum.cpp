@@ -21,6 +21,29 @@ double wrap_angle(double a) noexcept
 }  // namespace
 
 // ---------------------------------------------------------------------------
+// Dispersion relation
+// ---------------------------------------------------------------------------
+
+double dispersion_omega(double gravity, double k, double depth) noexcept
+{
+    if (!(k > 0.0)) return 0.0;
+    if (depth <= 0.0) return std::sqrt(gravity * k);  // deep water, exact branch
+    return std::sqrt(gravity * k * std::tanh(k * depth));
+}
+
+double dispersion_domega_dk(double gravity, double k, double omega,
+                            double depth) noexcept
+{
+    if (!(omega > 0.0)) return 0.0;
+    if (depth <= 0.0) return gravity / (2.0 * omega);
+
+    const double kh   = k * depth;
+    const double th   = std::tanh(kh);
+    const double sech2 = 1.0 - th * th;  // 1 - tanh^2, never overflows
+    return gravity * (th + kh * sech2) / (2.0 * omega);
+}
+
+// ---------------------------------------------------------------------------
 // JONSWAP
 // ---------------------------------------------------------------------------
 //
@@ -179,11 +202,13 @@ double wave_density(const SpectrumDesc& d, double kx, double kz)
 
     const double k = std::sqrt(k2);
     const double g = d.gravity;
+    const double depth = static_cast<double>(d.depth);
 
-    // Deep-water dispersion. Valid while depth > ~L/2, which holds for open
-    // ocean at every wavelength we represent. Shallow water would need the
-    // full omega^2 = g*k*tanh(k*h); that is a V2 concern.
-    const double omega = std::sqrt(g * k);
+    // Deep water unless d.depth is set: omega = sqrt(g*k) either way, but the
+    // depth<=0 branch inside dispersion_omega takes that literally rather than
+    // evaluating a tanh() that happens to be close to 1, so this line changes
+    // nothing for any scene that does not opt into shallow water.
+    const double omega = dispersion_omega(g, k, depth);
 
     const double s_omega = jonswap(d, omega);
     if (!(s_omega > 0.0)) return 0.0;
@@ -191,7 +216,8 @@ double wave_density(const SpectrumDesc& d, double kx, double kz)
     // Two changes of variable, and both are easy to get wrong:
     //
     // 1. Frequency -> wavenumber. S(k) dk = S(omega) domega, so we multiply by
-    //    the Jacobian domega/dk. With omega = sqrt(g*k), domega/dk = g/(2*omega).
+    //    the Jacobian domega/dk (dispersion_domega_dk - g/(2*omega) in deep
+    //    water, the finite-depth group-velocity expression otherwise).
     //
     // 2. Polar -> Cartesian. The 2D density must satisfy
     //       integral Psi(kx,kz) dkx dkz = integral S(k) D(theta) dk dtheta,
@@ -200,7 +226,7 @@ double wave_density(const SpectrumDesc& d, double kx, double kz)
     // Forgetting the 1/k is the classic bug here: the surface still looks like
     // an ocean, but the energy balance across scales is wrong, so it never
     // quite matches a real sea state at any wind speed.
-    const double domega_dk = g / (2.0 * omega);
+    const double domega_dk = dispersion_domega_dk(g, k, omega, depth);
     const double theta     = std::atan2(kz, kx);
     const double spread    = directional_spread(d, omega, theta);
 
@@ -263,7 +289,9 @@ void build_spectrum(const OceanDesc& desc, SpectrumTables& out)
                               static_cast<double>(kz_row) * kz_row;
             const double k  = std::sqrt(k2);
 
-            out.omega[i] = static_cast<float>(std::sqrt(desc.spectrum.gravity * k));
+            out.omega[i] = static_cast<float>(
+                dispersion_omega(desc.spectrum.gravity, k,
+                                 static_cast<double>(desc.spectrum.depth)));
             out.k_inv[i] = (k > 0.0) ? static_cast<float>(1.0 / k) : 0.0f;
 
             const double psi = wave_density(desc.spectrum, kx_val, kz_row);

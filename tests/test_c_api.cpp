@@ -246,6 +246,116 @@ TEST_CASE("C defaults match C++ defaults exactly")
     CHECK(c.spectrum.swell == cpp.spectrum.swell);
     CHECK(c.spectrum.small_wave_cutoff == cpp.spectrum.small_wave_cutoff);
     CHECK(c.spectrum.gravity == cpp.spectrum.gravity);
+    CHECK(c.water_depth == cpp.spectrum.depth);
+}
+
+TEST_CASE("water_depth translates into SpectrumDesc::depth and back")
+{
+    // water_depth lives at the top level of ocean_desc rather than inside
+    // ocean_spectrum_desc for ABI reasons (see ocean.h), so this checks the
+    // translate() layer actually bridges the two without transposing it with
+    // some other field or leaving it at zero by accident.
+    ocean_desc d = make_c_desc(32);
+    d.water_depth = 6.5f;
+
+    ocean_sim* sim = ocean_create(&d, nullptr);
+    REQUIRE(sim != nullptr);
+    ocean_update(sim, 3.0);
+
+    ocean::OceanDesc cpp = make_cpp_desc(32);
+    cpp.spectrum.depth = 6.5f;
+    ocean::Ocean reference{cpp};
+    reference.update(3.0);
+
+    const std::size_t bytes = 32u * 32u * 4 * sizeof(float);
+    CHECK(std::memcmp(reference.buffers().displacement,
+                      ocean_get_buffers(sim).displacement, bytes) == 0);
+
+    ocean_destroy(sim);
+}
+
+namespace {
+
+// The struct exactly as it stood before water_depth was appended - one layer
+// older than LegacyDesc above, which predates the threading fields.
+//
+// NOTE ON SIZE: on this ABI, sizeof(LegacyDescBeforeDepth) == sizeof(ocean_desc)
+// - both 88 bytes - even though this struct has one fewer field. `thread_count`
+// (a uint32_t) ends 4 bytes short of the struct's required 8-byte alignment
+// (forced by the size_t/pointers/uint64_t members), so the OLD struct already
+// carried 4 bytes of compiler-inserted TAIL PADDING to round up to 88.
+// Appending `water_depth` (also 4 bytes) exactly fills that existing padding
+// rather than growing the struct further. This is worth knowing as a general
+// property of size-based struct versioning, not just a quirk of this project:
+// a new field can fit inside old alignment padding with NO change in
+// sizeof(), so `struct_size` alone cannot always distinguish old callers from
+// new ones by size. What still makes this safe is the documented convention
+// (see ocean_desc_init's own comment) that callers zero-initialise before
+// filling fields - a real old caller who followed that convention has zeros,
+// not garbage, sitting in what was their padding, and zero happens to be
+// water_depth's correct default. A caller who skipped ocean_desc_init and
+// left their struct's padding as whatever the stack or heap happened to
+// contain would not be protected by struct_size here - which is exactly why
+// ocean_desc_init is not merely a convenience but the documented, load-bearing
+// way to build this struct.
+struct LegacyDescBeforeDepth {
+    std::size_t            struct_size;
+    std::uint32_t          size;
+    float                  patch_length;
+    ocean_spectrum_desc    spectrum;
+    float                  choppiness;
+    float                  foam_threshold;
+    std::uint64_t          seed;
+    ocean_parallel_for_fn  parallel_for;
+    void*                  parallel_for_user;
+    std::uint32_t          thread_count;
+};
+
+}  // namespace
+
+TEST_CASE("a caller built before water_depth existed still gets deep water, when zero-initialised")
+{
+    // legacy{} value-initialises every byte of the struct to zero, including
+    // the trailing 4 bytes that are padding in THIS struct's own layout but
+    // become the live water_depth field once reinterpreted as the current
+    // ocean_desc (see the comment above LegacyDescBeforeDepth). That is
+    // exactly what following the documented "always zero first" convention
+    // gives a real caller for free, and it is the property this test exists
+    // to check - not merely "an old caller happens to work".
+    LegacyDescBeforeDepth legacy{};
+    legacy.struct_size = sizeof(LegacyDescBeforeDepth);
+    legacy.size         = 64;
+    legacy.patch_length = 200.0f;
+    legacy.spectrum.wind_speed        = 11.0f;
+    legacy.spectrum.fetch             = 100000.0f;
+    legacy.spectrum.wind_direction    = 0.25f;
+    legacy.spectrum.peak_enhancement  = 3.3f;
+    legacy.spectrum.swell             = 0.0f;
+    legacy.spectrum.small_wave_cutoff = 0.5f;
+    legacy.spectrum.gravity           = 9.81f;
+    legacy.choppiness      = 1.0f;
+    legacy.foam_threshold  = 0.5f;
+    legacy.seed            = 555777;
+    legacy.parallel_for      = nullptr;
+    legacy.parallel_for_user = nullptr;
+    legacy.thread_count      = 0;
+
+    ocean_status s = OCEAN_ERROR_UNKNOWN;
+    ocean_sim* sim =
+        ocean_create(reinterpret_cast<const ocean_desc*>(&legacy), &s);
+    REQUIRE(sim != nullptr);
+    REQUIRE(s == OCEAN_OK);
+
+    ocean_update(sim, 1.25);
+
+    ocean::Ocean reference{make_cpp_desc(64)};  // depth left at its 0.0f default
+    reference.update(1.25);
+
+    const std::size_t bytes = 64u * 64u * 4 * sizeof(float);
+    CHECK(std::memcmp(reference.buffers().displacement,
+                      ocean_get_buffers(sim).displacement, bytes) == 0);
+
+    ocean_destroy(sim);
 }
 
 namespace {

@@ -9,6 +9,8 @@
 //   --mesh M          mesh quads per tile edge (default 256)
 //   --tiles T         tiles per side, odd (default 7)
 //   --wind U          wind speed in m/s (default 12)
+//   --depth D         water depth in metres for shallow-water dispersion
+//                     (default 0 = deep water; try 3-8 for visibly shoaled waves)
 //   --chop C          choppiness / Tessendorf lambda (default 1.0)
 //   --foam F          Jacobian threshold for foam (default 0.6)
 //   --wireframe       start in wireframe mode
@@ -42,6 +44,7 @@ struct Options {
     std::uint32_t mesh   = 256;
     std::uint32_t tiles  = 7;
     float         wind   = 12.0f;
+    float         depth  = 0.0f;   // <= 0 = deep water
     float         chop   = 1.0f;
     float         foam   = 0.6f;
     bool          wireframe = false;
@@ -64,6 +67,7 @@ Options parse_args(int argc, char** argv)
         else if (a == "--mesh")        o.mesh  = std::strtoul(next(), nullptr, 10);
         else if (a == "--tiles")       o.tiles = std::strtoul(next(), nullptr, 10);
         else if (a == "--wind")        o.wind  = std::strtof(next(), nullptr);
+        else if (a == "--depth")       o.depth = std::strtof(next(), nullptr);
         else if (a == "--chop")        o.chop  = std::strtof(next(), nullptr);
         else if (a == "--foam")        o.foam  = std::strtof(next(), nullptr);
         else if (a == "--wireframe")   o.wireframe = true;
@@ -269,6 +273,7 @@ int main(int argc, char** argv)
     desc.seed                    = 1337;
     desc.choppiness              = input.choppiness;
     desc.spectrum.wind_speed     = opt.wind;
+    desc.spectrum.depth          = opt.depth;
     desc.spectrum.fetch          = 100000.0f;
     desc.spectrum.wind_direction = 0.4f;
     desc.foam_threshold          = opt.foam;
@@ -282,8 +287,14 @@ int main(int argc, char** argv)
 
     ocean::Ocean sim{desc};
     float active_choppiness = desc.choppiness;
-    std::printf("ocean: %ux%u, patch %.0f m, wind %.1f m/s, SIMD %s\n",
-                opt.size, opt.size, desc.patch_length, opt.wind,
+    char depth_desc[64];
+    if (opt.depth > 0.0f) {
+        std::snprintf(depth_desc, sizeof(depth_desc), "%.1f m (shallow)", opt.depth);
+    } else {
+        std::snprintf(depth_desc, sizeof(depth_desc), "infinite (deep water)");
+    }
+    std::printf("ocean: %ux%u, patch %.0f m, wind %.1f m/s, depth %s, SIMD %s\n",
+                opt.size, opt.size, desc.patch_length, opt.wind, depth_desc,
                 ocean_simd_level());
 
     viewer::OceanView view;

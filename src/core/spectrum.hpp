@@ -27,6 +27,38 @@ namespace ocean::detail {
 // small quantities, where float would lose real accuracy.
 // ---------------------------------------------------------------------------
 
+// Finite-depth dispersion relation, omega^2 = g k tanh(k h).
+//
+// `depth <= 0` selects the deep-water limit exactly (tanh(kh) -> 1 as
+// h -> infinity), which is the default and matches Tessendorf's original
+// omega = sqrt(g k) bit for bit - this is not an approximation of the deep
+// branch, it IS the deep branch, taken as a literal special case rather than
+// evaluated as a tanh() that happens to be very close to 1. That keeps every
+// existing deep-water test and every existing deep-water ocean unaffected by
+// this feature's existence.
+//
+// Exposed here (not just used internally) so tests can check the shallow and
+// deep limits, and the derivative below, against closed-form textbook results
+// rather than only against each other.
+double dispersion_omega(double gravity, double k, double depth) noexcept;
+
+// d(omega)/dk for the same relation - the group velocity, and the Jacobian
+// needed for the frequency-to-wavenumber change of variables in
+// wave_density(). Deep water: g/(2*omega). Finite depth, differentiating
+// omega^2 = g k tanh(kh) implicitly:
+//
+//   2 omega (domega/dk) = g [tanh(kh) + kh sech^2(kh)]
+//   domega/dk = g [tanh(kh) + kh sech^2(kh)] / (2 omega)
+//
+// which reduces to exactly g/(2*omega) as depth -> infinity (tanh -> 1,
+// sech^2 -> 0), matching dispersion_omega's own exact deep-water branch.
+// sech^2(kh) is computed as 1 - tanh(kh)^2 rather than 1/cosh(kh)^2, because
+// cosh(kh) overflows a double for kh above a few hundred while tanh saturates
+// safely to 1.0 - a real concern here, since a coastal depth combined with a
+// short-wave wavenumber routinely makes kh reach into the thousands.
+double dispersion_domega_dk(double gravity, double k, double omega,
+                            double depth) noexcept;
+
 // Peak angular frequency [rad/s]. omega_p = 22 * (g^2 / (U*F))^(1/3).
 double jonswap_peak_omega(const SpectrumDesc& d);
 
@@ -77,7 +109,8 @@ struct SpectrumTables {
     // across the whole grid, every frame, for every cell).
     AlignedBuffer<float> h0c_re, h0c_im;
 
-    // Deep-water dispersion omega(k) = sqrt(g*k), evaluated per cell.
+    // omega(k) per cell, from dispersion_omega() - deep water unless
+    // desc.spectrum.depth is set to a finite positive value.
     AlignedBuffer<float> omega;
 
     // Wavevector and 1/|k| (defined as 0 at the DC bin). Stored rather than

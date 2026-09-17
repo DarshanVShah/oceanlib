@@ -75,6 +75,11 @@ ocean::OceanDesc translate(const ocean_desc& c)
     d.foam_threshold = c.foam_threshold;
     d.seed           = c.seed;
 
+    // water_depth lives at the very end of the flat C struct (see ocean.h for
+    // why); it maps onto the nested C++ field here. This translate layer is
+    // exactly what lets the two layouts differ.
+    d.spectrum.depth = c.water_depth;
+
     // The callback types are layout-identical by construction: both are plain
     // function pointers taking (void*, uint32_t) and (void*, fn, void*,
     // uint32_t). Keeping them identical rather than wrapping means a host
@@ -126,6 +131,7 @@ void ocean_desc_init(ocean_desc* desc)
     desc->foam_threshold = d.foam_threshold;
     desc->seed           = d.seed;
     desc->thread_count   = d.thread_count;
+    desc->water_depth    = d.spectrum.depth;
 }
 
 ocean_sim* ocean_create(const ocean_desc* desc, ocean_status* out_status)
