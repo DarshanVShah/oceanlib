@@ -1,0 +1,6 @@
+# Shell scripts must keep LF endings regardless of platform checkout settings.
+# A CRLF shebang line ("#!/usr/bin/env bash\r") fails on Linux/WSL with a
+# cryptic "bad interpreter" or "$'\r': command not found" error - exactly the
+# failure mode scripts/verify-neon-qemu.sh would hit if a Windows checkout
+# with core.autocrlf=true were allowed to convert it.
+*.sh text eol=lf
