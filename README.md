@@ -6,7 +6,8 @@ CPU-side displacement / normal / foam buffers any renderer can upload.
 
 ![Calm sea, 12 m/s wind](docs/ocean-calm.png)
 
-512x512 waves update in **1.9 ms** on an i7-14700HX. Above: the included
+512x512 waves update in **1.43 ms** on an i7-14700HX - 16.6x faster than
+the first working version. Above: the included
 Vulkan viewer, 256x256 grid tiled 7x7, 6.4M triangles. The sun glitter is not
 an effect - it falls out of the wave slopes in the normal buffer.
 
@@ -29,8 +30,10 @@ Four promises, and every one of them is tested rather than asserted:
    renderer displays, with no GPU readback. Because choppy displacement moves
    vertices sideways, that is a fixed-point inversion rather than a lookup:
    measured mean error 0.01 mm against 21.8 mm for a naive direct lookup.
-3. **Deterministic.** Same seed and time give byte-identical buffers, across
-   runs, across thread counts, and across SIMD levels.
+3. **Deterministic.** Same seed and time give byte-identical buffers: across
+   runs, across thread counts, across SIMD levels, and across platforms - the
+   library ships its own PRNG, its own normal distribution and its own
+   sine/cosine precisely so that nothing depends on a vendor's libm.
 4. **Easy to integrate.** The output buffers are laid out as RGBA32F textures,
    so uploading the whole ocean is two `memcpy`s and two image copies.
 

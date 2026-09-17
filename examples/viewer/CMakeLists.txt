@@ -77,6 +77,9 @@ target_include_directories(ocean_viewer PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}" "${OCEAN_SHADER_DIR}")
 
 if(MSVC)
+  # The screenshot writer uses fopen, which MSVC deprecates in favour of its
+  # non-portable fopen_s. The viewer is cross-platform, so we keep fopen.
+  target_compile_definitions(ocean_viewer PRIVATE _CRT_SECURE_NO_WARNINGS)
   target_compile_options(ocean_viewer PRIVATE /W4 /permissive- /fp:precise)
 else()
   target_compile_options(ocean_viewer PRIVATE -Wall -Wextra)
