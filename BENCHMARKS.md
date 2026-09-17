@@ -313,3 +313,23 @@ making two screenshots from different configurations incomparable by
 construction, independent of anything about the library itself. Screenshot
 mode now advances by a fixed 1/60 s virtual timestep instead, which also makes
 it usable for visual regression testing across machines generally.
+
+---
+
+## NEON verification (QEMU aarch64 emulation)
+
+Measured 2026-09-18. No physical ARM hardware was used - see ARCHITECTURE.md
+ADR-018 for the full methodology and its limits. Cross-compiled with
+`aarch64-linux-gnu-g++` 13.3.0, run under `qemu-aarch64-static` 8.2.2 inside
+WSL2 Ubuntu 24.04, statically linked, `-O3`.
+
+```
+detected SIMD level: NEON
+test cases:     91 |     91 passed | 0 failed | 0 skipped
+assertions: 633425 | 633425 passed | 0 failed |
+```
+
+The FFT NEON stage kernel matched the scalar reference bit for bit across
+every stage, stride and size the test suite checks - the same standard held
+for the AVX2 and SSE2 kernels on x86. Reproducible via
+`scripts/verify-neon-qemu.sh`.

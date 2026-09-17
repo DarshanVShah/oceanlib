@@ -198,6 +198,14 @@ TEST_CASE("SIMD kernels handle sizes below the vector width")
 #include "core/spectrum.hpp"
 #include "ocean/ocean.hpp"
 
+// evolve_rows_avx2 is declared only when compiling for x86 (see evolve.hpp);
+// on any other target the symbol does not exist, so this whole test must be
+// compiled out there rather than merely skipped at runtime. Caught by
+// actually cross-compiling the suite for aarch64 under QEMU (ADR-018) - a
+// runtime-only guard (`if (max_simd_level() != Avx2) return;`) is NOT enough,
+// because the test still has to link against a symbol the target never has.
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+
 TEST_CASE("the AVX2 evolve kernel is bit-identical to the scalar one")
 {
     // Same contract as the FFT kernels, and the same reason: a vector path
@@ -244,3 +252,5 @@ TEST_CASE("the AVX2 evolve kernel is bit-identical to the scalar one")
                             a.storage.size() * sizeof(float)) == 0);
     }
 }
+
+#endif  // x86

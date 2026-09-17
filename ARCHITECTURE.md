@@ -817,12 +817,29 @@ second benefit — a polynomial we evaluate ourselves is bit-identical on every
 platform, where libm is not. That would close the last cross-runtime
 determinism gap noted in ADR-003.
 
-### The NEON kernel is unverified
+### The NEON kernel: verified under emulation, not yet on physical silicon
 
-It is written, reviewed and structurally identical to the SSE2 kernel, but it
-has never been executed: the development machine is x86-64. The bit-exactness
-test will validate it the first time the suite runs on ARM hardware, and *that
-run* is what should be trusted — not the code review.
+Update (ADR-018): the development machine is x86-64, so there is no physical
+ARM board here, but the NEON kernel HAS now been executed — cross-compiled for
+aarch64 and run under QEMU user-mode emulation, which translates real ARM64
+machine code, including real NEON vector instructions, rather than modelling
+the ISA abstractly. The library's own bit-exactness test ran on that build and
+passed: the FFT stage kernel matched `stage_scalar` to the bit, with the
+harness itself confirming `detect_simd_level() == Neon` so there was no doubt
+which code path executed. See ADR-018 for the full methodology and result.
+
+This closes almost all of the original gap. What is left: QEMU's NEON
+implementation is a software model of the ISA, and while it aims for (and in
+practice achieves) faithful IEEE-754 semantics for the plain multiply/add/
+subtract/select operations this kernel uses, it is not a substitute for
+running on physical silicon. The specific class of risk that remains is
+esoteric ARM floating-point behaviour QEMU might not reproduce exactly - flush-
+to-zero handling on denormals is the traditional example, though the kernel
+touches no denormal-prone values at the magnitudes an ocean spectrum produces.
+The bit-exactness test is cheap to rerun, so the honest recommendation stands:
+if this ever runs on a real ARM board (a Raspberry Pi 5, an AWS Graviton
+instance, an Apple Silicon Mac under Linux), rerun `ocean_tests` there once and
+treat that as the final word - not this paragraph.
 
 ---
 
@@ -1163,3 +1180,119 @@ simulation itself. Screenshot mode now advances by a fixed virtual 1/60 s
 timestep, decoupled from wall-clock render speed. This is a general
 correctness fix for reproducible visual regression testing, independent of the
 SIMD-forcing feature that surfaced it.
+
+---
+
+## ADR-018 — Verifying the NEON kernel without owning ARM hardware
+
+### The problem
+
+ADR-008 shipped a NEON kernel for the FFT with an honest caveat: it had never
+been executed, because the development machine is x86-64. A kernel that
+compiles but has never run is not evidence of anything - the AVX2 kernel's
+signed-zero bug (ADR-016) and the FMA-precision trap (ADR-013) were exactly the
+kind of thing that only surfaces when the code actually executes, not when it
+is merely read.
+
+### The mechanism: cross-compile, then run under emulation - not just compile
+
+Compiling for ARM with the cross toolchain proves the code is syntactically
+valid ARM and uses the intrinsics correctly enough to assemble. It proves
+nothing about whether the arithmetic is correct, because a compile-only check
+never executes a single NEON instruction.
+
+The fix was to actually run it. `aarch64-linux-gnu-g++` (from Ubuntu's
+`g++-aarch64-linux-gnu` package, installed into a WSL2 Ubuntu instance since
+the host is Windows) cross-compiles a fully static `ocean_tests` binary for
+aarch64. `qemu-aarch64-static` (from `qemu-user-static`) then executes that
+binary directly: QEMU's user-mode emulation translates real ARM64 machine
+code - including real NEON vector instructions - into the host's instructions,
+rather than modelling the ISA's behaviour abstractly. This is the same
+technique large open-source projects use to cover ARM in CI without owning ARM
+hardware.
+
+Two things had to be gotten right for this to work at all, both because CMake
+and QEMU each have a sharp edge here:
+
+**`CMAKE_SYSTEM_PROCESSOR` must be set explicitly.** Simply overriding
+`CMAKE_CXX_COMPILER` to the cross compiler does *not* make CMake think it is
+cross-compiling; `CMAKE_SYSTEM_PROCESSOR` silently stays as the host's
+`x86_64`. That would have made this project's own
+`CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|...)"` guard (ADR-013) incorrectly
+true on an ARM build, and it would have tried to pass `-mavx2` to the ARM
+compiler. A proper toolchain file setting `CMAKE_SYSTEM_NAME Linux` and
+`CMAKE_SYSTEM_PROCESSOR aarch64` fixes this, and also flips on
+`CMAKE_CROSSCOMPILING`, which is what lets `CMAKE_CROSSCOMPILING_EMULATOR
+qemu-aarch64-static` make `ctest` transparently run cross-compiled tests
+through the emulator.
+
+**The binary must be statically linked.** `qemu-aarch64-static` executes the
+ARM machine code itself but still needs an ARM dynamic linker
+(`/lib/ld-linux-aarch64.so.1`) and ARM shared libraries to satisfy a
+dynamically-linked binary's runtime dependencies - and none of that exists on
+an x86_64 host without installing a full ARM sysroot. `-static` removes the
+dependency entirely for the one-off purpose of running this test binary.
+
+### A real bug this caught immediately
+
+The very first cross-compile attempt failed - correctly. `tests/test_simd.cpp`
+called `evolve_rows_avx2` directly, guarded only by a *runtime* check
+(`if (max_simd_level() != Avx2) return;`). But `evolve_rows_avx2` is *declared*
+only inside an `#if defined(__x86_64__) || ...` block in `evolve.hpp` (ADR-016
+deliberately does not build an AVX2 evolve kernel for other architectures), so
+on aarch64 the symbol does not exist at all - a link-time failure, not
+something a runtime guard can prevent. The test needed the same compile-time
+`#if` around the whole `TEST_CASE`, not just a runtime skip inside it.
+
+This is exactly why "we should test on other platforms" is worth doing rather
+than asserting: the bug was in the *test suite's* portability, not the
+library, and nothing short of an actual cross-compile would have found it. It
+was fixed once, here, and is now permanent - it costs this project nothing on
+future x86 builds.
+
+### The result
+
+```
+detected SIMD level: NEON
+[doctest] test cases:     91 |     91 passed | 0 failed | 0 skipped
+[doctest] assertions: 633425 | 633425 passed | 0 failed |
+```
+
+(91, not 92: the AVX2-only test correctly does not exist on this target - see
+above.) Pulling out just the NEON-relevant assertions:
+
+```
+tests/test_simd.cpp:187: SUCCESS: REQUIRE( std::memcmp(a_re.data(), b_re.data(), n * sizeof(float)) == 0 )
+  logged: level_name(level) := NEON, n := 4
+```
+
+The FFT stage kernel's NEON path was actually exercised - confirmed by the
+harness's own `level_name(level)` capture, not inferred - and matched
+`stage_scalar` bit for bit, across every size and stage the test suite already
+checks for every other kernel.
+
+### What this does and does not prove
+
+It proves the NEON kernel is arithmetically correct on real ARM64 machine
+code, not merely that it compiles. It does **not** prove correctness on
+physical ARM silicon: QEMU's NEON implementation is a software model, and
+while it targets (and in practice achieves) faithful IEEE-754 semantics for
+the plain multiply/add/subtract/select operations this kernel uses, it is not
+a substitute for real hardware. The specific residual risk is exotic ARM
+floating-point behaviour QEMU might not reproduce exactly - flush-to-zero
+handling on denormals is the standard example - though the kernel never
+touches denormal-range values at the magnitudes an ocean spectrum produces.
+
+### Reproducing this
+
+`scripts/verify-neon-qemu.sh` automates the whole procedure: install the
+prerequisites (`g++-aarch64-linux-gnu`, `qemu-user-static`, `cmake`,
+`ninja-build`) inside a Linux environment (WSL2 on Windows), then run the
+script from the repo root. It cross-compiles and runs the full test suite
+under emulation in one step, so this is a repeatable check rather than a
+one-off manual procedure - and the natural thing to wire into CI once this
+project has any.
+
+If this ever runs on physical ARM hardware (a Raspberry Pi 5, an AWS Graviton
+instance, an Apple Silicon Mac under Linux), running `ocean_tests` there once
+is the remaining, final word - not this ADR.

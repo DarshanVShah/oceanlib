@@ -3,13 +3,13 @@
 // NEON is mandatory on AArch64, so this needs no runtime feature check - the
 // dispatch selects it whenever the build targets ARM64.
 //
-// NOT VERIFIED ON HARDWARE. This was written and reviewed but has never been
-// executed: the development machine is x86-64. It is structurally identical to
-// the SSE2 kernel and uses only the four most basic ASIMD operations, so the
-// risk is low, but "low risk" is not "tested". The library's own
-// "every SIMD kernel matches scalar bit for bit" test will validate it the
-// first time the suite is run on an ARM machine, and that run is what should
-// be trusted - not this comment.
+// Verified under QEMU user-mode emulation (real ARM64 machine code, real NEON
+// instructions - not modelled), cross-compiled with aarch64-linux-gnu-g++ and
+// run through the library's own bit-exactness test against stage_scalar. See
+// ADR-018. Not yet run on physical ARM silicon; that remains the final check
+// if this ever ships on real ARM hardware, though the risk left after passing
+// under emulation is small (the only realistic gap is exotic denormal/FTZ
+// behaviour, and this kernel touches no denormal-range values).
 #include "core/fft_kernel.hpp"
 
 #if defined(__aarch64__) || defined(_M_ARM64)
