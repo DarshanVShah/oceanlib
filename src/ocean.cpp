@@ -5,6 +5,7 @@
 #include "core/fft.hpp"
 #include "core/spectrum.hpp"
 
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -136,16 +137,146 @@ Buffers Ocean::buffers() const noexcept
     return b;
 }
 
+namespace {
+
+// Bilinear tap into a periodic N x N grid of 4-component texels.
+//
+// Precomputed once per sample point because every query reads several
+// components (dx, dz, height, normal, foam) at the same location, and the
+// index arithmetic and wrapping would otherwise be repeated for each.
+struct Tap {
+    std::size_t i00 = 0, i10 = 0, i01 = 0, i11 = 0;
+    float w00 = 1.0f, w10 = 0.0f, w01 = 0.0f, w11 = 0.0f;
+};
+
+std::uint32_t wrap_index(int i, int n) noexcept
+{
+    i %= n;
+    if (i < 0) i += n;
+    return static_cast<std::uint32_t>(i);
+}
+
+// `u`, `v` are positions in the undisplaced parameter plane, in metres.
+Tap make_tap(float u, float v, std::uint32_t n, float inv_cell) noexcept
+{
+    const float gu = u * inv_cell;
+    const float gv = v * inv_cell;
+
+    const float fu = std::floor(gu);
+    const float fv = std::floor(gv);
+
+    const int ni = static_cast<int>(n);
+    const std::uint32_t x0 = wrap_index(static_cast<int>(fu), ni);
+    const std::uint32_t z0 = wrap_index(static_cast<int>(fv), ni);
+    const std::uint32_t x1 = (x0 + 1u) % n;
+    const std::uint32_t z1 = (z0 + 1u) % n;
+
+    // Wrapping rather than clamping is correct, not a convenience: the FFT
+    // surface is exactly periodic with period `patch_length`, so the tile
+    // genuinely tiles, and a query far outside the patch is well defined.
+    const float tu = gu - fu;
+    const float tv = gv - fv;
+
+    Tap t;
+    t.i00 = (static_cast<std::size_t>(z0) * n + x0) * 4;
+    t.i10 = (static_cast<std::size_t>(z0) * n + x1) * 4;
+    t.i01 = (static_cast<std::size_t>(z1) * n + x0) * 4;
+    t.i11 = (static_cast<std::size_t>(z1) * n + x1) * 4;
+    t.w00 = (1.0f - tu) * (1.0f - tv);
+    t.w10 = tu * (1.0f - tv);
+    t.w01 = (1.0f - tu) * tv;
+    t.w11 = tu * tv;
+    return t;
+}
+
+float fetch(const float* buf, const Tap& t, int c) noexcept
+{
+    return buf[t.i00 + c] * t.w00 + buf[t.i10 + c] * t.w10 +
+           buf[t.i01 + c] * t.w01 + buf[t.i11 + c] * t.w11;
+}
+
+// How many fixed-point steps to take when inverting the displacement.
+//
+// The iteration converges linearly with rate |lambda * grad D|, which is below
+// 1 exactly where the surface has not folded. Four steps drive the residual to
+// well under a millimetre for ordinary choppiness, and the error is bounded by
+// rate^4 - see the convergence test, which measures it directly.
+constexpr int kInversionSteps = 4;
+
+}  // namespace
+
 float Ocean::height_at(float world_x, float world_z) const noexcept
 {
     return sample_at(world_x, world_z).height;
 }
 
-Surface Ocean::sample_at(float, float) const noexcept
+Surface Ocean::sample_at(float world_x, float world_z) const noexcept
 {
-    // Implemented in the next step (fixed-point inversion of the choppy
-    // displacement). Returns flat-water defaults until then.
-    return Surface{};
+    const Impl& m = *impl_;
+    const std::uint32_t n = m.desc.size;
+    const float inv_cell = static_cast<float>(n) / m.desc.patch_length;
+    const float* disp = m.displacement.data();
+
+    // Invert the horizontal displacement map.
+    //
+    // The renderer draws the cell at parameter position (u,v) at world
+    // position (u + lambda*Dx(u,v), v + lambda*Dz(u,v)). So the vertex that
+    // LANDS at (world_x, world_z) did not start there, and a direct lookup
+    // would read the wrong cell - the error growing exactly where choppiness
+    // matters most, at the crests.
+    //
+    // Solve  u + lambda*Dx(u,v) = world_x,  v + lambda*Dz(u,v) = world_z
+    // by fixed-point iteration, starting from the undisplaced guess:
+    //
+    //     u <- world_x - lambda*Dx(u,v)
+    //     v <- world_z - lambda*Dz(u,v)
+    //
+    // This is a contraction while |lambda * grad D| < 1, which is precisely
+    // the condition that the Jacobian stays positive - i.e. that the surface
+    // has not folded over itself. So the iteration converges wherever the
+    // surface is single-valued, and degrades exactly where it genuinely is
+    // not: inside a breaking wave there really are several surface points
+    // above one (x,z), and no solver can pick one for us.
+    //
+    // Newton would converge quadratically here, and we even have the Jacobian
+    // matrix on hand in the normal buffer. It is not worth it: each Newton
+    // step needs three extra bilinear fetches for the gradient terms, so two
+    // Newton steps cost about as much as five fixed-point steps, and four
+    // fixed-point steps are already past the accuracy the bilinear
+    // interpolation itself can deliver.
+    float u = world_x;
+    float v = world_z;
+    for (int it = 0; it < kInversionSteps; ++it) {
+        const Tap t = make_tap(u, v, n, inv_cell);
+        // Channels 0 and 2 already hold lambda*Dx and lambda*Dz.
+        u = world_x - fetch(disp, t, 0);
+        v = world_z - fetch(disp, t, 2);
+    }
+
+    const Tap t = make_tap(u, v, n, inv_cell);
+    const float* nrm = m.normal.data();
+
+    Surface s;
+    s.offset_x = fetch(disp, t, 0);
+    s.height   = fetch(disp, t, 1);
+    s.offset_z = fetch(disp, t, 2);
+    s.foam     = fetch(disp, t, 3);
+
+    // Interpolating unit vectors does not preserve length, so renormalise.
+    float nx = fetch(nrm, t, 0);
+    float ny = fetch(nrm, t, 1);
+    float nz = fetch(nrm, t, 2);
+    const float len2 = nx * nx + ny * ny + nz * nz;
+    if (len2 > 0.0f) {
+        const float inv = 1.0f / std::sqrt(len2);
+        nx *= inv; ny *= inv; nz *= inv;
+    } else {
+        nx = 0.0f; ny = 1.0f; nz = 0.0f;
+    }
+    s.normal_x = nx;
+    s.normal_y = ny;
+    s.normal_z = nz;
+    return s;
 }
 
 const OceanDesc& Ocean::desc() const noexcept { return impl_->desc; }

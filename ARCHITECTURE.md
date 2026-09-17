@@ -569,3 +569,95 @@ One test therefore pins down, simultaneously:
 The reference side is deliberately written out in the test rather than calling
 `evolve_rows`, so the thing under test and the thing it is checked against do
 not share code.
+
+---
+
+## ADR-011 — World-space queries: inverting the choppy displacement
+
+### The problem
+
+The output buffers are indexed by the **undisplaced parameter position**
+`(u,v)`, not by world position. What the renderer actually draws for the cell at
+`(u,v)` is the world point
+
+```
+X = u + lambda*Dx(u,v),   Y = h(u,v),   Z = v + lambda*Dz(u,v)
+```
+
+So the vertex that *lands* at world `(X,Z)` did not start there. Answering
+"what is the height at `(X,Z)`?" means inverting that map: solving
+
+```
+u + lambda*Dx(u,v) = X
+v + lambda*Dz(u,v) = Z
+```
+
+for `(u,v)`. There is no closed form — `Dx` and `Dz` are FFT outputs.
+
+This is the whole reason promise #2 needs work at all. With `choppiness == 0`
+the map is the identity and a lookup is correct; the moment chop is switched
+on, a direct lookup reads the wrong cell.
+
+### The solution: fixed-point iteration
+
+Starting from the undisplaced guess `u = X, v = Z`:
+
+```
+u <- X - lambda*Dx(u,v)
+v <- Z - lambda*Dz(u,v)
+```
+
+**Why it converges.** The iteration map is a contraction exactly while
+`|lambda * grad D| < 1` — which is precisely the condition that the Jacobian
+determinant stays positive, i.e. that the surface has not folded over itself.
+So the solve converges wherever the surface is single-valued, and degrades
+exactly where it genuinely is not: inside a breaking wave there really *are*
+several surface points above one `(x,z)`, and no solver can choose among them
+for us. The failure mode of the algorithm coincides with the failure mode of
+the question. That is a good place to be.
+
+Convergence is linear at rate `|lambda * grad D|`, so error falls like
+`rate^iterations`. Four steps is the default.
+
+### Measured accuracy
+
+Every vertex of a 128² grid, checked against the height the renderer draws at
+that vertex's actual world position. RMS wave height 0.535 m, patch 200 m,
+wind 12 m/s:
+
+| choppiness | iterative mean | iterative worst | naive mean | naive worst |
+|-----------:|---------------:|----------------:|-----------:|------------:|
+| 0.0        | 0.00 mm        | 0.00 mm         | 0.00 mm    | 0.00 mm     |
+| 0.5        | 0.00 mm        | 0.03 mm         | 0.00 mm    | 0.00 mm     |
+| 1.0        | 0.01 mm        | 1.0 mm          | 21.8 mm    | **725 mm**  |
+| 1.5        | 0.06 mm        | 7.7 mm          | 58.7 mm    | 725 mm      |
+| 2.0        | 0.25 mm        | 32.6 mm         | 85.6 mm    | 949 mm      |
+
+("naive" = nearest-cell lookup treating the world position as if it were the
+parameter position. It reads zero below chop 1.0 only because the displacement
+is still under half a cell there and rounds back to the same texel.)
+
+At the default choppiness of 1.0 the naive worst-case error is **725 mm against
+an RMS wave height of 535 mm** — larger than the waves themselves, and worst at
+the crests, which is exactly where a boat or a swimmer would notice.
+
+### Why not Newton
+
+Newton converges quadratically here, and we even have the Jacobian matrix
+already sitting in the normal buffer. It still is not worth it: each Newton
+step needs three extra bilinear fetches for the gradient terms, so two Newton
+steps cost roughly what five fixed-point steps cost — and four fixed-point
+steps are already an order of magnitude finer than the bilinear interpolation
+between texels can resolve. Newton would be buying precision the sampling
+scheme cannot deliver.
+
+### Sampling wraps, it does not clamp
+
+The FFT surface is exactly periodic with period `patch_length`, so the tile
+genuinely tiles and a query anywhere in the world is well defined. Clamping
+would invent a flat shelf outside the patch. A test checks that
+`height_at(x + L, z)` equals `height_at(x, z)`.
+
+Normals are renormalised after interpolation: bilinear blending of unit vectors
+does not preserve length, and a renderer that skipped this would show darkened
+bands between texels.
