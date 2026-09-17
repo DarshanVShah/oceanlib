@@ -28,6 +28,7 @@ add_library(ocean STATIC
   src/core/fft_kernel_neon.cpp
   src/core/spectrum.cpp
   src/core/evolve.cpp
+  src/core/evolve_kernel_avx2.cpp
   src/core/thread_pool.cpp
   src/ocean.cpp
   src/c_api.cpp
@@ -49,10 +50,12 @@ target_compile_features(ocean PUBLIC cxx_std_20)
 # older hardware - which would break promise #1.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|i[3-6]86|X86)")
   if(MSVC)
-    set_source_files_properties(src/core/fft_kernel_avx2.cpp
+    set_source_files_properties(
+      src/core/fft_kernel_avx2.cpp src/core/evolve_kernel_avx2.cpp
       PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
   else()
-    set_source_files_properties(src/core/fft_kernel_avx2.cpp
+    set_source_files_properties(
+      src/core/fft_kernel_avx2.cpp src/core/evolve_kernel_avx2.cpp
       PROPERTIES COMPILE_OPTIONS "-mavx2")
   endif()
 endif()

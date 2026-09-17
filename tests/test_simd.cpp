@@ -189,3 +189,58 @@ TEST_CASE("SIMD kernels handle sizes below the vector width")
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Spectrum evolution kernels
+// ---------------------------------------------------------------------------
+
+#include "core/evolve.hpp"
+#include "core/spectrum.hpp"
+#include "ocean/ocean.hpp"
+
+TEST_CASE("the AVX2 evolve kernel is bit-identical to the scalar one")
+{
+    // Same contract as the FFT kernels, and the same reason: a vector path
+    // that produced merely *close* results would make the ocean depend on
+    // which CPU rendered it.
+    //
+    // This one is harder to get right than the FFT kernel, because it contains
+    // a polynomial sine, an integer quadrant fold, and a signed-zero-sensitive
+    // negation at the DC bin. All three have to match exactly.
+    if (max_simd_level() != SimdLevel::Avx2) return;
+
+    for (std::uint32_t n : {16u, 32u, 64u, 128u}) {
+        CAPTURE(n);
+        ocean::OceanDesc d;
+        d.size                    = n;
+        d.patch_length            = 200.0f;
+        d.seed                    = 606 + n;
+        d.spectrum.wind_speed     = 13.0f;
+        d.spectrum.wind_direction = 0.9f;
+
+        SpectrumTables tables;
+        build_spectrum(d, tables);
+
+        FieldSet a, b;
+        a.allocate(n);
+        b.allocate(n);
+
+        // A spread of times, including 0 (every phase identical), a fraction
+        // of a second, and ten hours - where the double phase fold is doing
+        // real work.
+        for (double t : {0.0, 0.001, 1.0, 7.25, 3600.0, 36000.0}) {
+            CAPTURE(t);
+            evolve_rows_scalar(tables, t, a, 0, n);
+            evolve_rows_avx2(tables, t, b, 0, n);
+
+            REQUIRE(std::memcmp(a.storage.data(), b.storage.data(),
+                                a.storage.size() * sizeof(float)) == 0);
+        }
+
+        // Partial row ranges too, since that is how the scheduler calls it.
+        evolve_rows_scalar(tables, 2.5, a, 3, n - 1);
+        evolve_rows_avx2(tables, 2.5, b, 3, n - 1);
+        REQUIRE(std::memcmp(a.storage.data(), b.storage.data(),
+                            a.storage.size() * sizeof(float)) == 0);
+    }
+}

@@ -1004,3 +1004,96 @@ triangles collapse to sub-pixel size and waste vertex work. Tessellation
 shaders with distance-based tessellation levels are the fix, and were rejected
 for now because two extra pipeline stages would obscure the integration story
 the demo exists to tell.
+
+---
+
+## ADR-016 — Our own sine and cosine, and a vectorised evolve stage
+
+### Two reasons for a hand-written sincos, and the second matters more
+
+**Speed.** The per-frame path needs a sine *and* a cosine of the same angle for
+every grid cell — 262 144 pairs per frame at 512². Calling `std::sinf` and
+`std::cosf` separately performs the argument reduction twice, and neither can
+be inlined into a vector loop.
+
+**Determinism, which is the real reason.** ADR-003 left one gap open and said
+so: libm's transcendental functions are permitted to differ by an ULP between
+implementations, so a build on glibc and one on MSVC could produce oceans
+differing in the last bits. A polynomial we evaluate ourselves is the same
+sequence of IEEE multiplies and adds on every platform. **This closes that gap**
+— "same seed, same waves" is now true across platforms, not merely across runs
+of one binary.
+
+The algorithm is the standard Cephes single-precision reduction: fold into
+`[-pi/4, pi/4]` by quadrant with a two-part Cody-Waite subtraction, evaluate a
+minimax polynomial, then select and sign by quadrant. Measured error against a
+double reference over `[-2pi, 2pi]`: **1.47e-7 for sine, 1.29e-7 for cosine**,
+about 1.2 ULP — as good as float can represent.
+
+`floor(v + 0.5)` finds the quadrant, not `std::round` (a libm call) or
+`nearbyint` (depends on the current rounding mode, which we do not control).
+A fixed rule is what lets the SIMD kernel reproduce it exactly.
+
+### `fmod` was as expensive as the sine
+
+Replacing `std::sinf`/`cosf` with the polynomial gained 1.33x on the stage.
+Replacing a single `std::fmod` in the same loop — used to fold `omega*t` into
+`[0, 2pi)` — gained another 1.17x on top. `fmod` is a libm call that cannot be
+inlined into a vector loop, so it was both slow and an outright blocker to
+vectorising the stage at all. `d - floor(d)` on the scaled value replaces it,
+and `floor` is one instruction everywhere.
+
+The expectation going in was that the transcendentals dominated. They did not,
+quite. Measuring each change separately is what revealed that.
+
+### Bit-exactness had to be designed in, not hoped for
+
+Two details that would each have produced a one-bit mismatch:
+
+**The multiply order.** The scalar reduction first read
+`omega * time * kInvTwoPi` — two multiplies with an intermediate rounding —
+while the vector path would naturally use one multiply by a precomputed
+`time/(2pi)`. Those disagree in the last bit. The scalar function now takes the
+hoisted product as its argument, which fixes the operation count and order for
+both paths.
+
+**Signed zero.** The scalar code writes `-sx * hr`, which parses as
+`(-sx) * hr`. When `sx` is `+0.0` and `hr` is positive, IEEE gives `-0.0`. The
+obvious vector spelling `0.0 - (sx*hr)` gives `+0.0` instead, because `x - x`
+is `+0` in round-to-nearest. And `sx` **is** exactly zero — at the DC bin,
+every frame. The vector kernel negates by flipping the sign bit instead, which
+is bit-identical to unary minus for every finite value including negative zero.
+
+Both are enforced by a `memcmp` test across four grid sizes and six times,
+including t = 10 hours where the double phase fold is doing real work, and
+including partial row ranges because that is how the scheduler calls it.
+
+### AVX2 gave 7.66x here, against 1.62x for the FFT
+
+Same instruction set, same vector width, wildly different results — and the
+reason is instructive. The evolve stage streams eight input arrays and eight
+output arrays with unit stride, so every cache line fetched is fully used and
+the work is genuinely compute-bound. The FFT's column pass was touching one
+float per 64-byte line.
+
+This is the whole argument for profiling rather than assuming wider registers
+mean proportionally faster code.
+
+### Coverage is deliberately asymmetric
+
+The FFT has scalar, SSE2, AVX2 and NEON kernels. The evolve stage has scalar
+and AVX2 only.
+
+That is a measured trade-off, not an oversight. The FFT is the dominant cost at
+every size, so it earns full ISA coverage. Evolve is now 5% of frame time, and
+an SSE2 version would need a software `floor` (SSE4.1 introduced `roundps`, and
+SSE2 is the baseline we promise), while a NEON version could not be tested
+here. Both remain straightforward to add if the measurements ever justify it.
+
+### Result
+
+Evolve: **5.334 ms to 0.449 ms serial at 512², 11.9x.** Overall the ocean went
+from 23.620 ms single-threaded scalar to **1.426 ms**, a 16.6x improvement, with
+the FFT now 84% of what remains. BENCHMARKS.md records the specific remaining
+opportunity — the row pass still runs its first three stages scalar, where the
+stride is below the vector width.

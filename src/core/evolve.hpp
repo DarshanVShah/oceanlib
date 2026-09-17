@@ -65,6 +65,18 @@ struct FieldSet {
 void evolve_rows(const SpectrumTables& tables, double time, FieldSet& fields,
                  std::uint32_t row_begin, std::uint32_t row_end) noexcept;
 
+// The individual kernels, exposed so tests can compare them directly rather
+// than only through whichever one this machine happens to select.
+void evolve_rows_scalar(const SpectrumTables& tables, double time,
+                        FieldSet& fields, std::uint32_t row_begin,
+                        std::uint32_t row_end) noexcept;
+
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+void evolve_rows_avx2(const SpectrumTables& tables, double time,
+                      FieldSet& fields, std::uint32_t row_begin,
+                      std::uint32_t row_end) noexcept;
+#endif
+
 // Turn the four transformed fields into the public interleaved buffers, for
 // rows [row_begin, row_end). Computes displacement, the exact normal of the
 // displaced surface, the Jacobian and the foam term.

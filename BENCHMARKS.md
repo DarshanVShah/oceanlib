@@ -176,3 +176,87 @@ one `cosf` per cell, 262 144 of each per frame. A vectorised polynomial
 sine/cosine is the next lever, and it would also close the cross-runtime
 determinism gap from ADR-003, since a polynomial we evaluate ourselves is
 bit-identical everywhere while libm is not.
+
+---
+
+## Vectorised spectrum evolution
+
+Measured 2026-09-17, same machine and settings.
+
+| N     | serial (ms) | threaded (ms) | speedup | evolve (ms) | FFT (ms) | finalise (ms) | Mcell/s |
+|------:|------------:|--------------:|--------:|------------:|---------:|--------------:|--------:|
+| 64x   |       0.098 |         0.098 |   1.00x |       0.007 |    0.083 |         0.009 |    41.8 |
+| 128x  |       0.401 |         0.343 |   1.17x |       0.029 |    0.331 |         0.037 |    47.8 |
+| 256x  |       1.664 |         0.503 |   3.31x |       0.119 |    1.359 |         0.222 |   130.2 |
+| 512x  |       8.378 |         1.426 |   5.88x |       0.449 |    7.002 |         0.623 |   183.8 |
+
+### The evolve stage, in three steps
+
+The stage was 5.334 ms serial at 512 squared. Each change was measured
+separately rather than bundled, because that is the only way to know which one
+actually paid:
+
+| change                                   | evolve (ms) | gain  |
+|------------------------------------------|------------:|------:|
+| baseline (`std::sinf`/`cosf`, `std::fmod`) |       5.334 |     - |
+| own polynomial sincos                    |       4.024 | 1.33x |
+| `d - floor(d)` instead of `std::fmod`     |       3.439 | 1.17x |
+| AVX2 kernel                              |   **0.449** | 7.66x |
+| **total**                                |             | **11.9x** |
+
+Two things worth noting:
+
+**The polynomial sincos was not the big win — `fmod` was comparable.** The
+expectation going in was that the transcendentals dominated. Replacing them
+gained 1.33x; replacing a single `std::fmod` in the same loop gained another
+1.17x on top. `fmod` is a libm call that cannot be inlined into a vector loop,
+so it was both slow and an outright blocker to vectorising the stage at all.
+
+**AVX2 gave 7.66x, close to the theoretical 8x** - in sharp contrast to the
+FFT, which gave only 1.62x before the memory layout was fixed. The difference
+is the access pattern: evolve streams eight input arrays and eight output
+arrays with unit stride, so every cache line fetched is fully used. The FFT's
+column pass was touching one float per line. Same instruction set, same vector
+width, wildly different results - which is the whole argument for profiling
+rather than assuming that wider registers mean proportionally faster code.
+
+Caveat on this number: the benchmark loops over a 16 MB working set, which fits
+in this CPU's 33 MB L3. A real frame shares L3 with a renderer, so the evolve
+stage would be somewhat slower in situ.
+
+## Overall progress at 512 squared
+
+| build                                         | serial (ms) | threaded (ms) |
+|-----------------------------------------------|------------:|--------------:|
+| scalar, single-threaded                       |      23.620 |             - |
+| + threads                                     |      25.558 |         2.919 |
+| + AVX2 FFT (naive)                            |      18.301 |         2.422 |
+| + batched FFT columns                         |      13.371 |         1.913 |
+| + own polynomial sincos                       |      12.234 |         1.862 |
+| + floor-based phase fold                      |      11.805 |         1.608 |
+| + AVX2 evolve                                 |   **8.378** |     **1.426** |
+
+**16.6x overall.** A 512x512 ocean now updates in 1.43 ms, leaving 15.2 ms of a
+60 Hz frame for everything else.
+
+### Where the time goes now
+
+At 512 squared serial: **FFT 7.00 ms (84%)**, evolve 0.45 ms (5%), finalise
+0.62 ms (7%). The FFT is dominant again.
+
+The remaining FFT opportunity is specific and measured: the row pass still runs
+its first three stages scalar, because there the memory stride `s` is 1, 2 and
+4, all below the 8-float vector width. That is 3 of 9 stages at N = 512, so
+roughly a third of the row-pass butterflies. The column pass does not have this
+problem, because batching eight columns multiplies the stride by eight.
+
+Two ways to fix it, neither yet attempted:
+
+1. A **radix-8 first stage**, folding s = 1, 2 and 4 into one pass that is
+   vectorisable by construction.
+2. A **blocked transpose** before the row pass, so rows can be batched the same
+   way columns already are. Costs two extra passes over memory, which may eat
+   the gain - it would have to be measured.
+
+Finalisation at 7% is memory-bound (it writes 8 MB per frame at 512 squared)
+and is not worth vectorising.

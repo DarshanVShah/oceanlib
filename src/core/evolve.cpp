@@ -1,13 +1,11 @@
 #include "core/evolve.hpp"
 
+#include "core/fft_kernel.hpp"   // for OCEAN_HAS_X86_KERNELS
+#include "core/trig.hpp"
+
 #include <cmath>
 
 namespace ocean::detail {
-namespace {
-
-constexpr double kTwoPi = 6.28318530717958647692;
-
-}  // namespace
 
 void FieldSet::allocate(std::uint32_t size)
 {
@@ -20,10 +18,12 @@ void FieldSet::allocate(std::uint32_t size)
 // Spectrum evolution
 // ---------------------------------------------------------------------------
 
-void evolve_rows(const SpectrumTables& tables, double time, FieldSet& fields,
-                 std::uint32_t row_begin, std::uint32_t row_end) noexcept
+void evolve_rows_scalar(const SpectrumTables& tables, double time,
+                        FieldSet& fields, std::uint32_t row_begin,
+                        std::uint32_t row_end) noexcept
 {
     const std::uint32_t n = tables.n;
+    const double time_over_two_pi = time * kInvTwoPiD;
 
     float* p0_re = fields.re(0); float* p0_im = fields.im(0);
     float* p1_re = fields.re(1); float* p1_im = fields.im(1);
@@ -34,17 +34,19 @@ void evolve_rows(const SpectrumTables& tables, double time, FieldSet& fields,
         for (std::uint32_t x = 0; x < n; ++x) {
             const std::size_t i = static_cast<std::size_t>(y) * n + x;
 
-            // The phase is accumulated in double and reduced modulo 2*pi
-            // before narrowing. omega*t reaches thousands of radians after an
-            // hour of simulation, where float would have only ~1e-4 rad of
-            // resolution left; reducing first keeps full precision no matter
-            // how far into the timeline we seek. This is also why update()
-            // takes absolute time - there is no accumulator to drift.
-            const double phase_d =
-                std::fmod(static_cast<double>(tables.omega[i]) * time, kTwoPi);
-            const float phase = static_cast<float>(phase_d);
-            const float c = std::cos(phase);
-            const float s = std::sin(phase);
+            // Phase folded into [0, 2*pi) in double before narrowing; see
+            // reduced_phase. This is also why update() takes absolute time -
+            // there is no accumulator to drift.
+            const float phase = reduced_phase(tables.omega[i], time_over_two_pi);
+
+            // Our own polynomial, not std::sinf/std::cosf. Two reasons: it
+            // produces both values from one shared argument reduction, and it
+            // is the same sequence of IEEE operations on every platform -
+            // which closes the last cross-runtime determinism gap from
+            // ADR-003, since libm is allowed to differ by an ULP between
+            // implementations.
+            float s = 0.0f, c = 0.0f;
+            sincos_f32(phase, s, c);
 
             // h(k,t) = h0(k) e^{i w t} + conj(h0(-k)) e^{-i w t}
             //
@@ -109,6 +111,35 @@ void evolve_rows(const SpectrumTables& tables, double time, FieldSet& fields,
             p3_re[i] = jzz_re - jxz_im;  p3_im[i] = jzz_im + jxz_re;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using EvolveKernel = void (*)(const SpectrumTables&, double, FieldSet&,
+                              std::uint32_t, std::uint32_t) noexcept;
+
+EvolveKernel select_evolve_kernel() noexcept
+{
+#if defined(OCEAN_HAS_X86_KERNELS)
+    if (detect_simd_level() == SimdLevel::Avx2) return &evolve_rows_avx2;
+#endif
+    return &evolve_rows_scalar;
+}
+
+}  // namespace
+
+void evolve_rows(const SpectrumTables& tables, double time, FieldSet& fields,
+                 std::uint32_t row_begin, std::uint32_t row_end) noexcept
+{
+    // Resolved once, on first call. Like the FFT kernels, every implementation
+    // is required to be bit-identical to the scalar one, so this changes speed
+    // and nothing else.
+    static const EvolveKernel kernel = select_evolve_kernel();
+    kernel(tables, time, fields, row_begin, row_end);
 }
 
 // ---------------------------------------------------------------------------
