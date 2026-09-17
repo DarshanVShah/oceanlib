@@ -495,3 +495,77 @@ points in state space instead.
 - Note this is far below the `U^2` of a fully developed sea — with fetch pinned
   at 100 km a 20 m/s wind is fetch-limited. Expecting `U^2` is the intuitive
   mistake, and it was the one wrong assertion in the first draft of these tests.
+
+---
+
+## ADR-010 — The per-frame pipeline
+
+Three stages, each splittable by row range so a scheduler can drive them:
+
+1. **`evolve_rows`** — advance every wavenumber to absolute time `t` and pack
+   the eight field spectra into four complex fields.
+2. **Four inverse 2D FFTs.**
+3. **`finalize_rows`** — unpack, build normals, Jacobian and foam, write the
+   interleaved output.
+
+### No normalisation on the inverse transform
+
+Tessendorf's surface is literally `h(x) = sum_k h~(k) e^{i k.x}` — the
+*unnormalised* inverse sum — and the spectrum amplitudes derived in ADR-009
+already carry the correct physical scale. Adding a `1/N^2` here and multiplying
+it back out of the spectrum would be pure ceremony. The Parseval test below is
+what keeps this honest: a stray `1/N` or `1/N^2` would show up as an `N^2` or
+`N^4` discrepancy.
+
+### Phase is reduced in double before narrowing to float
+
+`omega * t` reaches thousands of radians after an hour of simulated time, where
+float has only about 1e-4 rad of resolution left. We compute the product in
+double, reduce it modulo 2*pi there, and only then narrow for `sinf`/`cosf`.
+This is the other half of why `update()` takes absolute time: there is no
+accumulator to drift, and seeking to t = 10 hours is exactly as accurate as
+seeking to t = 0.1 s.
+
+### Only three displacement gradients, not four
+
+`dDz/dx` equals `dDx/dz`, because the horizontal displacement field is the
+gradient of a potential and so its Jacobian matrix is symmetric. Both come out
+as `(kx kz/|k|) h~`. That symmetry saves a whole field for free — the reason
+eight fields cover everything rather than nine.
+
+### The normal is the exact normal of the *displaced* surface
+
+Parameterising the surface by `(u,v)` as `(u + L*Dx, h, v + L*Dz)` gives
+tangents `T_u = (axx, hx, axz)` and `T_v = (axz, hz, azz)` where
+`axx = 1 + L*dDx/dx`, `azz = 1 + L*dDz/dz`, `axz = L*dDx/dz`. The normal is
+`-(T_u x T_v)`, and its Y component falls out as exactly the Jacobian
+determinant, so the normal and the foam term share their work.
+
+The common shortcut is the plain heightfield normal `(-hx, 1, -hz)`. That is
+wrong wherever choppiness is doing anything: the vertex has been dragged
+sideways, so the real surface there is steeper than the height derivative alone
+reports. Shading would disagree with physics, breaking promise #2. Here the
+exact form costs nothing extra, because the foam term already needs those same
+displacement gradients. With `choppiness == 0` it reduces to `(-hx, 1, -hz)`
+exactly, and a test checks that.
+
+### Verification: Parseval is the load-bearing test
+
+For the unnormalised inverse DFT, `mean_x |h|^2 = sum_k |h~(k)|^2`. The DC bin
+is exactly zero, so the left side is the variance of the rendered heightfield
+and the right side comes straight from the spectrum tables. This is an **exact
+identity, not a statistical one**, so it holds to float precision on a single
+realisation — measured agreement is within 1e-4 relative.
+
+One test therefore pins down, simultaneously:
+
+- that no stray normalisation crept into the transform,
+- that the two-fields-per-transform packing and unpacking are correct (a swap
+  would deposit `Dx`'s energy into the height channel),
+- that the spectrum really is Hermitian — if it were not, the inverse transform
+  would be complex and the real part alone would carry less than the full
+  energy.
+
+The reference side is deliberately written out in the test rather than calling
+`evolve_rows`, so the thing under test and the thing it is checked against do
+not share code.

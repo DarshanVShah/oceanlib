@@ -1,6 +1,9 @@
 #include "ocean/ocean.hpp"
 
 #include "core/aligned.hpp"
+#include "core/evolve.hpp"
+#include "core/fft.hpp"
+#include "core/spectrum.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -53,7 +56,13 @@ void validate(const OceanDesc& d)
 struct Ocean::Impl {
     OceanDesc   desc;
     double      time  = 0.0;
-    std::size_t cells = 0;  // N*N
+    std::size_t cells = 0;
+
+    // Everything below is allocated exactly once, here in the constructor.
+    detail::SpectrumTables spectrum;
+    detail::FftPlan        plan;
+    detail::FieldSet       fields;
+    detail::AlignedBuffer<float> fft_scratch;
 
     // Public outputs, GPU-texture-shaped: 4 floats per cell.
     detail::AlignedBuffer<float> displacement;
@@ -62,17 +71,38 @@ struct Ocean::Impl {
     explicit Impl(const OceanDesc& d)
         : desc(d),
           cells(static_cast<std::size_t>(d.size) * d.size),
+          plan(d.size),
+          fft_scratch(plan.scratch_floats()),
           displacement(cells * 4),
           normal(cells * 4)
     {
-        // Until the spectrum and FFT land, the buffers describe a perfectly
-        // flat ocean at y = 0: zero displacement, zero foam, +Y normals, and a
-        // Jacobian of 1 (no folding). That is a real, self-consistent surface,
-        // not a placeholder - every query below agrees with it.
-        for (std::size_t i = 0; i < cells; ++i) {
-            normal[4 * i + 1] = 1.0f;  // ny
-            normal[4 * i + 3] = 1.0f;  // jacobian
+        detail::build_spectrum(desc, spectrum);
+        fields.allocate(d.size);
+    }
+
+    void run(double t) noexcept
+    {
+        const std::uint32_t n = desc.size;
+
+        // 1. Advance every wavenumber to absolute time t and pack the eight
+        //    field spectra into four complex fields.
+        detail::evolve_rows(spectrum, t, fields, 0, n);
+
+        // 2. Four inverse 2D transforms. No 1/N^2 normalisation: Tessendorf's
+        //    surface is literally the unnormalised inverse sum
+        //    h(x) = sum_k h(k) e^{i k.x}, and the spectrum amplitudes already
+        //    carry the correct physical scale.
+        for (int f = 0; f < 4; ++f) {
+            plan.transform_2d(fields.re(f), fields.im(f), fft_scratch.data(),
+                              detail::FftSign::Inverse);
         }
+
+        // 3. Unpack, build the displaced-surface normal, the Jacobian and foam,
+        //    and write the interleaved output in one sweep.
+        detail::finalize_rows(fields, desc.choppiness, desc.foam_threshold,
+                              displacement.data(), normal.data(), 0, n);
+
+        time = t;
     }
 };
 
@@ -80,6 +110,9 @@ Ocean::Ocean(const OceanDesc& desc)
 {
     validate(desc);
     impl_ = std::make_unique<Impl>(desc);
+    // Leave the ocean in a valid, fully-evaluated state at t = 0 so that
+    // buffers() and the query API are meaningful before the first update().
+    impl_->run(0.0);
 }
 
 Ocean::~Ocean() = default;
@@ -90,7 +123,7 @@ void Ocean::update(double time)
 {
     // Absolute, not incremental: the surface is a pure function of
     // (seed, desc, time). Seeking or replaying reproduces it exactly.
-    impl_->time = time;
+    impl_->run(time);
 }
 
 Buffers Ocean::buffers() const noexcept
@@ -110,7 +143,8 @@ float Ocean::height_at(float world_x, float world_z) const noexcept
 
 Surface Ocean::sample_at(float, float) const noexcept
 {
-    // Flat ocean for now; the defaults in Surface already describe it.
+    // Implemented in the next step (fixed-point inversion of the choppy
+    // displacement). Returns flat-water defaults until then.
     return Surface{};
 }
 

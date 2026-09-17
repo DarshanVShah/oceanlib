@@ -3,6 +3,7 @@
 #include "alloc_probe.hpp"
 #include "ocean/ocean.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
@@ -57,31 +58,51 @@ TEST_CASE("buffers are correctly shaped and cache-line aligned")
     CHECK(reinterpret_cast<std::uintptr_t>(b.normal) % kBufferAlignment == 0);
 }
 
-TEST_CASE("an un-updated ocean is a self-consistent flat surface")
+TEST_CASE("a freshly constructed ocean is already evaluated at t = 0")
 {
+    // The constructor runs a full update, so buffers() and the query API are
+    // meaningful before the caller has called update() even once. An engine
+    // that builds the ocean during level load and uploads immediately should
+    // not get a frame of flat water.
     OceanDesc d;
     d.size = 32;
     Ocean sim{d};
 
+    CHECK(sim.time() == 0.0);
+
     const Buffers b = sim.buffers();
     const std::size_t cells = static_cast<std::size_t>(b.size) * b.size;
 
+    bool any_height = false;
     for (std::size_t i = 0; i < cells; ++i) {
-        CHECK(b.displacement[4 * i + 0] == 0.0f);  // dx
-        CHECK(b.displacement[4 * i + 1] == 0.0f);  // dy (height)
-        CHECK(b.displacement[4 * i + 2] == 0.0f);  // dz
-        CHECK(b.displacement[4 * i + 3] == 0.0f);  // foam
-        CHECK(b.normal[4 * i + 0] == 0.0f);
-        CHECK(b.normal[4 * i + 1] == 1.0f);        // +Y up
-        CHECK(b.normal[4 * i + 2] == 0.0f);
-        CHECK(b.normal[4 * i + 3] == 1.0f);        // unfolded Jacobian
+        if (b.displacement[4 * i + 1] != 0.0f) any_height = true;
+        // Normals are unit length everywhere, always.
+        const float nx = b.normal[4 * i + 0];
+        const float ny = b.normal[4 * i + 1];
+        const float nz = b.normal[4 * i + 2];
+        REQUIRE(std::abs(nx * nx + ny * ny + nz * nz - 1.0f) < 1e-4f);
     }
+    CHECK(any_height);
+}
 
-    // The query API must agree with the buffers - that is promise #2, and it
-    // has to hold even in this trivial case.
-    CHECK(sim.height_at(0.0f, 0.0f) == 0.0f);
-    CHECK(sim.height_at(12345.0f, -678.0f) == 0.0f);
-    CHECK(sim.sample_at(3.0f, 4.0f).normal_y == 1.0f);
+TEST_CASE("zero wind speed produces a genuinely flat ocean")
+{
+    OceanDesc d;
+    d.size = 32;
+    d.spectrum.wind_speed = 0.0f;
+    Ocean sim{d};
+    sim.update(3.0);
+
+    const Buffers b = sim.buffers();
+    const std::size_t cells = static_cast<std::size_t>(b.size) * b.size;
+    for (std::size_t i = 0; i < cells; ++i) {
+        REQUIRE(b.displacement[4 * i + 0] == 0.0f);
+        REQUIRE(b.displacement[4 * i + 1] == 0.0f);
+        REQUIRE(b.displacement[4 * i + 2] == 0.0f);
+        REQUIRE(b.displacement[4 * i + 3] == 0.0f);  // no foam on flat water
+        REQUIRE(b.normal[4 * i + 1] == 1.0f);        // +Y up
+        REQUIRE(b.normal[4 * i + 3] == 1.0f);        // unfolded Jacobian
+    }
 }
 
 TEST_CASE("the allocation probe is actually installed")

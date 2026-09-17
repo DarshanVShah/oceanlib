@@ -21,6 +21,7 @@ add_library(ocean STATIC
   src/core/rng.cpp
   src/core/fft.cpp
   src/core/spectrum.cpp
+  src/core/evolve.cpp
   src/ocean.cpp
 )
 add_library(ocean::ocean ALIAS ocean)
