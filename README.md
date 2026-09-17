@@ -17,6 +17,12 @@ At 22 m/s with heavier chop, foam appears along the crests. It is driven by the
 Jacobian of the horizontal displacement - the actual measure of the surface
 folding onto itself - not by a height threshold.
 
+![Three cascades](docs/ocean-cascades.png)
+
+Three cascades (800/150/25 m patches) summed into one surface: big rolling
+swell, mid-scale chop, and fine ripple detail all at once - the range a single
+patch cannot cover without compromising one scale for another.
+
 ## Why it exists
 
 Four promises, and every one of them is tested rather than asserted:
@@ -113,5 +119,7 @@ Flags: `--size N --mesh M --tiles T --wind U --chop C --foam F --wireframe
 ## Status
 
 Version 1 core is complete: spectrum, FFT, threading, SIMD, queries, C API,
-and the Vulkan viewer. Not yet built: cascades (multiple overlapping patch
-sizes), shallow-water dispersion, GPU compute, and time-looped baking.
+and the Vulkan viewer. Version 2 in progress: shallow-water dispersion,
+NEON verified under aarch64 QEMU emulation, and cascades (`ocean::CascadeStack`,
+in `include/ocean/cascade.hpp`) are done. Remaining: foam advection, GPU
+compute, and time-looped baking.

@@ -31,6 +31,7 @@ add_library(ocean STATIC
   src/core/evolve_kernel_avx2.cpp
   src/core/thread_pool.cpp
   src/ocean.cpp
+  src/cascade.cpp
   src/c_api.cpp
 )
 add_library(ocean::ocean ALIAS ocean)

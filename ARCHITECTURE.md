@@ -1392,3 +1392,180 @@ fields existed (genuinely smaller, `struct_size` differs), and one from
 immediately before `water_depth` (numerically the same size, protected only by
 zero-initialisation) - the second is the one that actually exercises this
 finding rather than the easier case.
+
+---
+
+## ADR-020 - Cascades: multiple ocean patches summed into one sea state
+
+### The problem
+
+A single Ocean patch must compromise between two conflicting needs: a large
+`patch_length` to capture big swells, and many texels per metre to capture
+fine ripples. Push one and the other suffers. Cascades resolve this the way
+every shipping ocean does: run several small, independently-scaled patches
+side by side, each covering its own wavelength band, and sum their
+contributions.
+
+### API shape: `CascadeStack` wraps N `Ocean` instances
+
+```cpp
+using CascadeLevel = OceanDesc;   // a cascade level IS an ocean patch
+
+class CascadeStack {
+public:
+    explicit CascadeStack(std::span<const CascadeLevel> levels);
+    void update(double time);
+    Buffers buffers(std::size_t level) const noexcept;   // per level, NOT combined
+    float height_at(float x, float z) const noexcept;    // combined
+    Surface sample_at(float x, float z) const noexcept;  // combined
+};
+```
+
+`ocean::Ocean` itself is completely unchanged - every existing single-patch
+integration is unaffected by this addition, and `CascadeStack` is implemented
+entirely in terms of the existing public `Ocean` API, adding no new access to
+internals.
+
+**A real correction made mid-design, worth stating plainly:** the initial plan
+described `CascadeStack::buffers()` as returning "one set of combined
+buffers." That was wrong, and the mistake is instructive. Each level keeps its
+own resolution and `patch_length` - that is the entire point of cascades - so
+their texel grids do not share a common indexing and cannot be flattened into
+a single CPU array. `buffers(level)` therefore returns each level's own
+buffers unmodified; a renderer samples each one at world position mapped into
+that level's own UV space and sums the *samples*, not the raw arrays. This is
+exactly what "additive sum, sampled at the same world position, each in its
+own patch's space" already implied - the buffer-representation question was
+underspecified in the plan, not a new decision.
+
+### What is exact, and what is approximate
+
+**Height and horizontal offset are exact linear superposition.** Each level's
+height/offset field is an independent real-valued function of world position
+(its own periodic tiling). Summing real fields at the same point is not an
+approximation - it is what "the composite surface is the sum of several wave
+trains" means mathematically, and it is the same principle Tessendorf's
+original formulation already relies on for summing individual *wavenumbers*
+within one spectrum, just applied across cascades instead of within one.
+
+**Normal and foam are a stated approximation.** The public `Ocean` API
+returns already-normalised normals and an already-thresholded foam scalar
+(ADR-005's pimpl deliberately does not expose raw slope/Jacobian gradients).
+`CascadeStack::sample_at` therefore combines normals by summing each level's
+unit normal and renormalising, and combines foam via
+`1 - product(1 - foam_i)` - a "screen"/OR blend, standard for combining
+independent [0,1] coverage layers. Both are the well-understood techniques
+real-time engines already use for multi-scale detail-normal blending; neither
+is a re-derivation from first principles, and both are documented as such
+rather than presented as exact.
+
+**The one approximation that also touches height, not just normal/foam:**
+each level solves its OWN fixed-point inversion (ADR-011) against only its
+own chop, not the combined chop of every level. The height/offset SUM is
+exact given each level's own answer; what is approximate is that a level's
+own answer assumes it is the only source of horizontal displacement, when in
+a multi-cascade scene it is not. A fully joint solve across all levels'
+combined displacement would remove this residual, and is the natural
+refinement if cascade choppiness is ever pushed high enough for the cross
+term to matter visibly - untested here because it has not yet visibly
+mattered at any setting exercised.
+
+### Verification: variances of independent levels add
+
+The strongest check, in the spirit of ADR-009's fetch-scaling law and
+ADR-010's Parseval identity: if three cascades are statistically independent
+(distinct seeds) and spectrally non-overlapping (`small_wave_cutoff` and
+`patch_length` chosen so their wavelength bands do not overlap much), then for
+the sum `h = h1 + h2 + h3`,
+
+```
+Var(h) = Var(h1) + Var(h2) + Var(h3)
+```
+
+exactly, because `Var(a+b) = Var(a) + Var(b) + 2*Cov(a,b)` and `Cov -> 0` for
+independent fields. Measured across a dense, deliberately non-grid-aligned
+set of world-space samples: composite variance matched the sum of the
+individual levels' variances to within 8% (the residual being Monte Carlo
+sampling noise plus the small, expected spectral overlap at each cascade's
+soft-knee cutoff edge - see ADR-009 on why the cutoff is a knee, not a wall).
+This is a strictly stronger claim than "the composite differs from any one
+level," and it is a real, derivable statistical property, not a
+plausibility check.
+
+Also verified: a single-level `CascadeStack` is indistinguishable from a
+standalone `Ocean` (both buffers and every query, bit-for-bit where exact and
+to float precision where the query path's fixed-point iteration is involved);
+determinism (bit-identical output across repeated construction, seeking
+backwards reproduces exactly); and `update()` performs no heap allocation
+beyond construction, preserving `Ocean`'s own guarantee transitively.
+
+### Performance: linear, as expected
+
+Measured on the i7-14700HX, 256x256 per level: a single `Ocean::update()` is
+0.512 ms (median); a 3-level `CascadeStack::update()` is 1.549 ms - a 3.02x
+ratio, matching the fact that `update()` runs levels sequentially (each
+already parallelises internally; see below for why sequential was chosen).
+`height_at()` costs 0.4 microseconds - three independent fixed-point solves,
+each cheap.
+
+**Why sequential across levels, not interleaved.** Each level already
+parallelises across its own hardware threads (or the shared host scheduler).
+Interleaving levels' internal stages - running level 0's FFT concurrently
+with level 1's spectrum evolution - is a plausible future optimisation, but
+only worth the added complexity once profiling shows the sequential form
+actually limits a real scene, consistent with this project's standing
+practice of measuring before optimising rather than anticipating a cost that
+has not been shown to matter.
+
+### The viewer: a real bug caught by tracing through what --cascades 1 would sample
+
+The viewer demonstrates exactly 3 cascades (far/mid/near), fixed at that
+count in `OceanView` to keep the descriptor layout and shader loops simple -
+`kMaxCascades = 3` is a demo-only simplification; `CascadeStack` itself is not
+limited to 3.
+
+Extending the vertex/fragment shaders to sum 3 cascades' worth of
+displacement/normal textures needed a descriptor layout with 7 bindings (1
+UBO + 3 x 2 texture pairs). For `--cascades 1` or `2`, the unused slots
+initially fell back to aliasing level 0's real texture, on the reasoning that
+"the shader always reads a valid, bound image." Tracing through what that
+actually computes catches the bug immediately: with slots 1 and 2 both
+pointing at level 0, the vertex shader's `d0 + d1 + d2` sum counts level 0's
+displacement three times instead of once, and `1 - product(1-foam_i)` triple
+counts its foam contribution - silently changing the rendered sea state
+whenever fewer than 3 cascades are active, with no validation error to catch
+it (every descriptor is legitimately bound to *something*).
+
+The fix is a dedicated 1x1 dummy texture pair (displacement all-zero, normal
++Y unit, uploaded once and never touched again) that unused slots point at
+instead: it contributes exactly nothing to height/offset and a neutral
+normal to the sum, correctly modelling "this cascade does not exist" rather
+than "this cascade exists twice." This was caught by mentally executing the
+shader's arithmetic for the `--cascades 1` case before ever running it - the
+same habit of tracing through what code actually computes, rather than
+trusting that "it will bind to something" is enough, that the earlier
+signed-zero bug in the AVX2 evolve kernel (ADR-016) and the FMA-precision
+trap in the SIMD FFT kernels (ADR-013) were also caught by.
+
+### A debugging note worth recording: a false alarm, and how it was resolved
+
+The first cascade renders appeared to show a washed-out, overexposed sky
+compared to earlier pre-cascade screenshots. Chasing it methodically - not by
+guessing, but by falsifying hypotheses in order - eventually showed there was
+no regression: raw pixel sampling of the "washed out" region matched a known-
+good pre-cascade reference image byte-for-byte at every sampled coordinate.
+The perceived difference was real but not a bug: the far cascade's own
+`small_wave_cutoff = 15 m` deliberately removes fine ripple detail (that is
+cascade 2's job when all three run together), so viewed in isolation
+(`--cascades 1`) its smooth, low-contrast surface reads as hazier than a
+normal single-patch ocean, without a single incorrect pixel anywhere.
+
+The methodology is worth recording because it generalises: rendering bugs
+that "look wrong" are not always code bugs, and the fix for uncertainty is
+the same either way - hardcode a shader stage's output to a known constant to
+prove the pass executes over the right region; visualise intermediate
+quantities (a view ray, a light direction, a dot product) as raw colour to
+check they are not NaN or degenerate; and, decisively, diff actual pixel
+values against a trusted reference rather than trusting a rescaled,
+recompressed visual impression. The last of these settled the question in one
+step after several plausible-sounding hypotheses had already been ruled out.

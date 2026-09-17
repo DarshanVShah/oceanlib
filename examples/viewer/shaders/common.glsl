@@ -8,13 +8,24 @@
 #ifndef OCEAN_COMMON_GLSL
 #define OCEAN_COMMON_GLSL
 
+// The viewer demonstrates exactly 3 cascades: a far scale for big swells, a
+// mid scale, and a near scale for fine ripples (see ADR-020). The library's
+// own CascadeStack is not limited to 3 - this is a viewer-only simplification
+// so the descriptor layout and shader loops can be fixed-size rather than
+// driven by a runtime count, which keeps the demo simple without limiting
+// what the library itself can do.
+const int kCascadeCount = 3;
+
 layout(set = 0, binding = 0) uniform Globals {
     mat4 viewProj;
     mat4 invViewProj;
-    vec4 camPos;    // xyz
-    vec4 sunDir;    // xyz, normalised, pointing TOWARD the sun
-    vec4 params;    // x patch_length, y tiles per side, z time, w mesh res
-    vec4 shading;   // x foam strength, y exposure, z fog density, w choppiness
+    vec4 camPos;       // xyz
+    vec4 sunDir;       // xyz, normalised, pointing TOWARD the sun
+    vec4 cascadePatch; // x,y,z = patch_length (m) of cascades 0,1,2; w = tiles
+                       // per side of the outer mesh, sized to cascade 0 (the
+                       // largest/farthest scale)
+    vec4 params;       // x = time, y = mesh resolution, z,w unused
+    vec4 shading;      // x foam strength, y exposure, z fog density, w unused
 } g;
 
 const float kPi = 3.14159265359;

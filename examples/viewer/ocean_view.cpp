@@ -24,10 +24,19 @@ VkShaderModule make_module(VkDevice device, const std::uint32_t* code,
 
 }  // namespace
 
-bool OceanView::init(VkContext& ctx, std::uint32_t ocean_size,
+bool OceanView::init(VkContext& ctx, const std::vector<ocean::OceanDesc>& levels,
                      std::uint32_t mesh_resolution, std::uint32_t tiles)
 {
-    ocean_size_      = ocean_size;
+    level_count_ = levels.size();
+    if (level_count_ == 0 || level_count_ > kMaxCascades) {
+        std::fprintf(stderr,
+                     "[viewer] level count must be between 1 and %zu\n",
+                     kMaxCascades);
+        return false;
+    }
+    for (std::size_t i = 0; i < level_count_; ++i) {
+        level_sizes_[i] = levels[i].size;
+    }
     mesh_resolution_ = mesh_resolution;
     tiles_           = tiles;
 
@@ -43,9 +52,10 @@ bool OceanView::init(VkContext& ctx, std::uint32_t ocean_size,
 
 bool OceanView::create_mesh(VkContext& ctx)
 {
-    // A flat unit grid in [0,1]^2. Two floats per vertex and nothing else -
-    // position, normal and foam all come from the textures at draw time, so
-    // there is no per-frame vertex traffic at all.
+    // A flat unit grid in [0,1]^2, tiled over cascade 0's (the largest
+    // scale's) own patch. Two floats per vertex and nothing else - position,
+    // normal and foam all come from the cascade textures at draw time, summed
+    // per ADR-020, so there is no per-frame vertex traffic at all.
     const std::uint32_t verts_per_side = mesh_resolution_ + 1;
     std::vector<float> vertices;
     vertices.reserve(static_cast<std::size_t>(verts_per_side) * verts_per_side * 2);
@@ -114,18 +124,15 @@ bool OceanView::create_mesh(VkContext& ctx)
 
 bool OceanView::create_textures(VkContext& ctx)
 {
-    const VkDeviceSize texture_bytes =
-        static_cast<VkDeviceSize>(ocean_size_) * ocean_size_ * 4 * sizeof(float);
-
-    auto make_image = [&](VkImage& image, VkDeviceMemory& memory,
-                          VkImageView& view) {
+    auto make_image = [&](std::uint32_t size, VkImage& image,
+                          VkDeviceMemory& memory, VkImageView& view) {
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.imageType = VK_IMAGE_TYPE_2D;
         // R32G32B32A32_SFLOAT because that is literally what the library
         // hands us. No conversion, no quantisation, no repacking - which was
         // the entire point of choosing that output layout.
         ci.format        = VK_FORMAT_R32G32B32A32_SFLOAT;
-        ci.extent        = {ocean_size_, ocean_size_, 1};
+        ci.extent        = {size, size, 1};
         ci.mipLevels     = 1;
         ci.arrayLayers   = 1;
         ci.samples       = VK_SAMPLE_COUNT_1_BIT;
@@ -154,17 +161,30 @@ bool OceanView::create_textures(VkContext& ctx)
     };
 
     for (auto& f : frames_) {
-        make_image(f.displacement, f.displacement_memory, f.displacement_view);
-        make_image(f.normal, f.normal_memory, f.normal_view);
+        // Staging buffer holds every level's displacement+normal data back to
+        // back, persistently mapped, sized to the SUM of all levels' byte
+        // counts since levels may have different resolutions.
+        VkDeviceSize total_bytes = 0;
+        for (std::size_t i = 0; i < level_count_; ++i) {
+            const VkDeviceSize bytes = static_cast<VkDeviceSize>(level_sizes_[i]) *
+                                       level_sizes_[i] * 4 * sizeof(float);
+            f.staging_offset[i] = total_bytes;  // displacement starts here
+            total_bytes += bytes;                // normal follows immediately after
+            total_bytes += bytes;
+        }
 
-        // One staging buffer holding both textures back to back, persistently
-        // mapped. Mapping and unmapping every frame would be pure overhead,
-        // and HOST_COHERENT removes the need for explicit flushes.
-        ctx.create_buffer(texture_bytes * 2, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        for (std::size_t i = 0; i < level_count_; ++i) {
+            make_image(level_sizes_[i], f.levels[i].displacement,
+                      f.levels[i].displacement_memory, f.levels[i].displacement_view);
+            make_image(level_sizes_[i], f.levels[i].normal,
+                      f.levels[i].normal_memory, f.levels[i].normal_view);
+        }
+
+        ctx.create_buffer(total_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                           f.staging, f.staging_memory);
-        vkMapMemory(ctx.device, f.staging_memory, 0, texture_bytes * 2, 0,
+        vkMapMemory(ctx.device, f.staging_memory, 0, total_bytes, 0,
                     &f.staging_mapped);
 
         ctx.create_buffer(sizeof(Globals), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
@@ -175,12 +195,66 @@ bool OceanView::create_textures(VkContext& ctx)
                     &f.uniform_mapped);
     }
 
+    // Dummy 1x1 pair for unused cascade slots (see the header comment on
+    // dummy_displacement_). Uploaded once via a one-shot staged copy, exactly
+    // like the mesh buffers - it never changes after this.
+    {
+        make_image(1, dummy_displacement_, dummy_displacement_memory_,
+                  dummy_displacement_view_);
+        make_image(1, dummy_normal_, dummy_normal_memory_, dummy_normal_view_);
+
+        const float zero_disp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        const float up_normal[4] = {0.0f, 1.0f, 0.0f, 1.0f};  // +Y, unfolded Jacobian
+
+        auto upload_texel = [&](VkImage image, const float texel[4]) {
+            VkBuffer staging = VK_NULL_HANDLE;
+            VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+            const VkDeviceSize bytes = 4 * sizeof(float);
+            ctx.create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                              staging, staging_mem);
+            void* mapped = nullptr;
+            vkMapMemory(ctx.device, staging_mem, 0, bytes, 0, &mapped);
+            std::memcpy(mapped, texel, static_cast<std::size_t>(bytes));
+            vkUnmapMemory(ctx.device, staging_mem);
+
+            VkCommandBuffer cmd = ctx.begin_one_shot();
+            transition_image(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT,
+                             VK_IMAGE_LAYOUT_UNDEFINED,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                             VK_PIPELINE_STAGE_2_COPY_BIT,
+                             VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent      = {1, 1, 1};
+            vkCmdCopyBufferToImage(cmd, staging, image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            transition_image(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_COPY_BIT,
+                             VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            ctx.end_one_shot(cmd);
+
+            vkDestroyBuffer(ctx.device, staging, nullptr);
+            vkFreeMemory(ctx.device, staging_mem, nullptr);
+        };
+        upload_texel(dummy_displacement_, zero_disp);
+        upload_texel(dummy_normal_, up_normal);
+    }
+
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = VK_FILTER_LINEAR;
     sci.minFilter = VK_FILTER_LINEAR;
-    // REPEAT is what makes the tiling free: the FFT surface is exactly
-    // periodic, so a wrapped sample at u = 1.05 is genuinely the right value,
-    // not an approximation. CLAMP would produce a visible seam at every tile.
+    // REPEAT is what makes the tiling free: each cascade's FFT surface is
+    // exactly periodic with its OWN patch_length, so a wrapped sample at
+    // u = 37.4 is genuinely that cascade's correct value, not an
+    // approximation. CLAMP would produce a visible seam at every period.
     sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
@@ -196,28 +270,42 @@ bool OceanView::create_textures(VkContext& ctx)
 
 bool OceanView::create_descriptors(VkContext& ctx)
 {
-    VkDescriptorSetLayoutBinding bindings[3]{};
+    // Binding 0: the Globals UBO. Bindings 1..6: displacement/normal pairs for
+    // up to 3 cascades (1,2 = level 0; 3,4 = level 1; 5,6 = level 2), matching
+    // the fixed bindings the shaders declare in common.glsl / ocean.vert /
+    // ocean.frag. Unused levels (when level_count_ < 3) still get a
+    // descriptor written pointing at level 0's textures, so the shader's
+    // fixed 3-cascade loop can read a harmless, valid image rather than an
+    // unbound slot - simpler than making the shader loop count dynamic for a
+    // demo that only ever runs with 1-3 fixed cascades.
+    constexpr std::uint32_t kBindingCount = 1 + 2 * static_cast<std::uint32_t>(kMaxCascades);
+    VkDescriptorSetLayoutBinding bindings[kBindingCount]{};
     bindings[0].binding         = 0;
     bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
     bindings[0].stageFlags =
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    bindings[1].binding         = 1;  // displacement
-    bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    bindings[1].descriptorCount = 1;
-    // Sampled in the VERTEX stage - this is the vertex texture fetch that
-    // makes GPU-side displacement possible.
-    bindings[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    for (std::uint32_t lvl = 0; lvl < kMaxCascades; ++lvl) {
+        const std::uint32_t disp_binding = 1 + lvl * 2;
+        const std::uint32_t norm_binding = 2 + lvl * 2;
 
-    bindings[2].binding         = 2;  // normal + jacobian
-    bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    bindings[2].descriptorCount = 1;
-    bindings[2].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings[disp_binding].binding         = disp_binding;
+        bindings[disp_binding].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[disp_binding].descriptorCount = 1;
+        // Sampled in the VERTEX stage - this is the vertex texture fetch that
+        // makes GPU-side displacement possible.
+        bindings[disp_binding].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+        bindings[norm_binding].binding         = norm_binding;
+        bindings[norm_binding].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[norm_binding].descriptorCount = 1;
+        bindings[norm_binding].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
 
     VkDescriptorSetLayoutCreateInfo lci{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    lci.bindingCount = 3;
+    lci.bindingCount = kBindingCount;
     lci.pBindings    = bindings;
     vkCreateDescriptorSetLayout(ctx.device, &lci, nullptr, &set_layout_);
 
@@ -225,7 +313,7 @@ bool OceanView::create_descriptors(VkContext& ctx)
     sizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[0].descriptorCount = kFramesInFlight;
     sizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[1].descriptorCount = kFramesInFlight * 2;
+    sizes[1].descriptorCount = kFramesInFlight * 2 * static_cast<std::uint32_t>(kMaxCascades);
 
     VkDescriptorPoolCreateInfo pci{
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -243,26 +331,57 @@ bool OceanView::create_descriptors(VkContext& ctx)
         vkAllocateDescriptorSets(ctx.device, &ai, &f.descriptor);
 
         VkDescriptorBufferInfo ubo{f.uniform, 0, sizeof(Globals)};
-        VkDescriptorImageInfo disp{sampler_, f.displacement_view,
-                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        VkDescriptorImageInfo nrm{sampler_, f.normal_view,
+
+        VkDescriptorImageInfo disp_info[kMaxCascades]{};
+        VkDescriptorImageInfo norm_info[kMaxCascades]{};
+        for (std::uint32_t lvl = 0; lvl < kMaxCascades; ++lvl) {
+            // Levels beyond level_count_ are bound to the dummy 1x1 pair, NOT
+            // to level 0's real textures: aliasing level 0 would make its
+            // contribution to the shader's sum count 2x or 3x instead of
+            // once. The dummy pair (all-zero displacement, +Y normal)
+            // contributes exactly nothing to height/offset and a neutral
+            // normal to the sum, matching "this cascade does not exist".
+            if (lvl < level_count_) {
+                disp_info[lvl] = {sampler_, f.levels[lvl].displacement_view,
                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-
-        VkWriteDescriptorSet writes[3]{};
-        for (int i = 0; i < 3; ++i) {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = f.descriptor;
-            writes[i].dstBinding = static_cast<std::uint32_t>(i);
-            writes[i].descriptorCount = 1;
+                norm_info[lvl] = {sampler_, f.levels[lvl].normal_view,
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            } else {
+                disp_info[lvl] = {sampler_, dummy_displacement_view_,
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                norm_info[lvl] = {sampler_, dummy_normal_view_,
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            }
         }
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        writes[0].pBufferInfo    = &ubo;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[1].pImageInfo     = &disp;
-        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[2].pImageInfo     = &nrm;
 
-        vkUpdateDescriptorSets(ctx.device, 3, writes, 0, nullptr);
+        VkWriteDescriptorSet writes[kBindingCount]{};
+        writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet          = f.descriptor;
+        writes[0].dstBinding      = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].pBufferInfo     = &ubo;
+
+        for (std::uint32_t lvl = 0; lvl < kMaxCascades; ++lvl) {
+            const std::uint32_t disp_binding = 1 + lvl * 2;
+            const std::uint32_t norm_binding = 2 + lvl * 2;
+
+            writes[disp_binding].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[disp_binding].dstSet          = f.descriptor;
+            writes[disp_binding].dstBinding      = disp_binding;
+            writes[disp_binding].descriptorCount = 1;
+            writes[disp_binding].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[disp_binding].pImageInfo      = &disp_info[lvl];
+
+            writes[norm_binding].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[norm_binding].dstSet          = f.descriptor;
+            writes[norm_binding].dstBinding      = norm_binding;
+            writes[norm_binding].descriptorCount = 1;
+            writes[norm_binding].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[norm_binding].pImageInfo      = &norm_info[lvl];
+        }
+
+        vkUpdateDescriptorSets(ctx.device, kBindingCount, writes, 0, nullptr);
     }
     return true;
 }
@@ -409,66 +528,75 @@ bool OceanView::create_pipelines(VkContext& ctx)
 
 void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
                        std::uint32_t image_index, std::uint32_t frame,
-                       const ocean::Buffers& buffers, const Globals& globals)
+                       const ocean::CascadeStack& stack, const Globals& globals)
 {
     FrameResources& f = frames_[frame];
 
-    const VkDeviceSize texture_bytes =
-        static_cast<VkDeviceSize>(ocean_size_) * ocean_size_ * 4 * sizeof(float);
-
-    // THE ENTIRE INTEGRATION WITH THE LIBRARY IS THESE TWO MEMCPYS.
+    // THE ENTIRE INTEGRATION WITH THE LIBRARY IS THESE MEMCPYS, ONE PAIR PER
+    // CASCADE LEVEL.
     //
-    // No repacking, no per-component conversion, no interleave pass. The
-    // library's output buffers are already laid out exactly as RGBA32F
-    // textures, which is what ADR-004 bought.
-    std::memcpy(f.staging_mapped, buffers.displacement,
-                static_cast<std::size_t>(texture_bytes));
-    std::memcpy(static_cast<std::uint8_t*>(f.staging_mapped) + texture_bytes,
-                buffers.normal, static_cast<std::size_t>(texture_bytes));
+    // No repacking, no per-component conversion, no interleave pass, for any
+    // level: each cascade's output buffers are already laid out exactly as
+    // RGBA32F textures (ADR-004), regardless of that level's own resolution.
+    for (std::size_t i = 0; i < level_count_; ++i) {
+        const ocean::Buffers b = stack.buffers(i);
+        const VkDeviceSize bytes = static_cast<VkDeviceSize>(b.size) * b.size *
+                                   4 * sizeof(float);
+        auto* dst = static_cast<std::uint8_t*>(f.staging_mapped) + f.staging_offset[i];
+        std::memcpy(dst, b.displacement, static_cast<std::size_t>(bytes));
+        std::memcpy(dst + bytes, b.normal, static_cast<std::size_t>(bytes));
+    }
 
     std::memcpy(f.uniform_mapped, &globals, sizeof(Globals));
 
-    // Transition both textures for the upload. The source layout is UNDEFINED
-    // on the very first use (nothing to preserve) and SHADER_READ afterwards.
-    const VkImageLayout old_layout = f.textures_initialised
-                                         ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                         : VK_IMAGE_LAYOUT_UNDEFINED;
-    const VkPipelineStageFlags2 src_stage =
-        f.textures_initialised ? VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
-                                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-                               : VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-    const VkAccessFlags2 src_access =
-        f.textures_initialised ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0;
+    for (std::size_t i = 0; i < level_count_; ++i) {
+        LevelTextures& lvl = f.levels[i];
+        const VkDeviceSize bytes = static_cast<VkDeviceSize>(level_sizes_[i]) *
+                                   level_sizes_[i] * 4 * sizeof(float);
 
-    for (VkImage image : {f.displacement, f.normal}) {
-        transition_image(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, old_layout,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, src_stage,
-                         src_access, VK_PIPELINE_STAGE_2_COPY_BIT,
-                         VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        // Transition both textures for the upload. The source layout is
+        // UNDEFINED on the very first use (nothing to preserve) and
+        // SHADER_READ afterwards.
+        const VkImageLayout old_layout = lvl.initialised
+                                             ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                             : VK_IMAGE_LAYOUT_UNDEFINED;
+        const VkPipelineStageFlags2 src_stage =
+            lvl.initialised ? VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                           : VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+        const VkAccessFlags2 src_access =
+            lvl.initialised ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0;
+
+        for (VkImage image : {lvl.displacement, lvl.normal}) {
+            transition_image(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, old_layout,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, src_stage,
+                             src_access, VK_PIPELINE_STAGE_2_COPY_BIT,
+                             VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        }
+
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent      = {level_sizes_[i], level_sizes_[i], 1};
+
+        copy.bufferOffset = f.staging_offset[i];
+        vkCmdCopyBufferToImage(cmd, f.staging, lvl.displacement,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        copy.bufferOffset = f.staging_offset[i] + bytes;
+        vkCmdCopyBufferToImage(cmd, f.staging, lvl.normal,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+        for (VkImage image : {lvl.displacement, lvl.normal}) {
+            transition_image(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_COPY_BIT,
+                             VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
+        lvl.initialised = true;
     }
-
-    VkBufferImageCopy copy{};
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent      = {ocean_size_, ocean_size_, 1};
-
-    copy.bufferOffset = 0;
-    vkCmdCopyBufferToImage(cmd, f.staging, f.displacement,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    copy.bufferOffset = texture_bytes;
-    vkCmdCopyBufferToImage(cmd, f.staging, f.normal,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-
-    for (VkImage image : {f.displacement, f.normal}) {
-        transition_image(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                         VK_PIPELINE_STAGE_2_COPY_BIT,
-                         VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                         VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
-                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    }
-    f.textures_initialised = true;
 
     // --- render ----------------------------------------------------------
     transition_image(cmd, ctx.images[image_index], VK_IMAGE_ASPECT_COLOR_BIT,
@@ -521,8 +649,9 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sky_pipeline_);
     vkCmdDraw(cmd, 3, 1, 0, 0);
 
-    // Ocean: one instance per tile. The instance index becomes the tile offset
-    // in the vertex shader, so the whole tiled field is a single draw call.
+    // Ocean: one instance per tile of cascade 0's (the largest scale's) patch.
+    // Cascades 1 and 2 are sampled through their own wrapped UVs inside that
+    // same instanced mesh - see ocean.vert.
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                       wireframe_ ? ocean_wire_pipeline_ : ocean_pipeline_);
     const VkDeviceSize offset = 0;
@@ -552,13 +681,23 @@ void OceanView::shutdown(VkContext& ctx)
         vkFreeMemory(ctx.device, f.staging_memory, nullptr);
         vkDestroyBuffer(ctx.device, f.uniform, nullptr);
         vkFreeMemory(ctx.device, f.uniform_memory, nullptr);
-        vkDestroyImageView(ctx.device, f.displacement_view, nullptr);
-        vkDestroyImage(ctx.device, f.displacement, nullptr);
-        vkFreeMemory(ctx.device, f.displacement_memory, nullptr);
-        vkDestroyImageView(ctx.device, f.normal_view, nullptr);
-        vkDestroyImage(ctx.device, f.normal, nullptr);
-        vkFreeMemory(ctx.device, f.normal_memory, nullptr);
+        for (auto& lvl : f.levels) {
+            if (lvl.displacement == VK_NULL_HANDLE) continue;
+            vkDestroyImageView(ctx.device, lvl.displacement_view, nullptr);
+            vkDestroyImage(ctx.device, lvl.displacement, nullptr);
+            vkFreeMemory(ctx.device, lvl.displacement_memory, nullptr);
+            vkDestroyImageView(ctx.device, lvl.normal_view, nullptr);
+            vkDestroyImage(ctx.device, lvl.normal, nullptr);
+            vkFreeMemory(ctx.device, lvl.normal_memory, nullptr);
+        }
     }
+
+    vkDestroyImageView(ctx.device, dummy_displacement_view_, nullptr);
+    vkDestroyImage(ctx.device, dummy_displacement_, nullptr);
+    vkFreeMemory(ctx.device, dummy_displacement_memory_, nullptr);
+    vkDestroyImageView(ctx.device, dummy_normal_view_, nullptr);
+    vkDestroyImage(ctx.device, dummy_normal_, nullptr);
+    vkFreeMemory(ctx.device, dummy_normal_memory_, nullptr);
 
     vkDestroySampler(ctx.device, sampler_, nullptr);
     vkDestroyPipeline(ctx.device, ocean_pipeline_, nullptr);

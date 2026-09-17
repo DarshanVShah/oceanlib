@@ -19,6 +19,7 @@ add_executable(ocean_tests
   test_threading.cpp
   test_simd.cpp
   test_trig.cpp
+  test_cascade.cpp
   test_c_api.cpp
   c_header_check.c
 )

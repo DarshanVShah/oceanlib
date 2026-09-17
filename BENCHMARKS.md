@@ -349,3 +349,27 @@ machine and settings: 512x512 threaded 1.232 ms - consistent with (in
 fact slightly better than, within normal laptop thermal variance) the
 1.426 ms recorded after the AVX2 evolve kernel above. No regression.
 
+---
+
+## Cascades (ADR-020)
+
+Measured 2026-09-18, i7-14700HX, 256x256 per level, patches 800/150/25 m
+(far/mid/near), wind 12 m/s.
+
+| configuration                       | update time | notes |
+|--------------------------------------|------------:|-------|
+| single Ocean::update() (256^2)      |    0.512 ms | baseline |
+| CascadeStack, 3 levels (256^2 each) |    1.549 ms | 3.02x - linear, as expected |
+| CascadeStack::height_at()           |   0.400 us  | 3 independent fixed-point solves |
+
+Scaling is linear because update() runs levels sequentially; each level
+already parallelises internally (own thread pool or shared host scheduler).
+1.55 ms total leaves comfortable room in a 60 Hz (16.7 ms) budget even before
+the renderer's own cost.
+
+Verification highlight: for three statistically independent, spectrally
+non-overlapping cascades, the realised composite variance matched the sum of
+each level's own variance to within 8% (Monte Carlo sampling noise plus
+expected small overlap at each cutoff's soft knee) - Var(a+b+c) = Var(a) +
+Var(b) + Var(c) for independent fields, verified on real generated data
+rather than assumed.

@@ -7,7 +7,8 @@
 //
 //   --size N          ocean grid resolution (default 256)
 //   --mesh M          mesh quads per tile edge (default 256)
-//   --tiles T         tiles per side, odd (default 7)
+//   --tiles T         tiles per side of the outer (far-cascade) mesh, odd (default 7)
+//   --cascades N      number of cascade scales, 1-3 (default 3; ADR-020)
 //   --wind U          wind speed in m/s (default 12)
 //   --depth D         water depth in metres for shallow-water dispersion
 //                     (default 0 = deep water; try 3-8 for visibly shoaled waves)
@@ -25,6 +26,7 @@
 #include "vk_context.hpp"
 #include "vk_math.hpp"
 
+#include "ocean/cascade.hpp"
 #include "ocean/ocean.h"    // for ocean_simd_level(); the viewer
                             // deliberately uses only public headers
 #include "ocean/ocean.hpp"
@@ -51,6 +53,7 @@ struct Options {
     std::string   screenshot;
     std::string   simd;           // "" = native max; else scalar|sse2|avx2|neon
     std::uint32_t threads = 0;    // 0 = one worker per hardware thread
+    std::uint32_t cascades = 3;   // 1-3, see ADR-020
     int           frames = 90;
     bool          validation = true;
 };
@@ -73,11 +76,14 @@ Options parse_args(int argc, char** argv)
         else if (a == "--wireframe")   o.wireframe = true;
         else if (a == "--simd")        o.simd = next();
         else if (a == "--threads")     o.threads = std::strtoul(next(), nullptr, 10);
+        else if (a == "--cascades")    o.cascades = std::strtoul(next(), nullptr, 10);
         else if (a == "--screenshot")  o.screenshot = next();
         else if (a == "--frames")      o.frames = std::atoi(next());
         else if (a == "--no-validation") o.validation = false;
     }
     if (o.tiles % 2 == 0) ++o.tiles;  // must be odd to centre on the origin
+    if (o.cascades < 1) o.cascades = 1;
+    if (o.cascades > 3) o.cascades = 3;
     return o;
 }
 
@@ -266,45 +272,67 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // --- the library ------------------------------------------------------
-    ocean::OceanDesc desc;
-    desc.size                    = opt.size;
-    desc.patch_length            = 200.0f;
-    desc.seed                    = 1337;
-    desc.choppiness              = input.choppiness;
-    desc.spectrum.wind_speed     = opt.wind;
-    desc.spectrum.depth          = opt.depth;
-    desc.spectrum.fetch          = 100000.0f;
-    desc.spectrum.wind_direction = 0.4f;
-    desc.foam_threshold          = opt.foam;
-
+    // --- the library --------------------------------------------------------
+    //
+    // Three cascades (ADR-020): a far scale for big swells, a mid scale, and a
+    // near scale for fine ripples, each an ordinary OceanDesc - the only new
+    // concept is that CascadeStack sums several of them. --wind/--depth/
+    // --chop/--foam apply uniformly (the same physical sea state, viewed at
+    // three different wavelength bands); patch_length and small_wave_cutoff
+    // are what actually separate the scales, and seeds are distinct per level
+    // deliberately (see CascadeStack's class comment on correlated seeds).
     if (!opt.simd.empty()) {
         const char* installed = ocean_force_simd_level(opt.simd.c_str());
         std::printf("requested SIMD level '%s' -> installed '%s'\n",
                     opt.simd.c_str(), installed);
     }
-    desc.thread_count = opt.threads;
 
-    ocean::Ocean sim{desc};
-    float active_choppiness = desc.choppiness;
+    struct CascadeSpec { float patch_length; float cutoff; std::uint64_t seed; };
+    static constexpr CascadeSpec kSpecs[3] = {
+        {800.0f, 15.0f, 1337},  // far:  big swells
+        {150.0f,  4.0f, 1338},  // mid
+        { 25.0f,  0.5f, 1339},  // near: fine ripples
+    };
+
+    std::vector<ocean::OceanDesc> levels;
+    for (std::uint32_t i = 0; i < opt.cascades; ++i) {
+        ocean::OceanDesc d;
+        d.size                    = opt.size;
+        d.patch_length            = kSpecs[i].patch_length;
+        d.seed                    = kSpecs[i].seed;
+        d.choppiness              = input.choppiness;
+        d.spectrum.wind_speed     = opt.wind;
+        d.spectrum.depth          = opt.depth;
+        d.spectrum.fetch          = 100000.0f;
+        d.spectrum.wind_direction = 0.4f;
+        d.spectrum.small_wave_cutoff = kSpecs[i].cutoff;
+        d.foam_threshold          = opt.foam;
+        d.thread_count            = opt.threads;
+        levels.push_back(d);
+    }
+
+    ocean::CascadeStack stack{std::span<const ocean::OceanDesc>(levels)};
+    float active_choppiness = input.choppiness;
+
     char depth_desc[64];
     if (opt.depth > 0.0f) {
         std::snprintf(depth_desc, sizeof(depth_desc), "%.1f m (shallow)", opt.depth);
     } else {
         std::snprintf(depth_desc, sizeof(depth_desc), "infinite (deep water)");
     }
-    std::printf("ocean: %ux%u, patch %.0f m, wind %.1f m/s, depth %s, SIMD %s\n",
-                opt.size, opt.size, desc.patch_length, opt.wind, depth_desc,
-                ocean_simd_level());
+    std::printf("ocean: %u cascade(s), %ux%u each, patches", opt.cascades, opt.size, opt.size);
+    for (std::uint32_t i = 0; i < opt.cascades; ++i) std::printf(" %.0fm", kSpecs[i].patch_length);
+    std::printf(", wind %.1f m/s, depth %s, SIMD %s\n",
+                opt.wind, depth_desc, ocean_simd_level());
 
     viewer::OceanView view;
-    if (!view.init(ctx, opt.size, opt.mesh, opt.tiles)) {
+    if (!view.init(ctx, levels, opt.mesh, opt.tiles)) {
         ctx.shutdown();
         glfwDestroyWindow(window);
         glfwTerminate();
         return 1;
     }
-    std::printf("mesh: %u quads/tile, %ux%u tiles, %.2fM triangles/frame\n",
+    std::printf("mesh: %u quads/tile, %ux%u tiles (of the far cascade), %.2fM triangles/frame\n",
                 opt.mesh, opt.tiles, opt.tiles,
                 view.triangle_count() / 1.0e6);
 
@@ -375,14 +403,14 @@ int main(int argc, char** argv)
         // update() never allocates, and honouring that means some things are
         // construction-time decisions.
         if (input.choppiness != active_choppiness) {
-            desc.choppiness = input.choppiness;
+            for (auto& lvl : levels) lvl.choppiness = input.choppiness;
             ctx.wait_idle();
-            sim = ocean::Ocean{desc};
+            stack = ocean::CascadeStack{std::span<const ocean::OceanDesc>(levels)};
             active_choppiness = input.choppiness;
         }
 
         const auto sim_start = std::chrono::steady_clock::now();
-        sim.update(sim_time);
+        stack.update(sim_time);
         const double ocean_ms =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - sim_start).count();
@@ -410,24 +438,34 @@ int main(int argc, char** argv)
         globals.sun_dir[0] = sun.x;
         globals.sun_dir[1] = sun.y;
         globals.sun_dir[2] = sun.z;
-        globals.params[0]  = desc.patch_length;
-        globals.params[1]  = static_cast<float>(opt.tiles);
-        globals.params[2]  = static_cast<float>(sim_time);
-        globals.params[3]  = static_cast<float>(opt.mesh);
+        globals.cascade_patch[0] = levels[0].patch_length;
+        globals.cascade_patch[1] = (levels.size() > 1) ? levels[1].patch_length : levels[0].patch_length;
+        globals.cascade_patch[2] = (levels.size() > 2) ? levels[2].patch_length : levels[0].patch_length;
+        globals.cascade_patch[3] = static_cast<float>(opt.tiles);
+        globals.params[0]  = static_cast<float>(sim_time);
+        globals.params[1]  = static_cast<float>(opt.mesh);
+        globals.params[2]  = 0.0f;
+        globals.params[3]  = 0.0f;
         globals.shading[0] = 1.0f;     // foam strength
         globals.shading[1] = 1.15f;    // exposure
-        globals.shading[2] = 0.00035f; // fog density
+        // Fog density was tuned for a 200 m single-patch ocean (visible extent
+        // ~1400 m at 7 tiles). The far cascade is now 800 m (~5600 m visible),
+        // so it is scaled up to match - see ADR-020's viewer notes: without
+        // this, far geometry fogs into raw sky_color (including its sharp
+        // sun-glare term) too slowly, and a wide band of near-horizon pixels
+        // can all catch the glare spike at once, washing out the sky.
+        globals.shading[2] = 0.0015f; // fog density
         globals.shading[3] = input.choppiness;
 
-        view.record(ctx, cmd, image_index, ctx.frame_index, sim.buffers(), globals);
+        view.record(ctx, cmd, image_index, ctx.frame_index, stack, globals);
         ctx.end_frame(image_index);
 
         // --- HUD ----------------------------------------------------------
         ocean_ms_avg = ocean_ms_avg * 0.95 + ocean_ms * 0.05;
         fps_avg = fps_avg * 0.95 + (dt > 0.0 ? 1.0 / dt : 0.0) * 0.05;
         if (++frame_counter % 15 == 0) {
-            const float h = sim.height_at(input.camera.position.x,
-                                          input.camera.position.z);
+            const float h = stack.height_at(input.camera.position.x,
+                                            input.camera.position.z);
             char title[256];
             std::snprintf(title, sizeof(title),
                           "oceanlib  |  %.0f fps  |  ocean %.2f ms  |  %ux%u  |  "

@@ -2,11 +2,15 @@
 
 #include "common.glsl"
 
-layout(set = 0, binding = 2) uniform sampler2D uNormal;
+layout(set = 0, binding = 2) uniform sampler2D uNormal0;
+layout(set = 0, binding = 4) uniform sampler2D uNormal1;
+layout(set = 0, binding = 6) uniform sampler2D uNormal2;
 
 layout(location = 0) in  vec3  vWorld;
-layout(location = 1) in  vec2  vUV;
-layout(location = 2) in  float vFoam;
+layout(location = 1) in  vec2  vUV0;
+layout(location = 2) in  vec2  vUV1;
+layout(location = 3) in  vec2  vUV2;
+layout(location = 4) in  float vFoam;
 
 layout(location = 0) out vec4 outColor;
 
@@ -15,11 +19,20 @@ void main()
     vec3 L = normalize(g.sunDir.xyz);
     vec3 V = normalize(g.camPos.xyz - vWorld);
 
-    // The normal comes straight from the library. It is the exact normal of
-    // the DISPLACED surface - derived from the same displacement gradients the
-    // foam term uses - not a heightfield approximation, so the shading agrees
-    // with the geometry even where the chop has dragged vertices sideways.
-    vec3 N = normalize(texture(uNormal, vUV).xyz);
+    // Sum-then-renormalise: the same technique CascadeStack::sample_at uses
+    // on the CPU side (ADR-020), applied here per-pixel instead of per-query.
+    // This is the standard way multi-scale detail normals are combined in
+    // real-time rendering - not exact (an exact answer needs the raw slope
+    // gradients from every cascade recombined before deriving one normal,
+    // which the public API does not expose - see ADR-005), but it is the
+    // well-understood, visually correct approximation, and using the SAME
+    // approximation here as the CPU query keeps rendering and physics
+    // consistent with each other rather than just each being locally
+    // plausible.
+    vec3 n0 = texture(uNormal0, vUV0).xyz;
+    vec3 n1 = texture(uNormal1, vUV1).xyz;
+    vec3 n2 = texture(uNormal2, vUV2).xyz;
+    vec3 N = normalize(n0 + n1 + n2);
 
     // Backfacing normals occur where the surface has folded (jacobian < 0).
     // Flipping rather than discarding keeps breaking crests lit instead of
@@ -61,9 +74,9 @@ void main()
     vec3 color = mix(refraction, reflection, F) + spec;
 
     // --- foam -------------------------------------------------------------
-    // The library's foam term is the Jacobian of the horizontal displacement:
-    // it is the actual measure of the surface folding onto itself, which is
-    // physically where whitecaps form - not a height threshold.
+    // vFoam already combines every cascade's own Jacobian-based foam via the
+    // same screen blend used by CascadeStack::sample_at - computed once per
+    // vertex in ocean.vert rather than reloading all 3 textures here.
     float foam = clamp(vFoam * g.shading.x, 0.0, 1.0);
     vec3  foamColor = vec3(0.86, 0.91, 0.95) * (0.45 + 0.55 * max(dot(N, L), 0.0));
     color = mix(color, foamColor, foam);
