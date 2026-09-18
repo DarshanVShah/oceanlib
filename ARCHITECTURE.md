@@ -1647,18 +1647,23 @@ appear/disappear abruptly), and trim strips plus a geomorphing blend band
 satisfies "no visible popping" rather than "no visible crack" - the other two
 were rejected on that basis, not on cost.
 
-**Trim-strip orientation is fixed, not rotated per frame.** The classic
-technique snaps each ring's centre to a multiple of *its own* cell size,
-which leaves the boundary offset against the next coarser ring's grid
-ambiguous (up to one coarse cell, in either of two directions), and needs
-four pre-built rotated trim variants plus per-frame selection to cover every
-case. Snapping each ring's centre to a multiple of *its coarser neighbour's*
-cell size instead (i.e. twice its own) fixes that parity permanently: the
-boundary always meets the coarser grid the same way, so exactly one trim
-shape is ever needed. The cost is that a ring can lag the camera by up to one
-coarse cell before re-centring, rather than one fine cell - imperceptible,
-because that slack is largest on the outermost rings, precisely where a
-one-cell wobble is smallest relative to what is already on screen.
+**Trim-strip orientation varies per frame, per ring.** Each ring's centre
+snaps independently to a multiple of *its own* cell size, which is what
+gives every ring the finest possible camera-following precision available
+at its own scale. That independence means the offset between a ring and its
+coarser neighbour is not fixed: it can land on either side of centre, in x
+and independently in z, so the crack the trim strip closes can be on either
+of two edges in each axis. One trim shape, built once, is reused for all of
+that: it is drawn against two of the hole's four edges - selected per ring
+per frame from the sign of that ring's offset relative to its coarser
+neighbour's - and mirrored in x and/or z via a sign flip on the same
+local-to-world multiply the vertex shader already does, rather than needing
+four separately-built rotated meshes. (An earlier draft of this ADR proposed
+snapping every ring to its *coarser* neighbour's cell size instead, to fix
+the parity and avoid mirroring altogether. That does not actually work: it
+only bounds the offset between adjacent centres to a multiple of the coarser
+cell size, not to zero, so the ambiguity - and the need to select an
+orientation - remains. Corrected before implementation.)
 
 *(Implementation, measured triangle counts and frame times follow as they
 land.)*
