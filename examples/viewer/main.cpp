@@ -16,6 +16,9 @@
 //   --foam-decay R    foam decay rate, 1/s (default 0.30, half-life 2.3 s)
 //   --foam-gain G     how fast breaking injects foam, 1/s (default 4)
 //   --foam-advect S   multiplier on the advecting current (default 1)
+//   --turbidity T     Preetham sky turbidity: 2 arctic, 3 clear, 6 hazy
+//   --sun-elev R      sun elevation in radians above the horizon
+//   --sun-azim R      sun azimuth in radians, 0 = +X
 //   --splash N        drop a scripted rock at the focus point on frame N, so
 //                     --screenshot can capture ripples without a mouse. The
 //                     position and frame are fixed, and --screenshot already
@@ -94,6 +97,11 @@ struct Options {
     float         foam_decay  = 0.40f;
     float         foam_gain   = 1.50f;
     float         foam_advect = 1.0f;
+    // Preetham turbidity: 2 is arctic-clear, 3 clear, 6 hazy, 10 murky.
+    float         turbidity = 2.6f;
+    float         sky_scale = 0.05f;
+    float         sun_elev = 0.38f;    // radians above the horizon
+    float         sun_azim = -2.08f;   // radians, 0 = +X
     int           frames = 90;
     bool          validation = true;
 };
@@ -126,6 +134,10 @@ Options parse_args(int argc, char** argv)
         else if (a == "--foam-decay")  o.foam_decay  = std::strtof(next(), nullptr);
         else if (a == "--foam-gain")   o.foam_gain   = std::strtof(next(), nullptr);
         else if (a == "--foam-advect") o.foam_advect = std::strtof(next(), nullptr);
+        else if (a == "--turbidity")  o.turbidity = std::strtof(next(), nullptr);
+        else if (a == "--sky-scale")  o.sky_scale = std::strtof(next(), nullptr);
+        else if (a == "--sun-elev")   o.sun_elev  = std::strtof(next(), nullptr);
+        else if (a == "--sun-azim")   o.sun_azim  = std::strtof(next(), nullptr);
         else if (a == "--cam-x")     { o.cam_x = std::strtof(next(), nullptr); o.cam_set = true; }
         else if (a == "--cam-y")     { o.cam_y = std::strtof(next(), nullptr); o.cam_set = true; }
         else if (a == "--cam-z")     { o.cam_z = std::strtof(next(), nullptr); o.cam_set = true; }
@@ -622,7 +634,12 @@ int main(int argc, char** argv)
                 opt.mesh, opt.tiles, opt.tiles,
                 view.triangle_count() / 1.0e6);
 
-    const vkm::Vec3 sun = vkm::normalize({-0.45f, 0.38f, -0.80f});
+    // Sun placed from elevation/azimuth rather than a hardcoded vector, so the
+    // Preetham sky can actually be driven through a day - which is most of the
+    // reason for having an analytic sky rather than a baked one.
+    const vkm::Vec3 sun = vkm::normalize(
+        {std::cos(opt.sun_elev) * std::cos(opt.sun_azim), std::sin(opt.sun_elev),
+         std::cos(opt.sun_elev) * std::sin(opt.sun_azim)});
 
     double sim_time = 0.0;
     auto   last     = std::chrono::steady_clock::now();
@@ -826,8 +843,8 @@ int main(int argc, char** argv)
         globals.cascade_patch[3] = static_cast<float>(opt.tiles);
         globals.params[0]  = static_cast<float>(sim_time);
         globals.params[1]  = static_cast<float>(opt.mesh);
-        globals.params[2]  = 0.0f;
-        globals.params[3]  = 0.0f;
+        globals.params[2]  = opt.turbidity;
+        globals.params[3]  = opt.sky_scale;
         globals.shading[0] = 1.0f;     // foam strength
         globals.shading[1] = 1.15f;    // exposure
         // Fog density was tuned for a 200 m single-patch ocean (visible extent

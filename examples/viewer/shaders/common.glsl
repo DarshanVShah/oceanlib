@@ -24,7 +24,8 @@ layout(set = 0, binding = 0) uniform Globals {
     vec4 cascadePatch; // x,y,z = patch_length (m) of cascades 0,1,2; w = tiles
                        // per side of the outer mesh, sized to cascade 0 (the
                        // largest/farthest scale)
-    vec4 params;       // x = time, y = mesh resolution, z,w unused
+    vec4 params;       // x = time, y = mesh resolution, z = sky
+                       // turbidity, w = sky luminance scale
     vec4 shading;      // x foam strength, y exposure, z fog density, w unused
     vec4 interaction;  // xy = world position of the field's low corner,
                        // z  = field extent in metres,
@@ -53,23 +54,155 @@ vec4 interaction_sample(vec2 worldXZ)
 
 const float kPi = 3.14159265359;
 
-// Analytic sky. Cheap, and good enough that the reflection sells the water.
+// Preetham analytic sky.
+//
+// Replaces a two-colour gradient with a real scattering model, and it improves
+// the WATER more than any change to the water would: most of what you see
+// looking at an ocean is reflected sky, so the reflection is only ever as good
+// as the thing being reflected. A flat gradient gives flat water.
+//
+// Preetham, Shirley & Smits 1999, "A Practical Analytic Model for Daylight".
+// The model fits Perez's five-parameter sky distribution to output from a full
+// spectral atmospheric simulation, parameterised by a single TURBIDITY number -
+// roughly the ratio of scattering by aerosols to scattering by molecules. 2 is
+// a very clear arctic sky, 3 clear, 6 hazy, 10+ murky.
+//
+// Chosen over Hosek-Wilkie (which is more accurate, especially near sunset)
+// because Hosek-Wilkie needs a large table of fitted coefficients that would
+// have to be baked into the binary, and ADR-001's zero-dependency rule makes
+// a compact closed form worth more here than the last few per cent of fidelity.
+//
+// Everything is evaluated per pixel. It is a few dozen ALU ops against a
+// cubemap fetch, which on any GPU that can run this demo is not the bottleneck,
+// and it buys a sky that responds continuously to sun angle and turbidity
+// rather than being baked at one time of day.
+
+// Perez sky distribution. `cosTheta` is the cosine of the angle from the
+// zenith, `gamma` the angle between the view direction and the sun.
+float perez(float cosTheta, float gamma, float A, float B, float C, float D,
+            float E)
+{
+    // cosTheta is clamped away from zero rather than allowed to reach it: the
+    // exp(B/cosTheta) term diverges at the horizon, and the model is not
+    // defined below it anyway.
+    float ct = max(cosTheta, 0.01);
+    float cg = cos(gamma);
+    return (1.0 + A * exp(B / ct)) * (1.0 + C * exp(D * gamma) + E * cg * cg);
+}
+
+vec3 xyY_to_linear_rgb(float x, float y, float Y)
+{
+    // xyY -> XYZ. y is a denominator, so guard it.
+    float yy = max(y, 1e-4);
+    vec3 XYZ = vec3(x * Y / yy, Y, (1.0 - x - y) * Y / yy);
+
+    // XYZ -> linear sRGB (Rec. 709 primaries, D65).
+    return vec3(
+        dot(XYZ, vec3( 3.2406, -1.5372, -0.4986)),
+        dot(XYZ, vec3(-0.9689,  1.8758,  0.0415)),
+        dot(XYZ, vec3( 0.0557, -0.2040,  1.0570)));
+}
+
+// `dir` and `sunDir` must be normalised. `turbidity` in roughly [1.7, 10].
+vec3 sky_color_turbid(vec3 dir, vec3 sunDir, float turbidity)
+{
+    float T = clamp(turbidity, 1.7, 10.0);
+
+    // Angles. thetaS is the sun's zenith angle; a sun below the horizon is
+    // clamped to just above it so the model stays defined during a sunset
+    // rather than producing negative luminance.
+    float cosTheta = dir.y;
+    float sunUp    = clamp(sunDir.y, 0.02, 1.0);
+    float thetaS   = acos(sunUp);
+    float gamma    = acos(clamp(dot(dir, sunDir), -1.0, 1.0));
+
+    // Perez coefficients, linear in turbidity (Preetham table 1).
+    float AY =  0.1787 * T - 1.4630;
+    float BY = -0.3554 * T + 0.4275;
+    float CY = -0.0227 * T + 5.3251;
+    float DY =  0.1206 * T - 2.5771;
+    float EY = -0.0670 * T + 0.3703;
+
+    float Ax = -0.0193 * T - 0.2592;
+    float Bx = -0.0665 * T + 0.0008;
+    float Cx = -0.0004 * T + 0.2125;
+    float Dx = -0.0641 * T - 0.8989;
+    float Ex = -0.0033 * T + 0.0452;
+
+    float Ay = -0.0167 * T - 0.2608;
+    float By = -0.0950 * T + 0.0092;
+    float Cy = -0.0079 * T + 0.2102;
+    float Dy = -0.0441 * T - 1.6537;
+    float Ey = -0.0109 * T + 0.0529;
+
+    // Zenith absolute luminance, in kcd/m^2.
+    float chi = (4.0 / 9.0 - T / 120.0) * (kPi - 2.0 * thetaS);
+    float Yz  = (4.0453 * T - 4.9710) * tan(chi) - 0.2155 * T + 2.4192;
+
+    // Zenith chromaticity: a cubic in the solar zenith angle, quadratic in
+    // turbidity.
+    float t2 = thetaS * thetaS;
+    float t3 = t2 * thetaS;
+    float T2 = T * T;
+
+    float xz =
+        ( 0.00166 * t3 - 0.00375 * t2 + 0.00209 * thetaS)             * T2 +
+        (-0.02903 * t3 + 0.06377 * t2 - 0.03202 * thetaS + 0.00394)   * T  +
+        ( 0.11693 * t3 - 0.21196 * t2 + 0.06052 * thetaS + 0.25886);
+
+    float yz =
+        ( 0.00275 * t3 - 0.00610 * t2 + 0.00317 * thetaS)             * T2 +
+        (-0.04214 * t3 + 0.08970 * t2 - 0.04153 * thetaS + 0.00516)   * T  +
+        ( 0.15346 * t3 - 0.26756 * t2 + 0.06670 * thetaS + 0.26688);
+
+    // The model gives RATIOS against the zenith, so every quantity is the
+    // zenith value scaled by perez(view) / perez(zenith).
+    float denomY = perez(1.0, thetaS, AY, BY, CY, DY, EY);
+    float denomx = perez(1.0, thetaS, Ax, Bx, Cx, Dx, Ex);
+    float denomy = perez(1.0, thetaS, Ay, By, Cy, Dy, Ey);
+
+    float Y = Yz * perez(cosTheta, gamma, AY, BY, CY, DY, EY) / max(denomY, 1e-4);
+    float x = xz * perez(cosTheta, gamma, Ax, Bx, Cx, Dx, Ex) / max(denomx, 1e-4);
+    float y = yz * perez(cosTheta, gamma, Ay, By, Cy, Dy, Ey) / max(denomy, 1e-4);
+
+    // kcd/m^2 into a range the tonemapper expects.
+    //
+    // This constant matters more than it looks. Preetham returns absolute
+    // luminance, and feeding it in too hot drives every channel into the
+    // Reinhard curve's saturation region, where they converge on each other
+    // and the sky turns white - taking the chromaticity, which is the whole
+    // point of the model, with it. The first value did exactly that: a sunset
+    // rendered as grey-blue because the warm hue was being clipped away rather
+    // than because the model had not produced one.
+    vec3 col = xyY_to_linear_rgb(x, y, Y * g.params.w);
+
+    // Preetham can dip slightly negative at extreme angles where the fit runs
+    // out; clamping is honest about the model's domain rather than letting a
+    // negative channel propagate into the water's reflection.
+    return max(col, vec3(0.0));
+}
+
 vec3 sky_color(vec3 dir, vec3 sunDir)
 {
-    float up = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+    // Below the horizon the model is undefined. Mirroring rather than clamping
+    // keeps the gradient continuous across y = 0, which matters because the
+    // water reflects rays that legitimately point downward off a steep wave
+    // face.
+    vec3 d = vec3(dir.x, abs(dir.y), dir.z);
+    vec3 col = sky_color_turbid(d, sunDir, g.params.z);
 
-    vec3 horizon = vec3(0.62, 0.72, 0.84);
-    vec3 zenith  = vec3(0.14, 0.32, 0.68);
-    vec3 col = mix(horizon, zenith, pow(up, 0.55));
-
-    // Sun: a tight disc for the specular highlight plus a broad glow that
-    // gives the haze around it.
+    // The sun itself. Preetham describes the sky's scattered light, not the
+    // solar disc, so the disc and its bloom are added separately.
     float cosA = max(dot(dir, sunDir), 0.0);
-    col += vec3(1.0, 0.92, 0.74) * (pow(cosA, 900.0) * 90.0 + pow(cosA, 12.0) * 0.30);
+    float disc  = pow(cosA, 5000.0) * 120.0;  // the disc, for sun glitter
+    float bloom = pow(cosA, 60.0) * 0.20;     // aureole around it
 
-    // Thicken the haze near the horizon so the ocean can fade into it and the
-    // edge of the tiled patch never reads as a hard boundary.
-    col = mix(col, vec3(0.80, 0.84, 0.88), pow(1.0 - abs(dir.y), 8.0) * 0.75);
+    // The disc reddens as it sets, for the same reason the sky does: a low sun
+    // is seen through far more atmosphere. Preetham models the SKY's scattered
+    // light, not the direct beam, so this has to be applied here.
+    float lowSun = 1.0 - clamp(sunDir.y * 3.0, 0.0, 1.0);
+    vec3 sunTint = mix(vec3(1.0, 0.96, 0.90), vec3(1.0, 0.52, 0.22), lowSun);
+    col += sunTint * (disc + bloom);
 
     return col;
 }
@@ -80,8 +213,31 @@ vec3 sky_color(vec3 dir, vec3 sunDir)
 vec3 tonemap(vec3 linear, float exposure)
 {
     vec3 c = linear * exposure;
-    c = c / (c + vec3(1.0));
-    return pow(c, vec3(1.0 / 2.2));
+
+    // Reinhard on LUMINANCE, not per channel.
+    //
+    // Per-channel Reinhard compresses a bright channel harder than a dim one,
+    // so it desaturates everything bright toward grey. That is exactly what
+    // made the Preetham sky look washed out: at the zenith the model produced
+    // linear (0.139, 0.236, 0.471) - blue is 3.4x red, a proper sky - and
+    // per-channel mapping delivered (104, 126, 158), nearly neutral. The
+    // chromaticity the whole model exists to compute was being thrown away in
+    // the last line of the shader.
+    //
+    // Compressing luminance and carrying the chroma through unchanged
+    // preserves hue and saturation exactly.
+    float L  = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    float Lt = L / (1.0 + L);
+    vec3 mapped = c * (Lt / max(L, 1e-5));
+
+    // Except that genuinely intense sources DO read as white - a photograph of
+    // the sun is a white disc, not a saturated orange one. So fade back toward
+    // the per-channel result as luminance climbs, which restores that
+    // behaviour for the sun and its glitter without touching the sky.
+    vec3 perChannel = c / (c + vec3(1.0));
+    mapped = mix(mapped, perChannel, clamp(L * 0.12, 0.0, 1.0));
+
+    return pow(clamp(mapped, 0.0, 1.0), vec3(1.0 / 2.2));
 }
 
 #endif

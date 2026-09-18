@@ -33,6 +33,9 @@ set(OCEAN_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${OCEAN_SHADER_DIR}")
 
 set(OCEAN_SHADER_HEADERS "")
+file(GLOB OCEAN_SHADER_INCLUDES
+     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.glsl")
+
 function(ocean_add_shader src var)
   get_filename_component(name "${src}" NAME)
   string(REPLACE "." "_" stem "${name}")
@@ -47,7 +50,18 @@ function(ocean_add_shader src var)
     COMMAND "${CMAKE_COMMAND}" -DSPV_IN=${spv} -DHDR_OUT=${hdr}
             -DVAR_NAME=${var}
             -P "${CMAKE_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
+    # Every shared .glsl is a dependency of every shader, because they are
+    # reached by #include and glslc resolves those itself - so nothing in the
+    # DEPENDS list would otherwise mention common.glsl.
+    #
+    # This was a real bug, not a precaution: editing common.glsl produced
+    # "ninja: no work to do" and the old SPIR-V kept running, so a shader
+    # change appeared to have no effect. Depending on the whole set is
+    # slightly over-broad - touching one include rebuilds all four shaders -
+    # which for four small files is a far better trade than a stale binary
+    # that silently ignores an edit.
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${src}"
+            ${OCEAN_SHADER_INCLUDES}
             "${CMAKE_SOURCE_DIR}/cmake/EmbedSpirv.cmake"
     COMMENT "Compiling and embedding ${name}"
     VERBATIM)

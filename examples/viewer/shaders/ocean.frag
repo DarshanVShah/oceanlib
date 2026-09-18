@@ -99,7 +99,20 @@ void main()
 
     vec3 deep    = vec3(0.004, 0.036, 0.072);
     vec3 scatter = vec3(0.045, 0.30, 0.26);
-    vec3 refraction = deep + scatter * lift * through * 1.6;
+
+    // Tint the subsurface term by the light actually falling on the water.
+    //
+    // Without this the water below the Fresnel crossover keeps a fixed
+    // turquoise no matter what the sky is doing, so a sunset gives a warm sky
+    // over cold cyan water and the image does not cohere. The scattered light
+    // leaving the water is light that entered it, so it has to carry the
+    // sky's colour. Sampled straight up, which is where most of the downwelling
+    // light comes from, and normalised against its own luminance so this
+    // changes HUE without also changing how bright the water is.
+    vec3 ambient = sky_color_turbid(vec3(0.0, 1.0, 0.0), L, g.params.z);
+    ambient /= max(dot(ambient, vec3(0.2126, 0.7152, 0.0722)), 1e-3);
+
+    vec3 refraction = (deep + scatter * lift * through * 1.6) * ambient;
 
     // --- sun specular (GGX) ----------------------------------------------
     vec3  H     = normalize(L + V);
