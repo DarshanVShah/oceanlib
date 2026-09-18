@@ -70,6 +70,7 @@ add_executable(ocean_viewer
   main.cpp
   vk_context.cpp
   ocean_view.cpp
+  clipmap.cpp
 )
 add_dependencies(ocean_viewer ocean_viewer_shaders)
 target_link_libraries(ocean_viewer PRIVATE ocean Vulkan::Vulkan glfw)
