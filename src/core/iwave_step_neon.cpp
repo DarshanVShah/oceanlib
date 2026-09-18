@@ -52,7 +52,13 @@ void iwave_step_rows_neon(const IWaveGrid& g, std::uint32_t row_begin,
                 c1v, vsubq_f32(vsubq_f32(vmulq_f32(two, hc),
                                          vmulq_f32(c2v, hp)),
                                vmulq_f32(gdt2, acc)));
-            vst1q_f32(g.old + row + x, r);
+            // Flush negligible values to zero, branchlessly. Same threshold
+            // and same result as the scalar path - see kIWaveFlush.
+            const uint32x4_t keep =
+                vcgeq_f32(vabsq_f32(r), vdupq_n_f32(kIWaveFlush));
+            vst1q_f32(g.old + row + x,
+                      vreinterpretq_f32_u32(
+                          vandq_u32(vreinterpretq_u32_f32(r), keep)));
         }
     }
 }

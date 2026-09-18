@@ -10,6 +10,31 @@
 
 namespace ocean::detail {
 
+// Values smaller than this are flushed to exactly zero at the end of each
+// substep.
+//
+// MEASURED, NOT PRECAUTIONARY. The absorbing layer multiplies its cells by
+// about 0.8 every substep, so after a few hundred steps a ring of cells is
+// sitting in the denormal range - and denormal arithmetic on x86 traps to
+// microcode, costing on the order of 100x per operation. It showed up as the
+// interaction field at 256^2 measuring FOUR TIMES slower per cell than at
+// 512^2, which is impossible for a loop whose work is exactly proportional to
+// cell count. The difference was how many substeps each size had run: 512^2
+// had not yet decayed into the denormal range, and 128^2 had already passed
+// through it to exact zero.
+//
+// The alternative fix is setting FTZ/DAZ in MXCSR, and it is rejected
+// deliberately: that is a process-wide CPU mode, it would change results in
+// the host's own code, and it is an x86 register with no portable equivalent -
+// so the scalar, SSE2, AVX2 and NEON paths would stop agreeing bit for bit and
+// ADR-013's contract would quietly break. An explicit compare-and-zero is
+// portable, deterministic, and identical on every path.
+//
+// 1e-30 m is thirty orders of magnitude below a millimetre of wave height, and
+// eight orders above the float denormal threshold of 1.18e-38, so it discards
+// nothing that could ever be seen and never leaves a denormal behind.
+inline constexpr float kIWaveFlush = 1.0e-30f;
+
 // One substep's worth of state, laid out for the convolution.
 //
 // The grid is stored with a P-cell halo on every side, so the stencil never

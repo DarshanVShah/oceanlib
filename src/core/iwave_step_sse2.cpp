@@ -60,7 +60,11 @@ void iwave_step_rows_sse2(const IWaveGrid& g, std::uint32_t row_begin,
                 c1v, _mm_sub_ps(_mm_sub_ps(_mm_mul_ps(two, hc),
                                            _mm_mul_ps(c2v, hp)),
                                 _mm_mul_ps(gdt2, acc)));
-            _mm_storeu_ps(g.old + row + x, r);
+            // Flush negligible values to zero, branchlessly. Same threshold and
+            // same result as the scalar path - see kIWaveFlush.
+            const __m128 mag = _mm_andnot_ps(_mm_set1_ps(-0.0f), r);
+            const __m128 keep = _mm_cmpge_ps(mag, _mm_set1_ps(kIWaveFlush));
+            _mm_storeu_ps(g.old + row + x, _mm_and_ps(r, keep));
         }
     }
 }

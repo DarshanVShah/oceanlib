@@ -14,7 +14,19 @@
 namespace ocean {
 namespace {
 
-constexpr std::size_t kMinCellsForThreading = 8192;   // as ADR-012, measured
+// Work below this many cells runs serially.
+//
+// ADR-012 measured 8192 for the FFT pipeline; this workload is different and
+// so is its crossover. Measured here: 128^2 (16384 cells) is SLOWER threaded -
+// 0.137 ms against 0.112 ms serial, 0.82x - while 256^2 wins by 2.35x. One
+// dispatch per substep is cheaper than the FFT's four barriers, but there is
+// also far less work to spread at small sizes.
+//
+// The crossover is therefore somewhere in (16384, 65536]; only powers of two
+// are legal sizes, so those are the only two points that exist to measure and
+// the threshold is placed between them. The principle is the defensible part,
+// and it is ADR-012's: threading must never make things worse.
+constexpr std::size_t kMinCellsForThreading = 32768;
 
 constexpr bool is_power_of_two(std::uint32_t v) noexcept
 {

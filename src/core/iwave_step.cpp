@@ -43,8 +43,12 @@ void iwave_step_rows_scalar(const IWaveGrid& g, std::uint32_t row_begin,
 
             const float hc = *centre;
             const float hp = g.old[row + x];
-            g.old[row + x] =
+            const float v =
                 g.c1[orow + x] * (2.0f * hc - g.c2[orow + x] * hp - g.gdt2 * acc);
+
+            // Flush negligible values to zero. See kIWaveFlush - this is a
+            // performance fix with a correctness constraint, not a tolerance.
+            g.old[row + x] = (v > -kIWaveFlush && v < kIWaveFlush) ? 0.0f : v;
         }
     }
 }

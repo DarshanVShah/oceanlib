@@ -1569,3 +1569,357 @@ check they are not NaN or degenerate; and, decisively, diff actual pixel
 values against a trusted reference rather than trusting a rescaled,
 recompressed visual impression. The last of these settled the question in one
 step after several plausible-sounding hypotheses had already been ruled out.
+
+---
+
+## ADR-021 - Local interaction: iWave on top of the FFT surface
+
+### The physics, and why the operator is nonlocal
+
+Linearised, irrotational, inviscid free-surface flow. Laplace in the volume,
+kinematic and dynamic boundary conditions linearised onto `y = 0`:
+
+```
+dh/dt = dphi/dy |_0 ,      dphi/dt = -g h |_0
+```
+
+Differentiating the first in time and substituting the second gives
+
+```
+d^2h/dt^2 = -g * G{h},     symbol of G = |k|
+```
+
+because the decaying harmonic extension of a mode `e^{ik.x}` into the
+half-space is `e^{|k|y}`, so `d/dy` at the surface is multiplication by `|k|`.
+Substituting a plane wave recovers `omega^2 = g|k|` - **the same deep-water
+dispersion relation the FFT ocean already solves** (ADR-009). That shared
+origin is what makes adding the two fields legitimate rather than a blend, and
+it is the same argument ADR-020 makes for cascades, applied across a different
+axis.
+
+`|k|` is not a polynomial in `k`, so `G` is not a differential operator. It is
+`sqrt(-laplacian)`, and in real space it is a convolution with infinite
+support. The iWave idea is to truncate that convolution to a small radius `P`
+and apply it directly, which keeps the operator **local**.
+
+### Why locality is the whole product
+
+An FFT convolution on the local grid would be exact (no truncation) and, at
+256 squared, actually *cheaper* - roughly 80 flops per cell against 169 taps.
+It was rejected, and this is the argument an interviewer is most likely to
+press on:
+
+- FFT convolution is **cyclic**. A ripple leaving the right edge re-enters on
+  the left. Zero-padding to 512 squared to prevent that costs 4x and erases the
+  advantage.
+- The **absorbing layer** is a spatially varying damping. There is no such
+  thing in a global spectral multiply.
+- The **obstruction mask** is a spatially varying boundary condition.
+  Enforcing it spectrally needs an iterative solve per substep.
+
+Direct convolution buys locality, and locality is what makes a local field
+worth having at all.
+
+Against the other obvious alternative - a plain wave equation
+`d^2h/dt^2 = c^2 laplacian h` - the answer is dispersion. That scheme is 9
+flops per cell instead of 169, but every wavelength travels at the same `c`, so
+an impact gives one rigid expanding ring. Real water gives a ring that fans
+into a train, long waves running ahead of short ones, and that dispersion *is*
+the look. The honest framing is that **iWave IS the wave equation with the
+dispersion correction taken to its limit**: the correction is exact, and the
+price is that the exact spatial operator is nonlocal. The kernel is not a hack
+bolted onto a wave equation; it is the correct linearised operator, truncated.
+
+### The kernel: fitted to a band, not truncated from a transform
+
+Two derivations are implemented so the choice is a measured number.
+
+**Hankel** is the published derivation: the inverse Hankel transform of the
+symbol (radial symmetry collapses the 2-D transform to
+`(1/2pi) integral S(k) J0(kr) k dk`), evaluated to the grid Nyquist and
+truncated at radius `P`. Kept as the reference and cross-check. `J0` is written
+out from Abramowitz and Stegun 9.4.1 / 9.4.3 because `std::cyl_bessel_j` is a
+C++17 special-math function MSVC does not implement, and a dependency is not an
+option (ADR-001).
+
+**LeastSquares**, which ships, solves directly for the truncated stencil whose
+*realised* symbol best matches the true one over the band the field claims.
+Measured peak symbol error over wavelengths of 2 to 16 cells, deep water,
+0.25 m cells:
+
+| P  | taps | Hankel | LeastSq | LSQ wave-speed error |
+|---:|-----:|-------:|--------:|---------------------:|
+|  3 |   49 | 63.4%  |   36.1% |                18.0% |
+|  4 |   81 | 61.1%  |   26.5% |                13.3% |
+|  6 |  169 | 59.7%  |   13.1% |                 6.6% |
+|  8 |  289 | 59.6%  |    6.5% |                 3.2% |
+| 10 |  441 | 59.7%  |    3.0% |                 1.5% |
+
+Speed error is half the symbol error, because `omega = sqrt(g S)`.
+
+Two constraints are enforced exactly rather than approximately. **D4 symmetry**:
+only the octant `a >= b >= 0` is stored and every orbit member is written from
+one value, so the 8-fold symmetry is bit-exact rather than
+equal-after-rounding. **Zero sum**: the true symbol is exactly zero at `k = 0`,
+so the centre tap is *eliminated* algebraically (`g00 = -sum n_ab g_ab`) rather
+than penalised, making `Shat(0) = 0` hold to the last bit. Without it a uniform
+water level would feel a restoring force and oscillate in place forever,
+because the operator cannot propagate DC anywhere.
+
+### Three findings from building the kernel
+
+**The Hankel transform needs a cell-area factor.** It returns the *continuum*
+kernel, a density in 1/m^2; the discrete stencil approximates the convolution
+integral by a sum over cells, so each tap carries `dx^2`. The first build was
+wrong by exactly `1/dx^2` - and being a constant, it survived every increase of
+`P`, so it looked nothing like truncation error. The clue was that the error
+barely moved between P = 2 and P = 10.
+
+**The truncated-transform kernel has a latent instability, and it is not in the
+band anyone looks at.** Its symbol is faithful throughout the inscribed Nyquist
+disc but goes **negative in the corners of k-space** - reaching -0.12 to -0.18
+of its maximum, at every radius from 2 to 12. Those corner modes are shorter
+than two cells along the diagonal, so they are aliasing artefacts rather than
+waves; but the grid still holds them, and `omega^2 = g S < 0` means they grow
+exponentially instead of oscillating. Nothing deliberately excites a
+checkerboard, which is exactly what makes it dangerous: rounding noise seeds
+it, damping cannot remove an exponential, and it surfaces much later as "the
+water sometimes explodes". Fitting over a band removes it for free, because the
+fit includes the corners at low weight - enough to hold the symbol non-negative
+there without spending accuracy in the band that matters. `kernel_is_stable()`
+checks it and the solver constructor refuses a kernel that fails.
+
+**The first least-squares attempt measured worse than the published kernel**,
+and the reason generalises. Weighting by `1/S^2` over the whole plane puts the
+*highest* weight near DC - exactly where a finite even stencil can never match
+`|k|`, because its symbol is analytic and even and so behaves like `c k^2`
+against a true `k`. The fit spent its freedom on the region it could not repair
+and paid for it in the region it could. Confining the fit to a band inverted
+the result.
+
+That low-k mismatch is a real limit of the method, not a defect of this
+implementation, and it is recorded rather than hidden: at P = 6 and 0.25 m
+cells, dispersion is within 10% only for wavelengths below 4.05 m. **Long waves
+are the FFT ocean's job; short ripples are this field's.** The division of
+labour is principled, not a workaround.
+
+### The scheme, and why stable is not accurate
+
+```
+h^{n+1} = [ 2h^n - (1 - a dt) h^{n-1} - g dt^2 G{h^n} ] / (1 + a dt)
+```
+
+Second order in time; the damping term is centred, so it is unconditionally
+dissipative for `a >= 0` and can never add energy whatever the timestep.
+
+Leapfrog on `h'' = -omega^2 h` is stable iff `omega dt <= 2`. The limit is
+derived from the kernel's **realised** symbol, not from theory - truncation
+ringing can push the realised symbol above the ideal `|k|`, and the bound
+depends on the largest frequency the state can actually contain. Computed from
+what was built, not from what was intended.
+
+But the discrete frequency obeys `sin(w~ dt/2) = w dt/2`, so at the stability
+limit `w~ dt = pi` against a true 2 - a **57% frequency error**. Stable, and
+completely wrong. So the default timestep comes from accuracy, not stability:
+1/60 s against a 0.1539 s limit, 9.2x of headroom, giving a **0.197% leapfrog
+phase error at Nyquist**. 1/60 s is also exactly one substep per frame at
+60 Hz, which keeps the common case cheap. A `fixed_dt` above the limit is
+refused at construction rather than silently clamped, because a caller who
+believes they are running at a timestep they are not has a very hard bug to
+find.
+
+A caller cannot push past it by feeding a huge `dt`: an accumulator runs whole
+fixed steps, and `max_substeps` caps them and **discards** the backlog rather
+than carrying it. After a long hitch the field runs slow; the frame does not
+explode. Determinism survives, because the clamp is a function of the
+accumulator, which is a function of the dt sequence.
+
+### The impulse shape
+
+The 2-D Ricker wavelet, `(1 - u) e^{-u}` with `u = r^2 / 2 sigma^2`. Three
+reasons, in increasing order of how much they matter.
+
+1. It looks like an impact crater: a central depression ringed by a raised rim
+   of exactly `e^-2` = 13.5% the depth at `r = 2 sigma` - the shallow broad rim
+   real craters have. A Gaussian spike looks like nothing in nature.
+2. **Its integral over the plane is exactly zero.** The operator symbol is zero
+   at `k = 0`, so any net volume injected can *never propagate away* - it would
+   sit there as a permanent bump forever. A Gaussian dimple does exactly that.
+   Zero net volume is physically forced, and it is the same statement as "the
+   rock displaces water, and the rim IS that displaced water".
+3. Its transform peaks at `k = sqrt(2)/sigma`, so `radius` is a **wavelength
+   selector**: the dominant emitted wavelength is about `4.44 sigma`. That is
+   what makes the dispersion test clean - inject at a known sigma, predict the
+   group velocity, measure the ring.
+
+A clipped, cell-sampled Ricker does *not* integrate to zero even though the
+continuous one does: the tail beyond 3 sigma carries 5% of the peak. It is now
+clipped at 4 sigma with the discrete mean subtracted, exactly as the kernel own
+DC term is.
+
+Displacement is added to **both** time levels and velocity to only the older
+one, because `dh/dt = (h^n - h^{n-1})/dt`: adding to `h^n` alone would inject a
+velocity of `displacement/dt`, an enormous one. `strength` says the water *has*
+been pushed down; `velocity_y` says it is *still* being pushed down; a real
+impact is both.
+
+### Verification: the ring expansion, decomposed
+
+The test that proves the method is physical measures a real group velocity out
+of a real simulation. It compares against **two** references, because they are
+two different claims:
+
+| sigma | lambda0 | measured | vs realised | vs ideal |
+|------:|--------:|---------:|------------:|---------:|
+|  0.30 |  1.33 m |   0.6941 |       0.10% |    0.62% |
+|  0.40 |  1.78 m |   0.8042 |       2.47% |    0.97% |
+|  0.50 |  2.22 m |   0.9238 |       4.26% |    3.74% |
+|  0.60 |  2.67 m |   1.0721 |       1.94% |    9.90% |
+|  0.80 |  3.55 m |   1.4363 |       0.71% |   27.51% |
+
+*vs realised* is the solver reproducing the operator it was given - a failure
+there is a bug. *vs ideal* is that operator being good deep-water physics - a
+gap there is the kernel band limit. At sigma = 0.8 the solver tracks its own
+operator to **0.71%** while the ideal error is 27.5%, which localises the entire
+gap to the kernel rather than the integrator. Conflating the two would have
+made the method look broken when it is not.
+
+The reference is the **energy-weighted** mean group velocity, not `c_g` at the
+profile peak wavenumber: the transform goes like `k^2 exp(-s^2 k^2/2)`, so the
+radial energy density goes like `k^5 exp(-s^2 k^2)`, a different and broader
+peak. Comparing against the wrong number and then congratulating the code for
+the mismatch is an easy trap.
+
+**Group velocity is a DERIVATIVE of the symbol**, which is why the ideal-theory
+error grows so much faster than the symbol error. Where the realised symbol is
+rising steeply through the transition band, a 28% symbol error becomes a 50%
+*speed* error. The accurate band is therefore narrower for group velocity than
+the symbol alone suggests - a point worth stating before someone else does.
+
+### Boundaries
+
+**Absorbing layer.** Damping ramps up quadratically from the inner edge rather
+than switching on at it: a step change in damping is an impedance
+discontinuity and reflects almost as badly as the hard boundary it replaces.
+Measured: **0.0025%** of launched energy returns to the central region after a
+full round trip, and removing the layer makes reflection **1991x** worse - so
+the threshold is measuring the layer, not the damping.
+
+**Obstruction.** This is a real physics distinction, not a style option. A
+rigid hull is no-normal-flow, `dphi/dn = 0`, which for surface elevation is
+`dEta/dn = 0` - a Neumann condition, and a crest reflects as a **crest**.
+Zeroing the field at solid cells, which is what the published iWave does and
+what nearly every implementation copies, is Dirichlet `eta = 0`: physically a
+pressure-release surface, not a wall, and it **flips the sign** of the
+reflection. Measured peak signed field in front of a wall: Neumann -0.518,
+Dirichlet +0.412. Neumann is the default, implemented by filling each solid
+cell from its nearest fluid cell (a multi-source BFS built once per
+`set_obstruction`, never per frame); Dirichlet remains available for anyone
+comparing against a reference implementation.
+
+### Recentring without a jolt
+
+The shift is always an **integer number of cells**, so it is an exact move:
+every retained cell keeps its bit-exact value, nothing is resampled,
+interpolated or filtered, and there is no jolt *by construction* - not "a small
+jolt we smooth over". Verified by comparing 61254 interior cells before and
+after a (10, 7) cell shift: **0 differing bits**. Newly exposed cells are set
+to zero, which is the physically correct value since this field holds only the
+local disturbance, and they arrive at the grid edge where the absorbing layer
+has already attenuated everything to nothing.
+
+Three things that are easy to get wrong: both time levels must shift together
+(shifting one misaligns them and turns the second time derivative into noise);
+the shift must happen at a substep boundary; and the row iteration order must
+follow the shift direction so overlapping ranges cannot corrupt.
+
+### Composition, and why this is a separate object
+
+`Ocean::update()` takes **absolute** time and is a pure function of
+`(seed, desc, time)`. That purity is core promise #3 and it is what makes
+seeking, pausing and replay work. An interaction field is a time-stepped ODE -
+inherently incremental, and it cannot be made a pure function of absolute time.
+Folding it into `Ocean` would quietly demote that promise for everyone. So they
+stay separate, and the signatures differ so the distinction is visible at every
+call site: `ocean.update(absolute_time)` against `field.update(dt)`.
+
+`WaterSurface` composes them for queries, holding non-owning references.
+Normals compose through **slopes**:
+
+```
+sx = -nx/ny + dEta/dx ,   sz = -nz/ny + dEta/dz ,   n' = normalize(-sx, 1, -sz)
+```
+
+This is **exact**, unlike ADR-020 cascade blend. Heights adding in world space
+means world-space slopes add - an identity. The cascade sum has to blend
+already-normalised unit vectors because the public API exposes nothing else
+(ADR-005); here there is a genuine height field, so the exact form is available
+and there is no reason to approximate. The fragment shader runs the same
+arithmetic, so shading and physics agree rather than each being separately
+plausible.
+
+### The viewer, and three bugs found by looking at the output
+
+Left click casts a ray and marches it against the **displaced** surface.
+`f(t) = ray(t).y - surface_height(ray(t).xz)` starts positive; find the first
+sign change, then refine with **Illinois** (modified regula falsi), which keeps
+the bracket - so it cannot diverge the way a secant can on a bumpy surface -
+while converging superlinearly rather than one bit per iteration as bisection
+does. The march step grows with distance, because perspective means a step one
+pixel wide near the camera is many pixels wide at the horizon.
+
+Failure cases, all real: a grazing ray covers a huge horizontal distance per
+unit of vertical drop and can step clean over a crest and come down the far
+side; a choppy surface genuinely folds at breaking crests, where the height is
+multi-valued and "the first crossing" is only approximately meaningful (the
+same limit ADR-011 inversion has, inherited); and at long range float precision
+becomes comparable to the step. Rays below a slope threshold are refused and
+the march is capped at 2 km - a click that does nothing beats a rock 4 km away.
+A max-mipmap with cone stepping is the scalable answer and is deliberately not
+built for a demo driven by mouse clicks.
+
+Three bugs, all caught by inspecting output rather than trusting that binding a
+texture meant seeing it:
+
+1. **The fragment shader used the interpolated per-vertex sample.** The mesh is
+   about 3 m per quad while the field carries 0.5 to 4 m ripples, so
+   interpolating across a quad aliased them away completely: field present,
+   texture bound, water still flat. Sampling the texture per pixel is what
+   makes the ripples catch the light rather than merely move the mesh.
+2. **The field was recentred on the camera**, not on what the camera was
+   looking at. With the default camera the 64 m field covered water behind the
+   viewer while the water being looked at fell outside the grid, so every
+   impulse aimed at it was silently swallowed.
+3. **`recenter()` left the public buffer stale**, so a query between a recentre
+   and the next update read the old field through the new origin - every value
+   off by the shift, silently.
+
+The interaction texture samples `CLAMP_TO_BORDER` with a transparent-black
+border, through its own sampler. This is the exact opposite of the cascade
+textures, which `REPEAT` because they are genuinely periodic - and reusing the
+repeating sampler that is already to hand would tile one splash across the
+entire ocean.
+
+### Performance
+
+Full tables in BENCHMARKS.md. At the default 256 squared, the field costs
+**0.191 ms** threaded - about 37% of one `Ocean::update()` and 13% of a 3-level
+cascade frame.
+
+The benchmark caught a bug rather than merely reporting a speed, for the second
+time in this project (the signed-zero AVX2 bug in ADR-016 was the first).
+256 squared measured four times slower *per cell* than 512 squared, which is
+impossible for a loop whose work is proportional to cell count. The cause was
+**denormal stalls**: the absorbing layer multiplies its cells by about 0.8 per
+substep, so after a few hundred steps a ring of cells sits in the denormal
+range where x86 arithmetic traps to microcode at roughly 100x cost. Each grid
+size had run a different number of substeps by the time it was measured.
+Flushing values below 1e-30 to zero gave **6.8x at 256 squared** and 6.2x at
+512 squared.
+
+FTZ/DAZ in MXCSR was rejected as the fix: it is a process-wide CPU mode that
+would change results in the host own code, and it is an x86 register with no
+portable equivalent, so the four kernels would stop agreeing bit for bit and
+the ADR-013 contract would quietly break. An explicit compare-and-zero is
+portable, deterministic, identical on every path, and covered by the same
+bit-exactness test as everything else.

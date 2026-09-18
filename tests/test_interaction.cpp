@@ -1082,3 +1082,29 @@ TEST_CASE("update() performs no heap allocation")
     const std::size_t after = alloc_probe::count();
     CHECK(after == before);
 }
+
+TEST_CASE("feeding exactly the fixed timestep runs exactly one substep")
+{
+    // The overwhelmingly common case: a 60 Hz host handing over 1/60 s against
+    // a 1/60 s timestep. It must run one substep per frame, every frame.
+    //
+    // Without a tolerance it does not. float(1/60) and the double accumulator
+    // land on opposite sides of the comparison by one ulp, so the field runs
+    // 0, 2, 0, 2, ... substeps - correct on average, visibly jittery in motion,
+    // and it silently halves the measured cost in a benchmark because half the
+    // sampled frames do no work at all. That is exactly how it was found.
+    InteractionDesc d = base_desc();
+    InteractionField f{d};
+    const float dt = f.fixed_dt();
+
+    f.add(rock(32.0f, 32.0f));
+    int zero_frames = 0, total = 0;
+    for (int i = 0; i < 240; ++i) {
+        f.update(dt);
+        total += static_cast<int>(f.last_substeps());
+        if (f.last_substeps() == 0) ++zero_frames;
+        REQUIRE(f.last_substeps() == 1);
+    }
+    CHECK(zero_frames == 0);
+    CHECK(total == 240);
+}

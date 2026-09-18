@@ -373,3 +373,107 @@ each level's own variance to within 8% (Monte Carlo sampling noise plus
 expected small overlap at each cutoff's soft knee) - Var(a+b+c) = Var(a) +
 Var(b) + Var(c) for independent fields, verified on real generated data
 rather than assumed.
+
+---
+
+## Interaction field (ADR-021)
+
+Measured 2026-09-18, i7-14700HX, AVX2, cell size held at 0.25 m so the kernel
+and timestep are identical across sizes. One `update()` at 60 fps runs exactly
+one substep, so these are also per-frame costs at 60 fps.
+
+Run it with `build/bench/ocean_bench_interaction.exe`.
+
+### Against grid size, P = 6 (169 taps)
+
+| N     | serial (ms) | threaded (ms) | speedup | Mcell/s | dt limit (s) |
+|------:|------------:|--------------:|--------:|--------:|-------------:|
+| 128²  |       0.111 |         0.116 |   0.96x |   140.8 |       0.1539 |
+| 256²  |       0.476 |         0.191 |   2.48x |   342.4 |       0.1539 |
+| 512²  |       1.894 |         0.350 |   5.41x |   748.8 |       0.1539 |
+
+Serial scales as 4.0x per 4x the cells, which is what a stencil whose work is
+exactly proportional to cell count should do.
+
+### Against kernel radius, 256²
+
+| P  | taps | serial (ms) | threaded (ms) | ms/Mtap | dispersion error |
+|---:|-----:|------------:|--------------:|--------:|-----------------:|
+|  3 |   49 |       0.178 |         0.133 |  0.0553 |           36.08% |
+|  4 |   81 |       0.248 |         0.149 |  0.0467 |           26.53% |
+|  6 |  169 |       0.462 |         0.185 |  0.0417 |           13.11% |
+|  8 |  289 |       0.768 |         0.201 |  0.0406 |            6.47% |
+| 10 |  441 |       1.298 |         0.238 |  0.0449 |            3.03% |
+
+Dispersion error is the peak symbol error over the band the kernel claims; the
+wave-**speed** error is half of it.
+
+**The threaded column makes a case for P = 8 that the serial column hides.**
+Serially, P = 8 costs 1.66x P = 6 — which is just the tap ratio 289/169 = 1.71,
+so the loop is doing exactly what it should. Threaded, it costs only **8.6%
+more** (0.201 against 0.185 ms) while halving the dispersion error, because at
+256² the dispatch overhead dominates and there is spare parallel capacity to
+absorb the extra taps. On this machine P = 8 is close to free; the default
+stays at 6 because that is not true of a machine with fewer cores, where the
+serial column is the honest guide.
+
+### Next to the FFT ocean
+
+| N     | ocean (ms) | interaction (ms) |
+|------:|-----------:|-----------------:|
+| 128²  |      0.357 |            0.156 |
+| 256²  |      0.539 |            0.200 |
+| 512²  |      1.342 |            0.327 |
+
+At the default 256², the interaction field costs about **37% of one
+`Ocean::update()`** and roughly 13% of a 3-level cascade frame (1.549 ms,
+measured in the cascades section above).
+
+### A 6.8x speedup found by an impossible number
+
+The first run of this benchmark reported 256² as **four times slower per cell
+than 512²**. That is not a slow path, it is an impossible one: the work is
+exactly proportional to cell count, so per-cell cost cannot fall as the grid
+grows.
+
+Chasing it ruled out substep count (1 everywhere, confirmed by instrumenting
+the loop) and cache capacity (which would make the larger grid slower, not
+faster). What actually differed was **how many substeps each size had run** by
+the time it was measured — 400 iterations at 256², 120 at 512², 1200 at 128².
+
+The absorbing layer multiplies its cells by about 0.8 every substep. After a
+few hundred steps a ring of cells is sitting in the **denormal** range, where
+x86 arithmetic traps to microcode at roughly 100x the cost. 512² had not yet
+decayed into that range; 128² had already passed through it to exact zero;
+256² was sitting in it for the whole measurement.
+
+Flushing values below 1e-30 to exactly zero at the end of each substep:
+
+| N     | before (ms) | after (ms) | speedup |
+|------:|------------:|-----------:|--------:|
+| 128²  |       0.147 |      0.124 |   1.20x |
+| 256²  |       1.325 |      0.196 | **6.76x** |
+| 512²  |       2.098 |      0.340 | **6.17x** |
+
+The alternative fix, setting FTZ/DAZ in MXCSR, was rejected: it is a
+process-wide CPU mode that would change results in the host's own code, and it
+is an x86 register with no portable equivalent, so the scalar, SSE2, AVX2 and
+NEON paths would stop agreeing bit for bit and ADR-013's contract would quietly
+break. An explicit compare-and-zero is portable, deterministic and identical on
+every path — and it is inside the bit-exactness test like everything else.
+
+This is the second time in this project that a benchmark caught a bug rather
+than merely reporting a speed (the first was the signed-zero AVX2 evolve bug in
+ADR-016). Both were found the same way: by noticing a number that could not be
+true and refusing to move on.
+
+### Threading threshold
+
+ADR-012 measured 8192 cells for the FFT pipeline. This workload is different —
+one dispatch per substep rather than four barriers, but far less work to spread
+at small sizes — and it has its own crossover: 128² (16384 cells) measured
+**slower** threaded, 0.137 ms against 0.112 ms serial. Only powers of two are
+legal sizes, so the crossover can only be located to (16384, 65536]; the
+threshold is set to 32768 between them, which brings 128² back to parity
+(0.96x). The principle is ADR-012's and is the defensible part: threading must
+never make things worse.
