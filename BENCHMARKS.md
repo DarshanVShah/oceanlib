@@ -506,3 +506,26 @@ Fusing the two passes and writing the AVX2 velocity kernel is the obvious
 optimisation. It is deliberately not done yet: the standing practice here is to
 measure before optimising, and nothing has yet shown a real scene limited by
 this.
+
+### Query cost
+
+Measured 2026-09-18, i7-14700HX, 256 squared ocean plus a 256 squared
+interaction field, 20000 queries at non-grid-aligned positions.
+
+| query                                | microseconds |
+|--------------------------------------|-------------:|
+| `Ocean::sample_at`                   |       0.1107 |
+| `InteractionField::sample_at`         |       0.0022 |
+| `WaterSurface::sample_at` (combined) |       0.1146 |
+| **added cost of the interaction**    |   **0.0039** |
+
+**The combined query costs 3.5% more than the FFT query alone.** The reason is
+structural: the interaction field is a pure height field, so it needs one
+bilinear tap and nothing else. The FFT query has to invert the choppy
+displacement first (ADR-011's fixed-point solve, four iterations of bilinear
+fetches), and that inversion is untouched by adding a height field on top of
+it - there is no second solve to do.
+
+At 0.115 microseconds a host can afford roughly 8500 combined queries per
+millisecond, so a few hundred buoyancy probes per frame is not a cost worth
+thinking about.

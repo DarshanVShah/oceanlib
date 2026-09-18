@@ -244,6 +244,68 @@ int main(int argc, char** argv)
                     b.median_ms / a.median_ms);
     }
 
+    // --- query cost ---------------------------------------------------------
+    //
+    // Per-query, not per-frame: a host asking for buoyancy at a few dozen
+    // points per frame is the case that matters, and a number in microseconds
+    // is what an integrator can actually budget with.
+    {
+        std::printf("\nQuery cost, 256^2 ocean + 256^2 interaction field\n");
+        std::printf("%-34s %12s\n", "query", "microseconds");
+
+        ocean::OceanDesc od;
+        od.size         = 256;
+        od.thread_count = threads;
+        ocean::Ocean sim{od};
+        sim.update(10.0);
+
+        ocean::InteractionDesc id;
+        id.size         = 256;
+        id.extent       = 64.0f;
+        id.thread_count = threads;
+        id.max_sources  = 8;
+        ocean::InteractionField field{id};
+        ocean::Disturbance s;
+        s.radius = 0.5f; s.strength = 0.3f;
+        s.world_x = 32.0f; s.world_z = 32.0f;
+        field.add(s);
+        for (int i = 0; i < 21; ++i) field.update(1.0f / 60.0f);
+
+        const ocean::WaterSurface water{sim, field};
+
+        // Non-grid-aligned sample points, so the bilinear taps and the
+        // fixed-point inversion both do real work rather than hitting a
+        // degenerate case.
+        constexpr int kQueries = 20000;
+        volatile float sink = 0.0f;
+
+        auto time_queries = [&](auto&& fn) {
+            const auto start = Clock::now();
+            for (int i = 0; i < kQueries; ++i) {
+                const float x = 31.3f + static_cast<float>(i) * 0.0137f;
+                const float z = 33.7f + static_cast<float>(i) * 0.0219f;
+                sink = fn(x, z);
+            }
+            const auto end = Clock::now();
+            return std::chrono::duration<double, std::micro>(end - start).count() /
+                   kQueries;
+        };
+
+        const double t_ocean = time_queries(
+            [&](float x, float z) { return sim.sample_at(x, z).height; });
+        const double t_field = time_queries(
+            [&](float x, float z) { return field.sample_at(x, z).height; });
+        const double t_both = time_queries(
+            [&](float x, float z) { return water.sample_at(x, z).height; });
+
+        std::printf("%-34s %12.4f\n", "Ocean::sample_at", t_ocean);
+        std::printf("%-34s %12.4f\n", "InteractionField::sample_at", t_field);
+        std::printf("%-34s %12.4f\n", "WaterSurface::sample_at (combined)", t_both);
+        std::printf("%-34s %12.4f\n", "  added cost of the interaction",
+                    t_both - t_ocean);
+        (void)sink;
+    }
+
     std::printf("\nOne update() at 60 fps runs exactly one substep, so the\n");
     std::printf("interaction column is also the per-frame cost at 60 fps.\n");
     return 0;

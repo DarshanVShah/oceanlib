@@ -51,7 +51,9 @@ Four promises, and every one of them is tested rather than asserted:
 FFT-based CPU displacement/normal/foam field per patch, exact world-space
 height/normal/foam queries against what's actually drawn, multi-scale
 cascades (several patches at different scales summed into one sea state),
-and a reference Vulkan viewer to see it in.
+optional 3-D orbital velocity, **local interaction** (objects disturb the
+water, the disturbance propagates, reflects off hulls and is visible to
+queries), and a reference Vulkan viewer to see it in.
 
 **Doesn't do:** GPU compute (the FFT is CPU-only, by design - see promise
 #1), foam *advection* (foam is a per-frame Jacobian threshold, not simulated
@@ -169,9 +171,22 @@ Needs the Vulkan SDK (for headers and `glslc`); GLFW is fetched automatically.
 | Shift | move faster | Tab | wireframe |
 | Space | pause time | R | reset camera |
 | 1 / 2 | choppiness | Esc | quit |
+| **LMB** | **drop a rock** | **I** | **wake only** |
+| - / = | impulse strength | [ / ] | impulse radius |
+
+Left click ray-marches against the *displaced* surface - not the flat y = 0
+plane - and drops a rock where it lands. `I` isolates the interaction field
+from the swell so the ripples can be read on their own.
 
 Flags: `--size N --mesh M --tiles T --wind U --chop C --foam F --wireframe
---screenshot out.bmp --frames N`.
+--screenshot out.bmp --frames N --interaction N --splash FRAME --isolate
+--impulse S --impulse-radius R --cam-x/y/z V --cam-yaw/--cam-pitch V`.
+
+![splash](docs/v3-splash.png)
+
+A rock dropped into a wind sea: the ring is summed with the swell in both
+geometry and shading. `docs/v3-wake-only.png` is the same moment with `I`
+held - the interaction field alone.
 
 ## Performance
 

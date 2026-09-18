@@ -78,7 +78,7 @@ int ocean_c_header_smoke_test(void)
         ocean_interaction_buffers ib;
         ocean_interaction_sample isample;
         ocean_disturbance d;
-        unsigned char mask[32 * 32];
+        unsigned char mask[64 * 64]; /* must match idesc.size^2 */
         int i;
 
         ocean_sample_ex(sim, 3.0f, 4.0f, &ex);
@@ -97,7 +97,7 @@ int ocean_c_header_smoke_test(void)
         if (field == NULL) return 15;
         if (status != OCEAN_OK) return 16;
 
-        for (i = 0; i < 32 * 32; ++i) mask[i] = 0;
+        for (i = 0; i < 64 * 64; ++i) mask[i] = 0;
         ocean_interaction_set_obstruction(field, mask);
         ocean_interaction_set_obstruction(field, NULL);
 
