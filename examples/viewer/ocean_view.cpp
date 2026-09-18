@@ -583,6 +583,12 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
 {
     FrameResources& f = frames_[frame];
 
+    // Brackets the whole GPU cost of one ocean frame: cascade texture
+    // upload plus the actual clipmap draw, which is what "frame time"
+    // means for the before/after clipmap comparison (ADR-021) - a player
+    // does not care which part of that cost went down, only the total.
+    ctx.write_timestamp(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, true);
+
     // THE ENTIRE INTEGRATION WITH THE LIBRARY IS THESE MEMCPYS, ONE PAIR PER
     // CASCADE LEVEL.
     for (std::size_t i = 0; i < level_count_; ++i) {
@@ -771,6 +777,8 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0);
+
+    ctx.write_timestamp(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, false);
 }
 
 void OceanView::shutdown(VkContext& ctx)

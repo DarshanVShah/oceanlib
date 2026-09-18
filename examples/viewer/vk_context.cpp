@@ -1,8 +1,10 @@
 #include "vk_context.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace viewer {
 namespace {
@@ -54,7 +56,8 @@ void transition_image(VkCommandBuffer cmd, VkImage image,
     vkCmdPipelineBarrier2(cmd, &dep);
 }
 
-bool VkContext::init(GLFWwindow* w, bool enable_validation)
+bool VkContext::init(GLFWwindow* w, bool enable_validation,
+                     const char* gpu_preference)
 {
     window = w;
     if (!create_instance(enable_validation)) return false;
@@ -62,7 +65,7 @@ bool VkContext::init(GLFWwindow* w, bool enable_validation)
                "glfwCreateWindowSurface")) {
         return false;
     }
-    if (!pick_physical_device()) return false;
+    if (!pick_physical_device(gpu_preference)) return false;
     if (!create_device()) return false;
     if (!create_swapchain()) return false;
     if (!create_depth_resources()) return false;
@@ -134,7 +137,7 @@ bool VkContext::create_instance(bool enable_validation)
     return true;
 }
 
-bool VkContext::pick_physical_device()
+bool VkContext::pick_physical_device(const char* gpu_preference)
 {
     std::uint32_t count = 0;
     vkEnumeratePhysicalDevices(instance, &count, nullptr);
@@ -144,6 +147,14 @@ bool VkContext::pick_physical_device()
     }
     std::vector<VkPhysicalDevice> devices(count);
     vkEnumeratePhysicalDevices(instance, &count, devices.data());
+
+    // Lowercased once; device names and the preference string are compared
+    // case-insensitively so "--gpu uhd" and "--gpu UHD" both work.
+    std::string want;
+    if (gpu_preference != nullptr) {
+        want = gpu_preference;
+        for (char& ch : want) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
 
     VkPhysicalDevice best = VK_NULL_HANDLE;
     int best_score = -1;
@@ -173,11 +184,25 @@ bool VkContext::pick_physical_device()
         }
         if (found < 0) continue;
 
-        // Prefer discrete: this is a laptop with an integrated GPU too, and
-        // landing on the iGPU would make the benchmark numbers meaningless.
-        int score = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-                        ? 1000
-                        : 10;
+        std::string name = props.deviceName;
+        for (char& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+
+        int score;
+        if (!want.empty()) {
+            // Explicit preference always wins over the default discrete
+            // bias below - this is the ONLY way to reach the iGPU for a
+            // before/after comparison on a laptop with both.
+            const bool matches_type =
+                (want == "discrete" && props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) ||
+                (want == "integrated" && props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
+            const bool matches_name = name.find(want) != std::string::npos;
+            score = (matches_type || matches_name) ? 1000 : 0;
+        } else {
+            // Default: prefer discrete. This is a laptop with an integrated
+            // GPU too, and landing on the iGPU by accident would make the
+            // benchmark numbers meaningless.
+            score = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) ? 1000 : 10;
+        }
         if (score > best_score) {
             best_score   = score;
             best         = dev;
@@ -195,6 +220,7 @@ bool VkContext::pick_physical_device()
     physical = best;
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(physical, &props);
+    timestamp_period_ns = props.limits.timestampPeriod;
     std::printf("GPU: %s\n", props.deviceName);
     return true;
 }
@@ -394,7 +420,40 @@ bool VkContext::create_frames()
         fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         vkCreateFence(device, &fci, nullptr, &frames[i].in_flight);
     }
+
+    VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qpci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+    qpci.queryCount = 2 * kFramesInFlight;
+    if (!check(vkCreateQueryPool(device, &qpci, nullptr, &timestamp_pool),
+               "vkCreateQueryPool")) {
+        return false;
+    }
     return true;
+}
+
+void VkContext::write_timestamp(VkCommandBuffer cmd, VkPipelineStageFlagBits2 stage,
+                                bool start)
+{
+    const std::uint32_t query = frame_index * 2 + (start ? 0u : 1u);
+    // Resetting the pair right before the "start" write, rather than once at
+    // the top of the frame, keeps the reset and both writes in the same
+    // command buffer - simplest ordering guarantee, and it costs nothing
+    // extra since a command buffer reset already invalidates prior results.
+    if (start) vkCmdResetQueryPool(cmd, timestamp_pool, frame_index * 2, 2);
+    vkCmdWriteTimestamp2(cmd, stage, timestamp_pool, query);
+}
+
+double VkContext::last_gpu_ms() const
+{
+    std::uint64_t ts[2]{};
+    const VkResult r = vkGetQueryPoolResults(
+        device, timestamp_pool, frame_index * 2, 2, sizeof(ts), ts, sizeof(std::uint64_t),
+        VK_QUERY_RESULT_64_BIT);
+    // NOT_READY on the very first couple of frames, before this slot has
+    // ever been submitted - 0 is a harmless placeholder, not a real
+    // measurement, and every subsequent frame overwrites it.
+    if (r != VK_SUCCESS) return 0.0;
+    return static_cast<double>(ts[1] - ts[0]) * static_cast<double>(timestamp_period_ns) / 1.0e6;
 }
 
 bool VkContext::begin_frame(std::uint32_t& image_index, VkCommandBuffer& cmd)
@@ -517,6 +576,7 @@ void VkContext::shutdown()
         if (frames[i].in_flight)
             vkDestroyFence(device, frames[i].in_flight, nullptr);
     }
+    if (timestamp_pool) vkDestroyQueryPool(device, timestamp_pool, nullptr);
     destroy_swapchain();
     if (command_pool) vkDestroyCommandPool(device, command_pool, nullptr);
     vkDestroyDevice(device, nullptr);

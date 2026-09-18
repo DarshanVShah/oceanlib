@@ -26,7 +26,12 @@ struct Frame {
 
 class VkContext {
 public:
-    bool init(GLFWwindow* window, bool enable_validation);
+    // `gpu_preference`: "discrete" (default if null - a laptop's iGPU would
+    // otherwise make benchmark numbers meaningless by accident), "integrated",
+    // or a substring of the device name to match (e.g. "UHD"), so a specific
+    // GPU can be selected for a before/after comparison.
+    bool init(GLFWwindow* window, bool enable_validation,
+              const char* gpu_preference = nullptr);
     void shutdown();
 
     // Acquires the next swapchain image and begins recording. Returns false if
@@ -34,6 +39,19 @@ public:
     // the frame.
     bool begin_frame(std::uint32_t& image_index, VkCommandBuffer& cmd);
     void end_frame(std::uint32_t image_index);
+
+    // Writes a GPU timestamp for the frame currently being recorded (slot
+    // `frame_index`); `start` selects which of the two queries that slot
+    // uses. Cheap - one vkCmdWriteTimestamp2 - safe to call every frame.
+    void write_timestamp(VkCommandBuffer cmd, VkPipelineStageFlagBits2 stage,
+                         bool start);
+
+    // GPU time, in milliseconds, that the timestamps written for frame slot
+    // `frame_index` bounded - valid only after that slot's fence has been
+    // waited on (begin_frame already does this before recording reuses the
+    // slot), so this reads the PREVIOUS frame that used this slot, exactly
+    // like the fence wait it piggybacks on.
+    [[nodiscard]] double last_gpu_ms() const;
 
     void recreate_swapchain();
     void wait_idle() const { vkDeviceWaitIdle(device); }
@@ -84,9 +102,15 @@ public:
     bool validation_enabled = false;
     VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
 
+    // 2 queries per frame-in-flight slot (start, end); nanoseconds per tick
+    // comes from VkPhysicalDeviceLimits and varies by vendor, so every
+    // conversion to milliseconds must go through it rather than assuming 1.
+    VkQueryPool timestamp_pool   = VK_NULL_HANDLE;
+    float       timestamp_period_ns = 1.0f;
+
 private:
     bool create_instance(bool enable_validation);
-    bool pick_physical_device();
+    bool pick_physical_device(const char* gpu_preference);
     bool create_device();
     bool create_swapchain();
     void destroy_swapchain();

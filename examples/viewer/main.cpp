@@ -21,6 +21,8 @@
 //   --screenshot P    render a few frames, write P as BMP, exit
 //   --frames N        frames to render before the screenshot (default 90)
 //   --no-validation   skip the Vulkan validation layer
+//   --gpu G           select the GPU: discrete|integrated, or a name
+//                     substring e.g. "UHD" (default: prefer discrete)
 
 #include "ocean_view.hpp"
 #include "vk_context.hpp"
@@ -56,6 +58,8 @@ struct Options {
     std::uint32_t cascades = 3;   // 1-3, see ADR-020
     int           frames = 90;
     bool          validation = true;
+    std::string   gpu;            // "" = prefer discrete (default);
+                                  // "discrete" | "integrated" | a name substring
 };
 
 Options parse_args(int argc, char** argv)
@@ -80,6 +84,7 @@ Options parse_args(int argc, char** argv)
         else if (a == "--screenshot")  o.screenshot = next();
         else if (a == "--frames")      o.frames = std::atoi(next());
         else if (a == "--no-validation") o.validation = false;
+        else if (a == "--gpu")          o.gpu = next();
     }
     if (o.rings < 1) o.rings = 1;
     if (o.rings > viewer::kMaxRings) o.rings = viewer::kMaxRings;
@@ -267,7 +272,8 @@ int main(int argc, char** argv)
     glfwSetKeyCallback(window, key_callback);
 
     viewer::VkContext ctx;
-    if (!ctx.init(window, opt.validation)) {
+    if (!ctx.init(window, opt.validation,
+                  opt.gpu.empty() ? nullptr : opt.gpu.c_str())) {
         glfwDestroyWindow(window);
         glfwTerminate();
         return 1;
@@ -347,6 +353,7 @@ int main(int argc, char** argv)
     double sim_time = 0.0;
     auto   last     = std::chrono::steady_clock::now();
     double ocean_ms_avg = 0.0;
+    double gpu_ms_avg = 0.0;
     double fps_avg = 0.0;
     int    frame_counter = 0;
     std::uint32_t last_image = 0;
@@ -429,6 +436,12 @@ int main(int argc, char** argv)
         if (!ctx.begin_frame(image_index, cmd)) continue;
         last_image = image_index;
 
+        // Read back BEFORE view.record() below resets and rewrites this
+        // frame slot's timestamp pair - begin_frame() just waited on this
+        // slot's fence, so the PREVIOUS frame that used it (kFramesInFlight
+        // frames ago) is guaranteed complete and its GPU time is valid now.
+        const double gpu_ms = ctx.last_gpu_ms();
+
         const float aspect = static_cast<float>(ctx.extent.width) /
                              static_cast<float>(ctx.extent.height);
         const vkm::Mat4 proj = vkm::perspective(1.05f, aspect, 0.3f, 8000.0f);
@@ -466,15 +479,18 @@ int main(int argc, char** argv)
 
         // --- HUD ----------------------------------------------------------
         ocean_ms_avg = ocean_ms_avg * 0.95 + ocean_ms * 0.05;
+        // gpu_ms is 0 for the first couple of frames (see last_gpu_ms), which
+        // would drag the running average down artificially - skip those.
+        if (gpu_ms > 0.0) gpu_ms_avg = gpu_ms_avg * 0.95 + gpu_ms * 0.05;
         fps_avg = fps_avg * 0.95 + (dt > 0.0 ? 1.0 / dt : 0.0) * 0.05;
         if (++frame_counter % 15 == 0) {
             const float h = stack.height_at(input.camera.position.x,
                                             input.camera.position.z);
             char title[256];
             std::snprintf(title, sizeof(title),
-                          "oceanlib  |  %.0f fps  |  ocean %.2f ms  |  %ux%u  |  "
-                          "chop %.2f  |  water under camera %+.2f m%s",
-                          fps_avg, ocean_ms_avg, opt.size, opt.size,
+                          "oceanlib  |  %.0f fps  |  ocean %.2f ms  |  gpu %.2f ms  |  "
+                          "%ux%u  |  chop %.2f  |  water under camera %+.2f m%s",
+                          fps_avg, ocean_ms_avg, gpu_ms_avg, opt.size, opt.size,
                           input.choppiness, h, input.paused ? "  [PAUSED]" : "");
             glfwSetWindowTitle(window, title);
         }
@@ -484,6 +500,8 @@ int main(int argc, char** argv)
                 std::printf("wrote %s (%ux%u)\n", opt.screenshot.c_str(),
                             ctx.extent.width, ctx.extent.height);
             }
+            std::printf("gpu frame time: %.3f ms (exponential moving average, decay 0.95)  |  %u triangles/frame\n",
+                        gpu_ms_avg, view.triangle_count());
             break;
         }
     }
