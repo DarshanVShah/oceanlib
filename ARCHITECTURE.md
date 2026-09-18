@@ -1665,5 +1665,43 @@ only bounds the offset between adjacent centres to a multiple of the coarser
 cell size, not to zero, so the ambiguity - and the need to select an
 orientation - remains. Corrected before implementation.)
 
-*(Implementation, measured triangle counts and frame times follow as they
-land.)*
+### Implementation and a real bug caught by looking at it
+
+Built as: `clipmap.hpp/.cpp` (host-side ring layout, mesh and stitch-band
+generation, no Vulkan types - independently readable, per this file's
+established pattern of keeping geometry math out of graphics-API noise),
+`RingPush` (a 16-byte push constant: ring offset, cell size, morph start),
+and `ocean_view.cpp` drawing one solid centre plus, per outer ring, an
+annulus draw and a stitch-band draw against the next-finer ring.
+
+At default settings (6 rings, 0.5 m finest cell), the clipmap draws **~40k
+triangles/frame** against the old single-tile mesh's 6.42M at the same
+visible range - matching the whole reason for the technique (ADR-015's known
+limitation is now fixed).
+
+Verified the same way ADR-015 verifies the rest of this viewer: by looking
+at it, not by assuming it compiled. A wireframe screenshot immediately
+showed a real defect - a thin bright crack running across the surface,
+clearly visible against the sky's fog colour. It survived disabling the
+stitch band entirely and separately forcing the geomorph blend to zero,
+which ruled out both as the cause and pointed at the one piece neither
+bisection touched: the fine-cascade distance fade (`vFade1`/`vFade2`) was
+driven by `ring.cellSize`, a per-ring push-constant **that doubles at every
+ring boundary**. Since a faded cascade's displacement is scaled by that
+factor before being summed into height, two adjacent rings - which must
+agree on height at their shared boundary for the surface to be seamless -
+were computing genuinely different heights there, because they disagreed
+on how much of cascades 1 and 2 to include. No amount of correct stitching
+or morphing closes a gap caused by the two sides legitimately disagreeing
+about where the surface *is*.
+
+Fixed by driving the fade from world-space distance from the camera
+instead: distance is continuous across the whole clipmap, including exactly
+at ring seams, so it has no jump for the fade to inherit. Confirmed fixed by
+the same means the bug was found - wireframe and shaded screenshots at ring
+counts 1 (no stitching at all), 6 (default) and 8 (max), all clean.
+
+This is the reason the geomorph-blend correction earlier in this ADR and
+this fade bug are both recorded rather than silently fixed: a technique this
+fiddly to get exactly right is exactly where "it compiled" and "it is
+correct" come apart, and the second one only gets checked by looking.

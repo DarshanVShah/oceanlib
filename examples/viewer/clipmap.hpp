@@ -11,6 +11,7 @@
 // is that same idea, just with its own independent scale and offset per level.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -23,6 +24,11 @@ namespace viewer {
 // range - see RingLayout below.
 inline constexpr std::int32_t kRingSegments = 64;
 inline constexpr std::int32_t kRingHalf     = kRingSegments / 2;
+
+// Compile-time cap on ring count, so RingLayout::place can fill a fixed
+// array rather than allocate one every frame (this is viewer/demo code, not
+// the core library, but there is no reason to be sloppier about it here).
+inline constexpr std::uint32_t kMaxRings = 8;
 
 // One ring's placement for the current frame: independent of every other
 // ring, following ADR-021's "finest possible camera-following precision at
@@ -57,8 +63,12 @@ struct RingLayout {
     // Because each ring snaps independently, ring i's centre and ring
     // (i-1)'s centre generally differ by a small offset (up to half of ring
     // i's own cell) - that gap is what StitchBand closes.
-    [[nodiscard]] std::vector<RingPlacement> place(float camera_x,
-                                                    float camera_z) const;
+    //
+    // Fills `out[0..ring_count)` in place; `out` must have at least
+    // ring_count entries (callers size it kMaxRings, like the descriptor/
+    // texture arrays already do for kMaxCascades) so this never allocates.
+    void place(float camera_x, float camera_z,
+              std::array<RingPlacement, kMaxRings>& out) const;
 };
 
 // Host-side vertex/index buffers for one shared clipmap mesh, reused by every

@@ -21,10 +21,12 @@ layout(set = 0, binding = 0) uniform Globals {
     mat4 invViewProj;
     vec4 camPos;       // xyz
     vec4 sunDir;       // xyz, normalised, pointing TOWARD the sun
-    vec4 cascadePatch; // x,y,z = patch_length (m) of cascades 0,1,2; w = tiles
-                       // per side of the outer mesh, sized to cascade 0 (the
-                       // largest/farthest scale)
-    vec4 params;       // x = time, y = mesh resolution, z,w unused
+    vec4 cascadePatch; // x,y,z = patch_length (m) of cascades 0,1,2;
+                       // w = cascade grid resolution N (all cascades share
+                       // one N - see main.cpp), used to fade fine cascades
+                       // out once a clipmap ring's own cell size is already
+                       // coarser than that cascade's texel size (ADR-021)
+    vec4 params;       // x = time, y,z,w unused
     vec4 shading;      // x foam strength, y exposure, z fog density, w unused
 } g;
 

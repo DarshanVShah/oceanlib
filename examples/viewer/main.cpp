@@ -6,8 +6,8 @@
 //   1 / 2       choppiness    R                 reset camera
 //
 //   --size N          ocean grid resolution (default 256)
-//   --mesh M          mesh quads per tile edge (default 256)
-//   --tiles T         tiles per side of the outer (far-cascade) mesh, odd (default 7)
+//   --rings N         clipmap ring count, 1-8 (default 6; ADR-021)
+//   --cell C          finest ring's world metres per mesh cell (default 0.5)
 //   --cascades N      number of cascade scales, 1-3 (default 3; ADR-020)
 //   --wind U          wind speed in m/s (default 12)
 //   --depth D         water depth in metres for shallow-water dispersion
@@ -43,8 +43,8 @@ namespace {
 
 struct Options {
     std::uint32_t size   = 256;
-    std::uint32_t mesh   = 256;
-    std::uint32_t tiles  = 7;
+    std::uint32_t rings  = 6;
+    float         cell   = 0.5f;
     float         wind   = 12.0f;
     float         depth  = 0.0f;   // <= 0 = deep water
     float         chop   = 1.0f;
@@ -67,8 +67,8 @@ Options parse_args(int argc, char** argv)
             return (i + 1 < argc) ? argv[++i] : "";
         };
         if (a == "--size")             o.size  = std::strtoul(next(), nullptr, 10);
-        else if (a == "--mesh")        o.mesh  = std::strtoul(next(), nullptr, 10);
-        else if (a == "--tiles")       o.tiles = std::strtoul(next(), nullptr, 10);
+        else if (a == "--rings")       o.rings = std::strtoul(next(), nullptr, 10);
+        else if (a == "--cell")        o.cell  = std::strtof(next(), nullptr);
         else if (a == "--wind")        o.wind  = std::strtof(next(), nullptr);
         else if (a == "--depth")       o.depth = std::strtof(next(), nullptr);
         else if (a == "--chop")        o.chop  = std::strtof(next(), nullptr);
@@ -81,7 +81,8 @@ Options parse_args(int argc, char** argv)
         else if (a == "--frames")      o.frames = std::atoi(next());
         else if (a == "--no-validation") o.validation = false;
     }
-    if (o.tiles % 2 == 0) ++o.tiles;  // must be odd to centre on the origin
+    if (o.rings < 1) o.rings = 1;
+    if (o.rings > viewer::kMaxRings) o.rings = viewer::kMaxRings;
     if (o.cascades < 1) o.cascades = 1;
     if (o.cascades > 3) o.cascades = 3;
     return o;
@@ -325,15 +326,20 @@ int main(int argc, char** argv)
     std::printf(", wind %.1f m/s, depth %s, SIMD %s\n",
                 opt.wind, depth_desc, ocean_simd_level());
 
+    viewer::RingLayout ring_layout;
+    ring_layout.ring_count     = opt.rings;
+    ring_layout.base_cell_size = opt.cell;
+
     viewer::OceanView view;
-    if (!view.init(ctx, levels, opt.mesh, opt.tiles)) {
+    if (!view.init(ctx, levels, ring_layout)) {
         ctx.shutdown();
         glfwDestroyWindow(window);
         glfwTerminate();
         return 1;
     }
-    std::printf("mesh: %u quads/tile, %ux%u tiles (of the far cascade), %.2fM triangles/frame\n",
-                opt.mesh, opt.tiles, opt.tiles,
+    std::printf("clipmap: %u rings, %.2f m finest cell, %.0f m outermost footprint, %.2fM triangles/frame\n",
+                opt.rings, opt.cell,
+                ring_layout.footprint(opt.rings - 1),
                 view.triangle_count() / 1.0e6);
 
     const vkm::Vec3 sun = vkm::normalize({-0.45f, 0.38f, -0.80f});
@@ -441,19 +447,17 @@ int main(int argc, char** argv)
         globals.cascade_patch[0] = levels[0].patch_length;
         globals.cascade_patch[1] = (levels.size() > 1) ? levels[1].patch_length : levels[0].patch_length;
         globals.cascade_patch[2] = (levels.size() > 2) ? levels[2].patch_length : levels[0].patch_length;
-        globals.cascade_patch[3] = static_cast<float>(opt.tiles);
+        globals.cascade_patch[3] = static_cast<float>(opt.size);  // cascade grid resolution N
         globals.params[0]  = static_cast<float>(sim_time);
-        globals.params[1]  = static_cast<float>(opt.mesh);
+        globals.params[1]  = 0.0f;
         globals.params[2]  = 0.0f;
         globals.params[3]  = 0.0f;
         globals.shading[0] = 1.0f;     // foam strength
         globals.shading[1] = 1.15f;    // exposure
-        // Fog density was tuned for a 200 m single-patch ocean (visible extent
-        // ~1400 m at 7 tiles). The far cascade is now 800 m (~5600 m visible),
-        // so it is scaled up to match - see ADR-020's viewer notes: without
-        // this, far geometry fogs into raw sky_color (including its sharp
-        // sun-glare term) too slowly, and a wide band of near-horizon pixels
-        // can all catch the glare spike at once, washing out the sky.
+        // Fog density: tuned so far geometry (out to the clipmap's outermost
+        // ring footprint) fogs into raw sky_color before its sharp sun-glare
+        // term can wash out a wide band of near-horizon pixels at once - see
+        // ADR-020's viewer notes. Re-tuned for the clipmap in ADR-021.
         globals.shading[2] = 0.0015f; // fog density
         globals.shading[3] = input.choppiness;
 

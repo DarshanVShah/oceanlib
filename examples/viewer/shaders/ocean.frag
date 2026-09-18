@@ -11,6 +11,8 @@ layout(location = 1) in  vec2  vUV0;
 layout(location = 2) in  vec2  vUV1;
 layout(location = 3) in  vec2  vUV2;
 layout(location = 4) in  float vFoam;
+layout(location = 5) in  float vFade1;
+layout(location = 6) in  float vFade2;
 
 layout(location = 0) out vec4 outColor;
 
@@ -29,9 +31,13 @@ void main()
     // approximation here as the CPU query keeps rendering and physics
     // consistent with each other rather than just each being locally
     // plausible.
+    // vFade1/vFade2 mirror the same distance fade the vertex shader already
+    // applied to displacement (ADR-021) - kept consistent here so a faded
+    // cascade's normal contribution drops out too, rather than continuing to
+    // bend the surface's shading after its height contribution is gone.
     vec3 n0 = texture(uNormal0, vUV0).xyz;
-    vec3 n1 = texture(uNormal1, vUV1).xyz;
-    vec3 n2 = texture(uNormal2, vUV2).xyz;
+    vec3 n1 = texture(uNormal1, vUV1).xyz * vFade1;
+    vec3 n2 = texture(uNormal2, vUV2).xyz * vFade2;
     vec3 N = normalize(n0 + n1 + n2);
 
     // Backfacing normals occur where the surface has folded (jacobian < 0).

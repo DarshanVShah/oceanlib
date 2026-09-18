@@ -16,11 +16,10 @@ std::uint32_t vertex_index(std::int32_t local_i, std::int32_t local_z)
 
 }  // namespace
 
-std::vector<RingPlacement> RingLayout::place(float camera_x, float camera_z) const
+void RingLayout::place(float camera_x, float camera_z,
+                       std::array<RingPlacement, kMaxRings>& out) const
 {
-    std::vector<RingPlacement> out;
-    out.reserve(ring_count);
-    for (std::uint32_t r = 0; r < ring_count; ++r) {
+    for (std::uint32_t r = 0; r < ring_count && r < kMaxRings; ++r) {
         const float cs = cell_size(r);
         RingPlacement p;
         p.cell_size = cs;
@@ -30,9 +29,8 @@ std::vector<RingPlacement> RingLayout::place(float camera_x, float camera_z) con
         // trailing it by up to one cell.
         p.world_x = std::round(camera_x / cs) * cs;
         p.world_z = std::round(camera_z / cs) * cs;
-        out.push_back(p);
+        out[r] = p;
     }
-    return out;
 }
 
 ClipmapMesh ClipmapMesh::build()

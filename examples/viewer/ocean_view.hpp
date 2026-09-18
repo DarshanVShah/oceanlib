@@ -1,17 +1,15 @@
 // Everything specific to drawing oceanlib's output.
 //
-// Demonstrates 3 cascades (ADR-020): a far/large scale, a mid scale, and a
-// near/fine scale, summed in the shader at every pixel. The viewer fixes the
-// count at 3 (kMaxCascades below) to keep the descriptor layout and shader
-// loops simple - the library's own CascadeStack is not limited to 3, this is
-// a demo-only simplification.
-//
-// The core integration is unchanged in kind from the single-cascade version:
-// upload each cascade's two buffers as RGBA32F textures, and sample them -
-// just three times instead of once, summed per ADR-020's "additive sum, no
-// distance weighting" decision.
+// Demonstrates 3 cascades (ADR-020) summed in the shader at every pixel, over
+// a geometry-clipmap mesh (ADR-021) instead of a single uniform-resolution
+// tiled grid: concentric rings, each twice the previous ring's cell size,
+// centred on the camera and re-snapped every frame. The core integration is
+// unchanged in kind from the single-mesh version: upload each cascade's two
+// buffers as RGBA32F textures, and sample them in the vertex shader - the
+// clipmap only changes how many vertices ask for that sample and where.
 #pragma once
 
+#include "clipmap.hpp"
 #include "vk_context.hpp"
 #include "vk_math.hpp"
 
@@ -37,35 +35,41 @@ struct Globals {
     vkm::Mat4 inv_view_proj;
     float     cam_pos[4];
     float     sun_dir[4];
-    float     cascade_patch[4];  // x,y,z = patch_length of cascades 0,1,2;
-                                 // w = tiles per side of the outer mesh
-    float     params[4];         // x = time, y = mesh resolution, z,w unused
+    float     cascade_patch[4];  // x,y,z = patch_length of cascades 0,1,2; w = cascade grid resolution N
+    float     params[4];         // x = time, y,z,w unused
     float     shading[4];        // foam strength, exposure, fog density, unused
+};
+
+// Pushed once per ring draw. Matches the `RingPush` block in ocean.vert.
+struct RingPush {
+    float offset_x     = 0.0f;
+    float offset_z     = 0.0f;
+    float cell_size    = 1.0f;
+    float morph_start  = 0.6f;  // fraction of the ring's own half-extent where the geomorph blend begins
 };
 
 class OceanView {
 public:
-    // `levels` must have between 1 and kMaxCascades entries; `mesh_resolution`
-    // is quads per tile edge; `tiles` is the number of copies of cascade 0's
-    // (the largest scale's) patch per side of the outer mesh (odd, centred on
-    // the origin).
+    // `levels` must have between 1 and kMaxCascades entries. `layout`
+    // describes the clipmap: ring count and ring 0's (finest) cell size.
     bool init(VkContext& ctx, const std::vector<ocean::OceanDesc>& levels,
-              std::uint32_t mesh_resolution, std::uint32_t tiles);
+              const RingLayout& layout);
     void shutdown(VkContext& ctx);
 
-    // Copies every cascade level's buffers into this frame's textures and
-    // records the draw. `frame` selects which set of per-frame resources to
-    // use.
+    // Copies every cascade level's buffers into this frame's textures,
+    // re-places every clipmap ring around globals.cam_pos, and records the
+    // draw. `frame` selects which set of per-frame resources to use.
     void record(VkContext& ctx, VkCommandBuffer cmd, std::uint32_t image_index,
                 std::uint32_t frame, const ocean::CascadeStack& stack,
                 const Globals& globals);
 
     void set_wireframe(bool on) { wireframe_ = on; }
     [[nodiscard]] bool wireframe() const { return wireframe_; }
-    [[nodiscard]] std::uint32_t triangle_count() const
-    {
-        return mesh_resolution_ * mesh_resolution_ * 2u * tiles_ * tiles_;
-    }
+
+    // Exact triangle count for the CURRENT frame's draw (varies by at most a
+    // handful of triangles frame to frame as stitch bands are regenerated,
+    // though their triangle COUNT is fixed - only vertex positions change).
+    [[nodiscard]] std::uint32_t triangle_count() const { return triangle_count_; }
 
 private:
     bool create_mesh(VkContext& ctx);
@@ -75,22 +79,33 @@ private:
 
     std::size_t   level_count_      = 0;
     std::array<std::uint32_t, kMaxCascades> level_sizes_{};
-    std::uint32_t mesh_resolution_ = 0;
-    std::uint32_t tiles_           = 0;
-    std::uint32_t index_count_     = 0;
     bool          wireframe_       = false;
+    std::uint32_t triangle_count_  = 0;
 
-    VkBuffer       vertex_buffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory vertex_memory_ = VK_NULL_HANDLE;
-    VkBuffer       index_buffer_  = VK_NULL_HANDLE;
-    VkDeviceMemory index_memory_  = VK_NULL_HANDLE;
+    RingLayout ring_layout_{};
 
-    // One set of textures per frame in flight, per cascade level.
-    //
-    // A single set would race: we only wait on the fence for THIS frame index,
-    // so the other in-flight submission may still be sampling the textures
-    // while we overwrite them. Double-buffering is cheaper and simpler than
-    // the extra barriers a single set would need.
+    // Static (built once at init): the shared vertex buffer and the two
+    // index buffers every ring's main draw reuses (ADR-021).
+    VkBuffer       clip_vertex_buffer_   = VK_NULL_HANDLE;
+    VkDeviceMemory clip_vertex_memory_   = VK_NULL_HANDLE;
+    VkBuffer       clip_solid_indices_   = VK_NULL_HANDLE;
+    VkDeviceMemory clip_solid_memory_    = VK_NULL_HANDLE;
+    std::uint32_t  clip_solid_count_     = 0;
+    VkBuffer       clip_annulus_indices_ = VK_NULL_HANDLE;
+    VkDeviceMemory clip_annulus_memory_  = VK_NULL_HANDLE;
+    std::uint32_t  clip_annulus_count_   = 0;
+
+    // Static: the stitch band's topology never changes (ADR-021), only its
+    // vertex positions do, every frame.
+    VkBuffer       stitch_index_buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory stitch_index_memory_ = VK_NULL_HANDLE;
+    std::uint32_t  stitch_index_count_  = 0;
+
+    // Reused every frame: update() rewrites this in place, then its
+    // .vertices are memcpy'd into whichever frame-in-flight's mapped GPU
+    // buffer is currently safe to write - never reallocated after build().
+    StitchBand stitch_scratch_;
+
     struct LevelTextures {
         VkImage        displacement        = VK_NULL_HANDLE;
         VkDeviceMemory displacement_memory = VK_NULL_HANDLE;
@@ -104,9 +119,6 @@ private:
     struct FrameResources {
         std::array<LevelTextures, kMaxCascades> levels{};
 
-        // One staging buffer holding every level's displacement+normal data
-        // back to back, persistently mapped. Sized to the SUM of all levels'
-        // byte counts, since levels may have different resolutions.
         VkBuffer       staging        = VK_NULL_HANDLE;
         VkDeviceMemory staging_memory = VK_NULL_HANDLE;
         void*          staging_mapped = nullptr;
@@ -116,16 +128,15 @@ private:
         VkDeviceMemory  uniform_memory = VK_NULL_HANDLE;
         void*           uniform_mapped = nullptr;
         VkDescriptorSet descriptor     = VK_NULL_HANDLE;
+
+        // Host-visible, persistently mapped, sized once at init to fit
+        // StitchBand::vertices - rewritten every frame, never reallocated.
+        VkBuffer        stitch_vertex        = VK_NULL_HANDLE;
+        VkDeviceMemory  stitch_vertex_memory = VK_NULL_HANDLE;
+        void*           stitch_vertex_mapped = nullptr;
     };
     FrameResources frames_[kFramesInFlight]{};
 
-    // A single 1x1 texture pair (displacement all-zero, normal +Y unit)
-    // that unused cascade slots (when fewer than kMaxCascades levels are
-    // active) are bound to instead of aliasing level 0's real texture.
-    // Without this, an unused slot pointed at level 0 would double- or
-    // triple-count level 0's contribution in the shader's sum, rather
-    // than contributing nothing - a real bug caught before it ever ran,
-    // by tracing through what --cascades 1 would actually sample.
     VkImage        dummy_displacement_        = VK_NULL_HANDLE;
     VkDeviceMemory dummy_displacement_memory_  = VK_NULL_HANDLE;
     VkImageView    dummy_displacement_view_    = VK_NULL_HANDLE;
