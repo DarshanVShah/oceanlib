@@ -48,6 +48,8 @@ struct Globals {
                                  // metre of distance
     float     interaction[4];    // x,y = world low corner of the interaction
                                  // field; z = its extent; w = isolate flag
+    float     water[4];          // x = camera depth below the surface in
+                                 // metres, positive when submerged
 };
 
 class OceanView {

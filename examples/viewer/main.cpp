@@ -876,6 +876,17 @@ int main(int argc, char** argv)
                 : 2.0f * std::tan(0.5f * 1.05f) /
                       static_cast<float>(ctx.extent.height);
 
+        // How far the camera is below the water, using the COMBINED surface so
+        // that swimming under a wake counts. Queried once per frame, not per
+        // pixel - the shader only needs the depth, and the surface it is under
+        // is the same everywhere in the frame.
+        const float surf_y = water.height_at(input.camera.position.x,
+                                             input.camera.position.z);
+        globals.water[0] = surf_y - input.camera.position.y;
+        globals.water[1] = 0.0f;
+        globals.water[2] = 0.0f;
+        globals.water[3] = 0.0f;
+
         const ocean::InteractionBuffers ib = field.buffers();
         globals.interaction[0] = ib.origin_x;
         globals.interaction[1] = ib.origin_z;
@@ -894,8 +905,7 @@ int main(int argc, char** argv)
         if (++frame_counter % 15 == 0) {
             // Queried through WaterSurface, so the number in the title bar
             // includes the wake - the whole point of the combined query.
-            const float h = water.height_at(input.camera.position.x,
-                                            input.camera.position.z);
+            const float h = surf_y;
             char title[320];
             std::snprintf(title, sizeof(title),
                           "oceanlib  |  %.0f fps  |  sim %.2f ms (wake %.2f)  |  "

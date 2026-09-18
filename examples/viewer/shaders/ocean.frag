@@ -171,6 +171,40 @@ void main()
     vec3 foamColor = vec3(0.94, 0.96, 0.98) * (0.55 + 0.45 * max(dot(N, L), 0.0));
     color = mix(color, foamColor, foam);
 
+    // --- submerged view ---------------------------------------------------
+    //
+    // Seen from below, the water surface is not a reflector of sky, it is a
+    // refractor with a critical angle - so this is a different shading model
+    // rather than the same one with the normal flipped.
+    if (g.water.x > 0.0) {
+        vec3 Nb = (N.y > 0.0) ? -N : N;          // face the submerged viewer
+        vec3 I  = -V;                            // travelling toward the surface
+
+        // Refract from water into air. GLSL's refract() returns 0 on total
+        // internal reflection, which is exactly the Snell's-window boundary.
+        vec3 T = refract(I, Nb, 1.0 / kWaterIor);
+        vec3 above;
+        if (dot(T, T) < 1e-6) {
+            above = underwater_background(reflect(I, Nb), L);   // TIR: a mirror
+        } else {
+            above = sky_color(T, L);
+        }
+
+        // Fresnel for the water-to-air direction, which rises to 1 at the
+        // critical angle - the physical reason the window has a bright rim.
+        float c = max(dot(Nb, V), 0.0);
+        float Fw = 0.02 + 0.98 * pow(1.0 - c, 5.0);
+        vec3 uwColor = mix(above, underwater_background(reflect(I, Nb), L), Fw);
+
+        // Foam seen from below is still bright, but it is being viewed through
+        // water, so it is absorbed like everything else.
+        uwColor = mix(uwColor, foamColor, foam * 0.6);
+
+        float d = length(g.camPos.xyz - vWorld);
+        outColor = vec4(tonemap(absorb(uwColor, d), g.shading.y), 1.0);
+        return;
+    }
+
     // --- atmospheric fade -------------------------------------------------
     // Fades the ocean into the sky at distance, which both looks right and
     // hides the outer edge of the tiled patch.

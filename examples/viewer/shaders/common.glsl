@@ -32,6 +32,8 @@ layout(set = 0, binding = 0) uniform Globals {
     vec4 interaction;  // xy = world position of the field's low corner,
                        // z  = field extent in metres,
                        // w  = 1 to show the interaction field in isolation
+    vec4 water;        // x = camera depth below the surface, metres, positive
+                       // when submerged; yzw unused
 } g;
 
 // How much of a cascade survives at this distance, in [0,1].
@@ -236,6 +238,59 @@ vec3 sky_color(vec3 dir, vec3 sunDir)
 // Reinhard tone map followed by gamma. The scene is rendered in linear light
 // with an unbounded sun, so something has to bring it back into range; without
 // a tone map the specular highlight clips to a flat white disc.
+// ---------------------------------------------------------------------------
+// Underwater
+// ---------------------------------------------------------------------------
+
+// Beer-Lambert extinction of clear sea water, per metre, per channel.
+//
+// Red is absorbed roughly ten times faster than blue. This one fact is most of
+// why underwater footage looks the way it does: everything goes blue-green
+// with distance, and a red object is grey by a few metres down. Faking it with
+// a blue fog colour gets the hue but not the behaviour - real absorption
+// changes the RATIO between channels with distance, so contrast collapses
+// toward monochrome rather than toward a tint.
+const vec3 kExtinction = vec3(0.42, 0.075, 0.035);
+
+vec3 absorb(vec3 color, float pathMetres)
+{
+    return color * exp(-kExtinction * max(pathMetres, 0.0));
+}
+
+// Water refractive index, and the cosine of the critical angle measured from
+// vertical: asin(1/1.333) = 48.6 degrees, so cos = 0.6614.
+const float kWaterIor  = 1.333;
+const float kCosCrit   = 0.6614;
+
+// What a submerged viewer sees looking along `dir`.
+//
+// SNELL'S WINDOW is the striking part, and it is real rather than stylised:
+// from below, the entire 180-degree sky is refracted into a cone of about 97
+// degrees directly overhead. Look up inside that cone and you see the world
+// above, squashed toward the edge; look outside it and the surface is a
+// perfect mirror by total internal reflection, showing the water below.
+vec3 underwater_background(vec3 dir, vec3 sunDir)
+{
+    vec3 deepColor = vec3(0.018, 0.075, 0.105);
+
+    if (dir.y > kCosCrit) {
+        // Inside the window. Refract back out to air: Snell gives
+        // sin(air) = n * sin(water), and the angle is measured from vertical.
+        float sinW = sqrt(max(0.0, 1.0 - dir.y * dir.y));
+        float sinA = clamp(kWaterIor * sinW, 0.0, 1.0);
+        float cosA = sqrt(max(0.0, 1.0 - sinA * sinA));
+        vec3  horiz = vec3(dir.x, 0.0, dir.z);
+        float hlen = length(horiz);
+        horiz = (hlen > 1e-5) ? horiz / hlen : vec3(1.0, 0.0, 0.0);
+        return sky_color(horiz * sinA + vec3(0.0, cosA, 0.0), sunDir);
+    }
+
+    // Outside the window: total internal reflection, so the surface mirrors
+    // the water. Darkening downward is the light falling off with depth.
+    float down = clamp(-dir.y * 0.5 + 0.5, 0.0, 1.0);
+    return deepColor * mix(0.35, 1.0, down);
+}
+
 vec3 tonemap(vec3 linear, float exposure)
 {
     vec3 c = linear * exposure;
