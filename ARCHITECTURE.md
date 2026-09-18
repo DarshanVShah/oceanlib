@@ -1923,3 +1923,167 @@ portable equivalent, so the four kernels would stop agreeing bit for bit and
 the ADR-013 contract would quietly break. An explicit compare-and-zero is
 portable, deterministic, identical on every path, and covered by the same
 bit-exactness test as everything else.
+
+---
+
+## ADR-022 - Persistent foam, and four rendering changes that earn their cost
+
+Four pieces, ordered by impact per unit of effort. Three are viewer-only; the
+first is a library feature, because foam that persists is simulation state
+rather than a shading trick.
+
+### 1. Foam that persists and drifts (library)
+
+The FFT surface already reported foam, but only as an instantaneous Jacobian
+threshold: it appeared the moment a crest folded and vanished the moment it
+unfolded, pinned to the wave rather than to the water. Real foam is a passive
+tracer - created by breaking, carried by the surface current, dissolved over
+seconds.
+
+`FoamField` adds semi-Lagrangian advection by the horizontal orbital velocity
+plus exponential decay, using the FFT's own Jacobian foam as the source so the
+two agree about *where* foam is born and only persistence and drift are new.
+It is a separate object for exactly ADR-021's reason: `Ocean::update()` is a
+pure function of `(seed, desc, time)` and advected foam is history-dependent
+state that cannot be. It refuses an ocean without `compute_velocity` rather
+than silently degrading - without velocity there is nothing to advect with.
+
+Semi-Lagrangian is unconditionally stable, so there is no CFL limit anywhere in
+the class; the price is numerical diffusion, which for foam reads as a patch
+softening at its edges and is, if anything, welcome.
+
+**Each behaviour is verified in isolation, by switching the other off.**
+Decay: predicted `exp(-decay*t) = 0.084882` against measured `0.084883`, a
+0.000% error. Advection: a drift of exactly one cell per step makes the
+bilinear weights exactly 1 and 0, so advection becomes a pure relabelling and
+the result must be **bit-identical** to the field shifted by hand - 16384 cells
+compared, 0 differing, and a full lap around the periodic patch returns it
+exactly. Testing the two together would only have shown that something changed,
+which is the weakest possible claim.
+
+Ping-pong buffers are load-bearing for determinism, not just tidiness:
+advecting in place would let one row read what another had already overwritten,
+and *which* rows depended on how the scheduler split them.
+
+`foam_at()` inverts the choppy displacement like `Ocean::sample_at` does. Worst
+error 0.0007 against 0.9994 for a naive lookup - essentially foam versus no
+foam, because foam lives exactly where the displacement is largest.
+
+### 2. A real sky (Preetham)
+
+Most of what you see looking at an ocean is reflected sky, so the reflection is
+only ever as good as the thing reflected. A two-colour gradient gives flat
+water no matter what the simulation does.
+
+Preetham, Shirley & Smits 1999: Perez's five-parameter distribution fitted to a
+spectral atmospheric simulation, driven by one turbidity number. Chosen over
+Hosek-Wilkie, which is better near sunset but needs a large coefficient table
+baked into the binary - ADR-001's zero-dependency rule makes a compact closed
+form worth more than the last few per cent here.
+
+**The bug worth recording is that the model was right and the tonemapper was
+eating it.** Per-channel Reinhard compresses a bright channel harder than a dim
+one, so it desaturates everything bright toward grey. Measured: the model
+produced a zenith of linear `(0.139, 0.236, 0.471)` - blue at 3.4x red, a
+proper sky - and the tonemapper delivered `(104, 126, 158)`, nearly neutral. A
+sunset rendered grey-blue not because Preetham failed to produce warmth but
+because the last line of the shader clipped it away. Tonemapping *luminance*
+and carrying chroma through unchanged fixes it, fading back toward per-channel
+as luminance climbs so that genuinely intense sources still read as white - a
+photograph of the sun is a white disc, not a saturated orange one.
+
+This was diagnosed by porting the shader to Python and evaluating it
+numerically, which is what separated "the model is wrong" from "the model is
+right and something downstream is destroying it". Guessing from pixels had
+already produced two wrong conclusions.
+
+The water's subsurface colour is now tinted by the sky sampled straight up,
+normalised against its own luminance so it changes hue without changing
+brightness. Light leaving the water is light that entered it; without this a
+warm sunset sat over cold cyan water and the image did not cohere.
+
+### 3. Distance-based detail fade
+
+A cascade whose texels project to less than a pixel cannot be resolved. What
+reaches the screen is not detail but aliasing, and the worst kind - it shimmers
+as the camera moves, because which sub-texel each pixel lands on changes every
+frame.
+
+Each cascade now fades once its texel drops below roughly a pixel. This is
+mip-mapping's argument applied to a whole frequency band: the cascades *are* a
+frequency decomposition, so dropping the top band is what a low-pass filter
+would do.
+
+**Measured, not eyeballed.** RMS discrete Laplacian, which isolates pure
+high-frequency content, over a band just below the horizon: 24.305 with the
+fade off, 9.086 with it on - **62.6% less high-frequency energy**. Over a
+near-field band, where detail must be preserved: 14.084 against 12.986, a 7.8%
+change, most of which is the normal-combination change below rather than the
+fade.
+
+The fade forced a genuine improvement. **A unit normal cannot be scaled** -
+multiplying it by 0.5 does not halve the bump, it produces a shorter vector
+that renormalises straight back - so fading a band out is impossible in that
+representation. Normals are now combined in *slope* space: converted, weighted,
+summed, converted back. Slopes scale. It is also closer to correct than the
+sum-and-renormalise ADR-020 settled for, since heights adding in world space
+means world-space slopes add - the same argument as ADR-021's normal
+composition.
+
+### 4. Underwater
+
+Two things carry it, and both are physics rather than a blue filter.
+
+**Beer-Lambert absorption, per channel.** Red is absorbed about ten times
+faster than blue. A blue fog colour gets the hue but not the behaviour: real
+absorption changes the *ratio* between channels with distance, so contrast
+collapses toward monochrome rather than toward a tint.
+
+**Snell's window.** From below, the entire 180-degree sky refracts into a cone
+about 97 degrees wide overhead; outside it the surface is a perfect mirror by
+total internal reflection. Across a wavy surface that boundary breaks into a
+bright/dark mosaic - every dark patch is a piece of surface steep enough to
+have passed the critical angle. It is a different shading model rather than the
+same one with the normal flipped, and the branch falls out of the physics:
+`refract()` from water into air returns zero exactly at total internal
+reflection, which *is* the window boundary, so there is no tuned threshold.
+Fresnel for the water-to-air direction rises to 1 at the critical angle, which
+is the physical reason the window has a bright rim.
+
+Depth is queried once per frame through `WaterSurface`, so swimming under a
+wake counts, not just the swell.
+
+### What was deliberately not built, and why
+
+**Caustics** need a surface to land on and this demo has no sea floor. Adding a
+floor is easy; projecting correct caustics onto it is real work, and a faked
+one would undercut the point of everything above it.
+
+**A shoreline is architectural, not effortful.** The FFT ocean assumes
+*horizontal homogeneity*: one spectrum, one depth, periodic over the patch.
+Shoaling is waves responding to a depth that varies with position, which that
+assumption forbids - it cannot be obtained from an FFT patch by tuning
+parameters. ADR-019 added finite depth, but *per patch*, which models a
+uniformly shallow sea rather than a beach. Real shoaling needs either a
+spatially varying spectrum blended between depth zones, or a separate
+shallow-water/Boussinesq solver near shore coupled to the FFT offshore.
+
+Breaking is further still. The linear model can *fold* - the Jacobian goes
+negative, which is exactly what drives foam - but it cannot *overturn*, because
+overturning is where linearisation stops being true. Anything that looks like a
+breaking wave here is a fold being shaded as one.
+
+### A build bug that made shader edits do nothing
+
+The SPIR-V rule listed only each shader's own source in `DEPENDS`, not the
+`common.glsl` every shader `#include`s and `glslc` resolves itself. Editing the
+shared include produced "ninja: no work to do" and the old SPIR-V kept running,
+so a shader change appeared to have no effect - and the first round of sky
+tuning was silently discarded because of it. Every `.glsl` in the directory is
+now a dependency of every shader.
+
+Related trap, from adding uniforms for the detail fade: a `std140` block is
+matched by **offset, not by name**. A field inserted at a different position in
+the C++ struct than in the GLSL block silently shifts everything after it and
+the shader reads the wrong `vec4`, with no validation error, because every
+binding is still legitimately bound.

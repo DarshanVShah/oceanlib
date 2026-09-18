@@ -53,11 +53,14 @@ height/normal/foam queries against what's actually drawn, multi-scale
 cascades (several patches at different scales summed into one sea state),
 optional 3-D orbital velocity, **local interaction** (objects disturb the
 water, the disturbance propagates, reflects off hulls and is visible to
-queries), and a reference Vulkan viewer to see it in.
+queries), **persistent foam** that drifts with the surface current instead of
+blinking on and off with the Jacobian, and a reference Vulkan viewer with a
+Preetham sky, distance-based detail fade and an underwater camera.
 
 **Doesn't do:** GPU compute (the FFT is CPU-only, by design - see promise
-#1), foam *advection* (foam is a per-frame Jacobian threshold, not simulated
-particles that persist and drift), buoyancy or rigid-body solving (you get
+#1), shoaling or breaking waves near a shoreline (the FFT assumes horizontal
+homogeneity - one spectrum, one depth, periodic - which a beach violates by
+definition; see ADR-022), caustics, buoyancy or rigid-body solving (you get
 `height_at`/`sample_at`; physics integration is yours), rendering (the
 viewer is a reference integration, not an engine), or non-power-of-two grid
 sizes (the FFT is radix-2). Shallow water gets the correct dispersion
@@ -183,6 +186,15 @@ Flags: `--size N --mesh M --tiles T --wind U --chop C --foam F --wireframe
 --impulse S --impulse-radius R --cam-x/y/z V --cam-yaw/--cam-pitch V`.
 
 ![splash](docs/v3-splash.png)
+
+![sunset](docs/sky-sunset.png)
+
+![underwater](docs/underwater.png)
+
+Top to bottom: a rock dropped into a wind sea; the Preetham sky at low sun;
+and the view from below, where the bright/dark mosaic is Snell's window - the
+sky refracts into a 97-degree cone overhead and everything outside it is total
+internal reflection.
 
 A rock dropped into a wind sea: the ring is summed with the swell in both
 geometry and shading. `docs/v3-wake-only.png` is the same moment with `I`

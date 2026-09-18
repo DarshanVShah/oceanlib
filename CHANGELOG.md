@@ -36,6 +36,15 @@ reflects, and gameplay queries see it. See ARCHITECTURE.md ADR-021.
   captures: `--splash`, `--isolate`, `--impulse`, `--impulse-radius`,
   `--interaction`, `--cam-x/y/z`, `--cam-yaw`, `--cam-pitch`.
 - **`bench/ocean_bench_interaction`** and a new BENCHMARKS.md section.
+- **Persistent, advected foam** (`ocean/foam.hpp`). Semi-Lagrangian advection
+  by the orbital velocity plus exponential decay, sourced from the FFT's own
+  Jacobian foam. A separate object for the same reason `InteractionField` is.
+- **Viewer rendering** (ADR-022): Preetham analytic sky with sun position and
+  turbidity controls, luminance-preserving tonemapping, distance-based cascade
+  detail fade (62.6% less high-frequency energy at the horizon), slope-space
+  normal combination, and an underwater camera with Beer-Lambert absorption and
+  Snell's window.
+
 
 ### Changed
 
@@ -69,6 +78,11 @@ reflects, and gameplay queries see it. See ARCHITECTURE.md ADR-021.
   caller could set it and silently get no velocity.
 
 ### Known limitations
+
+- No shoaling, breaking or shoreline. The FFT assumes horizontal homogeneity,
+  which a beach violates by definition - see ADR-022 for why this is
+  architectural rather than a matter of effort.
+- No caustics: there is no sea floor for them to land on.
 
 - The interaction field contributes VERTICAL velocity only. Horizontal orbital
   velocity would need the Riesz transform of `dEta/dt` - two more convolutions
