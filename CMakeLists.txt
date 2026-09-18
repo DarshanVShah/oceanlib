@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(oceanlib VERSION 0.1.0 LANGUAGES CXX C)
+project(oceanlib VERSION 1.0.0 LANGUAGES CXX C)
 
 option(OCEAN_BUILD_TESTS    "Build oceanlib tests"      ON)
 option(OCEAN_BUILD_BENCH    "Build oceanlib benchmarks" ON)

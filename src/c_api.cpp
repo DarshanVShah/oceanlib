@@ -243,8 +243,8 @@ const char* ocean_force_simd_level(const char* name)
 
 void ocean_version(uint32_t* major, uint32_t* minor, uint32_t* patch)
 {
-    if (major != nullptr) *major = 0;
-    if (minor != nullptr) *minor = 1;
+    if (major != nullptr) *major = 1;
+    if (minor != nullptr) *minor = 0;
     if (patch != nullptr) *patch = 0;
 }
 

@@ -401,8 +401,9 @@ TEST_CASE("status strings and version are reported")
 
     std::uint32_t major = 99, minor = 99, patch = 99;
     ocean_version(&major, &minor, &patch);
-    CHECK(major == 0);
-    CHECK(minor == 1);
+    CHECK(major == 1);
+    CHECK(minor == 0);
+    CHECK(patch == 0);
 }
 
 TEST_CASE("forcing the SIMD level is reflected by ocean_simd_level")
