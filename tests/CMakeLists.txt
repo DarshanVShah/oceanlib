@@ -20,6 +20,7 @@ add_executable(ocean_tests
   test_simd.cpp
   test_trig.cpp
   test_iwave_kernel.cpp
+  test_interaction.cpp
   test_cascade.cpp
   test_c_api.cpp
   c_header_check.c
