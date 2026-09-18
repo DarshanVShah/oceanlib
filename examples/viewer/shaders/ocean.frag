@@ -2,6 +2,13 @@
 
 #include "common.glsl"
 
+// Displacement textures, for their ALPHA channel only: that is where foam
+// lives, and it has to be read per pixel rather than interpolated from the
+// vertex shader.
+layout(set = 0, binding = 1) uniform sampler2D uDisplacement0;
+layout(set = 0, binding = 3) uniform sampler2D uDisplacement1;
+layout(set = 0, binding = 5) uniform sampler2D uDisplacement2;
+
 layout(set = 0, binding = 2) uniform sampler2D uNormal0;
 layout(set = 0, binding = 4) uniform sampler2D uNormal1;
 layout(set = 0, binding = 6) uniform sampler2D uNormal2;
@@ -106,11 +113,33 @@ void main()
     vec3 color = mix(refraction, reflection, F) + spec;
 
     // --- foam -------------------------------------------------------------
-    // vFoam already combines every cascade's own Jacobian-based foam via the
-    // same screen blend used by CascadeStack::sample_at - computed once per
-    // vertex in ocean.vert rather than reloading all 3 textures here.
-    float foam = clamp(vFoam * g.shading.x, 0.0, 1.0);
-    vec3  foamColor = vec3(0.86, 0.91, 0.95) * (0.45 + 0.55 * max(dot(N, L), 0.0));
+    //
+    // Sampled PER PIXEL, not taken from the interpolated vFoam the vertex
+    // shader computes. The mesh is about 3 m per quad while foam structure is
+    // metres or less across, so interpolating a per-vertex sample smears sharp
+    // whitewater into broad pale washes - the water goes milky instead of
+    // getting foam on it. Exactly the same mistake, and the same fix, as the
+    // interaction field's normals above.
+    //
+    // The screen blend 1 - product(1 - f_i) is the same one
+    // CascadeStack::sample_at uses on the CPU, so a physics query and a pixel
+    // agree about how much foam is at a point.
+    float f0 = texture(uDisplacement0, vUV0).w;
+    float f1 = texture(uDisplacement1, vUV1).w;
+    float f2 = texture(uDisplacement2, vUV2).w;
+    float coverage = 1.0 - (1.0 - f0) * (1.0 - f1) * (1.0 - f2);
+
+    // A gentle contrast curve. Advected foam has a long thin tail as it decays,
+    // and mapping that tail linearly to opacity turns half the ocean hazy;
+    // pushing the low end down keeps the faint remnants as texture and lets
+    // fresh whitewater read as actually white.
+    float foam = clamp(coverage * g.shading.x, 0.0, 1.0);
+    foam = foam * foam * (3.0 - 2.0 * foam);
+
+    // Foam is a diffuse, near-Lambertian scatterer - it has no specular
+    // highlight of its own, which is why it reads as matte against the water
+    // it sits on.
+    vec3 foamColor = vec3(0.94, 0.96, 0.98) * (0.55 + 0.45 * max(dot(N, L), 0.0));
     color = mix(color, foamColor, foam);
 
     // --- atmospheric fade -------------------------------------------------

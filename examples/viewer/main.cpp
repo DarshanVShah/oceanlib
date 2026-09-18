@@ -12,6 +12,10 @@
 //   --interaction N   interaction field resolution, power of two (default 256)
 //   --cam-x/y/z V     camera position; --cam-yaw/--cam-pitch V its heading
 //   --isolate         start with the interaction field shown on its own
+//   --no-foam-advect  fall back to the instantaneous Jacobian foam
+//   --foam-decay R    foam decay rate, 1/s (default 0.30, half-life 2.3 s)
+//   --foam-gain G     how fast breaking injects foam, 1/s (default 4)
+//   --foam-advect S   multiplier on the advecting current (default 1)
 //   --splash N        drop a scripted rock at the focus point on frame N, so
 //                     --screenshot can capture ripples without a mouse. The
 //                     position and frame are fixed, and --screenshot already
@@ -40,6 +44,7 @@
 #include "vk_math.hpp"
 
 #include "ocean/cascade.hpp"
+#include "ocean/foam.hpp"
 #include "ocean/interaction.hpp"
 #include "ocean/ocean.h"    // for ocean_simd_level(); the viewer
                             // deliberately uses only public headers
@@ -62,7 +67,11 @@ struct Options {
     float         wind   = 12.0f;
     float         depth  = 0.0f;   // <= 0 = deep water
     float         chop   = 1.0f;
-    float         foam   = 0.6f;
+    // 0.6 produced literally zero foam at ordinary choppiness - the Jacobian
+    // simply never falls that far - which meant the foam path was dead code in
+    // the demo. Measured: at threshold 0.6 coverage is 0.0000; at 0.85 it is a
+    // few per cent, concentrated on breaking crests, which is what foam is.
+    float         foam   = 0.85f;
     bool          wireframe = false;
     std::string   screenshot;
     std::string   simd;           // "" = native max; else scalar|sse2|avx2|neon
@@ -76,6 +85,15 @@ struct Options {
     float         cam_yaw = -1.6f, cam_pitch = -0.18f;
     bool          cam_set = false;
     float         impulse = 0.45f, impulse_radius = 0.55f;
+    bool          no_foam_advect = false;
+    // Steady-state coverage under a sustained source is source_gain/decay, so
+    // this ratio is the knob that decides whether foam reads as whitecaps or
+    // as milk. 4/0.3 = 13x saturated the entire ocean; 1.5/0.4 = 3.75x lets a
+    // genuinely breaking crest reach white while a briefly-folding one stays
+    // faint.
+    float         foam_decay  = 0.40f;
+    float         foam_gain   = 1.50f;
+    float         foam_advect = 1.0f;
     int           frames = 90;
     bool          validation = true;
 };
@@ -104,6 +122,10 @@ Options parse_args(int argc, char** argv)
         else if (a == "--isolate")    o.isolate = true;
         else if (a == "--impulse")        o.impulse = std::strtof(next(), nullptr);
         else if (a == "--impulse-radius") o.impulse_radius = std::strtof(next(), nullptr);
+        else if (a == "--no-foam-advect") o.no_foam_advect = true;
+        else if (a == "--foam-decay")  o.foam_decay  = std::strtof(next(), nullptr);
+        else if (a == "--foam-gain")   o.foam_gain   = std::strtof(next(), nullptr);
+        else if (a == "--foam-advect") o.foam_advect = std::strtof(next(), nullptr);
         else if (a == "--cam-x")     { o.cam_x = std::strtof(next(), nullptr); o.cam_set = true; }
         else if (a == "--cam-y")     { o.cam_y = std::strtof(next(), nullptr); o.cam_set = true; }
         else if (a == "--cam-z")     { o.cam_z = std::strtof(next(), nullptr); o.cam_set = true; }
@@ -525,6 +547,9 @@ int main(int argc, char** argv)
         d.spectrum.small_wave_cutoff = kSpecs[i].cutoff;
         d.foam_threshold          = opt.foam;
         d.thread_count            = opt.threads;
+        // Persistent foam advects with the surface current, so the cascades
+        // have to produce one. This is what the extra transforms buy.
+        d.compute_velocity        = !opt.no_foam_advect;
         levels.push_back(d);
     }
 
@@ -542,6 +567,31 @@ int main(int argc, char** argv)
     idesc.thread_count = opt.threads;
     ocean::InteractionField field{idesc};
     ocean::WaterSurface water{stack, field};
+
+    // One foam field per cascade, because foam is born from each scale's own
+    // Jacobian and rides that scale's own current. The shader already combines
+    // the levels with a screen blend, so nothing downstream changes.
+    std::vector<ocean::FoamField> foam_fields;
+    std::vector<const ocean::FoamField*> foam_ptrs;
+    if (!opt.no_foam_advect) {
+        ocean::FoamDesc fdesc;
+        fdesc.decay        = opt.foam_decay;
+        fdesc.source_gain  = opt.foam_gain;
+        fdesc.advect_scale = opt.foam_advect;
+        fdesc.thread_count = opt.threads;
+        foam_fields.reserve(levels.size());
+        for (std::size_t i = 0; i < levels.size(); ++i) {
+            foam_fields.emplace_back(stack.level(i), fdesc);
+        }
+        for (auto& f : foam_fields) foam_ptrs.push_back(&f);
+        std::printf("foam: persistent and advected, decay %.2f /s "
+                    "(half-life %.1f s), gain %.1f /s, advect scale %.2f\n",
+                    opt.foam_decay, 0.6931 / opt.foam_decay, opt.foam_gain,
+                    opt.foam_advect);
+    } else {
+        std::printf("foam: instantaneous Jacobian threshold only "
+                    "(--no-foam-advect)\n");
+    }
 
     std::printf("interaction: %ux%u over %.0f m (dx = %.3f m), kernel P=%u, "
                 "dt = %.4f s (limit %.4f s), dispersion error %.1f%%\n",
@@ -731,6 +781,16 @@ int main(int argc, char** argv)
             }
         }
 
+        // Foam reads the ocean state, so it is stepped AFTER the stack has
+        // advanced and never before.
+        const auto foam_start = std::chrono::steady_clock::now();
+        for (auto& f : foam_fields) {
+            f.update(input.paused ? 0.0f : static_cast<float>(dt));
+        }
+        const double foam_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - foam_start).count();
+
         const auto inter_start = std::chrono::steady_clock::now();
         field.update(input.paused ? 0.0f : static_cast<float>(dt));
         const double inter_ms =
@@ -785,11 +845,13 @@ int main(int argc, char** argv)
         globals.interaction[2] = ib.extent;
         globals.interaction[3] = input.isolate ? 1.0f : 0.0f;
 
-        view.record(ctx, cmd, image_index, ctx.frame_index, stack, field, globals);
+        view.record(ctx, cmd, image_index, ctx.frame_index, stack, field,
+                    foam_ptrs, globals);
         ctx.end_frame(image_index);
 
         // --- HUD ----------------------------------------------------------
-        ocean_ms_avg = ocean_ms_avg * 0.95 + (ocean_ms + inter_ms) * 0.05;
+        ocean_ms_avg =
+            ocean_ms_avg * 0.95 + (ocean_ms + inter_ms + foam_ms) * 0.05;
         inter_ms_avg = inter_ms_avg * 0.95 + inter_ms * 0.05;
         fps_avg = fps_avg * 0.95 + (dt > 0.0 ? 1.0 / dt : 0.0) * 0.05;
         if (++frame_counter % 15 == 0) {
@@ -811,6 +873,18 @@ int main(int argc, char** argv)
         }
 
         if (!opt.screenshot.empty() && frame_counter >= opt.frames) {
+            for (std::size_t i = 0; i < foam_fields.size(); ++i) {
+                const ocean::Buffers lb = stack.buffers(i);
+                double instant = 0.0;
+                const std::size_t cells =
+                    static_cast<std::size_t>(lb.size) * lb.size;
+                for (std::size_t c = 0; c < cells; ++c) {
+                    instant += lb.displacement[4 * c + 3];
+                }
+                std::printf("  cascade %zu foam coverage: instantaneous %.4f, "
+                            "persistent %.4f\n", i, instant / cells,
+                            foam_fields[i].coverage());
+            }
             if (capture_frame(ctx, last_image, opt.screenshot.c_str())) {
                 std::printf("wrote %s (%ux%u)\n", opt.screenshot.c_str(),
                             ctx.extent.width, ctx.extent.height);

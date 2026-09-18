@@ -68,6 +68,11 @@ const OceanDesc& CascadeStack::desc(std::size_t level) const noexcept
 {
     return impl_->levels[level].desc();
 }
+const Ocean& CascadeStack::level(std::size_t level) const noexcept
+{
+    return impl_->levels[level];
+}
+
 
 float CascadeStack::height_at(float world_x, float world_z) const noexcept
 {

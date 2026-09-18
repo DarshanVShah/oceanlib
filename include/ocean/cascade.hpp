@@ -69,6 +69,15 @@ public:
     [[nodiscard]] Buffers buffers(std::size_t level) const noexcept;
     [[nodiscard]] const OceanDesc& desc(std::size_t level) const noexcept;
 
+    // The Ocean backing one level.
+    //
+    // Exposed so that per-level facilities which attach to an Ocean - FoamField
+    // is the one that motivated this - can be used with a cascade. It hands
+    // out a reference to an object the stack owns, so it stays valid for the
+    // stack's lifetime and must not outlive it. Behaviour is undefined for
+    // `level >= level_count()`.
+    [[nodiscard]] const Ocean& level(std::size_t level) const noexcept;
+
     // Combined physics query, summed across every level at the same world
     // position. Height and horizontal offset are exact (see ADR-020); normal
     // and foam are blended from each level's own already-normalised output.

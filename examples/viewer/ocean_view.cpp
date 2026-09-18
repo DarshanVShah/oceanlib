@@ -316,7 +316,11 @@ bool OceanView::create_descriptors(VkContext& ctx)
         bindings[disp_binding].descriptorCount = 1;
         // Sampled in the VERTEX stage - this is the vertex texture fetch that
         // makes GPU-side displacement possible.
-        bindings[disp_binding].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        // VERTEX for the displacement itself, FRAGMENT because foam lives in
+        // that texture's alpha and has to be sampled per pixel - see the note
+        // in ocean.frag.
+        bindings[disp_binding].stageFlags =
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
         bindings[norm_binding].binding         = norm_binding;
         bindings[norm_binding].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -570,6 +574,7 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
                        std::uint32_t image_index, std::uint32_t frame,
                        const ocean::CascadeStack& stack,
                        const ocean::InteractionField& field,
+                       const std::vector<const ocean::FoamField*>& foam,
                        const Globals& globals)
 {
     FrameResources& f = frames_[frame];
@@ -587,6 +592,25 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
         auto* dst = static_cast<std::uint8_t*>(f.staging_mapped) + f.staging_offset[i];
         std::memcpy(dst, b.displacement, static_cast<std::size_t>(bytes));
         std::memcpy(dst + bytes, b.normal, static_cast<std::size_t>(bytes));
+
+        // Overwrite the displacement texture's ALPHA channel with the
+        // persistent foam.
+        //
+        // displacement.w already carries the FFT's instantaneous Jacobian
+        // foam, and every shader that reads foam reads it from there. Swapping
+        // the value in the staging copy therefore upgrades the whole pipeline
+        // to advected, persistent foam without a new texture, a new binding or
+        // a single line of shader change - and it cannot desynchronise, since
+        // both come from the same cascade level at the same instant.
+        //
+        // The library's own buffer is untouched; this writes into the staging
+        // copy the GPU is about to receive.
+        if (i < foam.size() && foam[i] != nullptr) {
+            const float* src = foam[i]->data();
+            auto* texels = reinterpret_cast<float*>(dst);
+            const std::size_t cells = static_cast<std::size_t>(b.size) * b.size;
+            for (std::size_t c = 0; c < cells; ++c) texels[4 * c + 3] = src[c];
+        }
     }
 
     // One more memcpy for the interaction field - same story as the cascades,

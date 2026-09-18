@@ -38,6 +38,7 @@ add_library(ocean STATIC
   src/ocean.cpp
   src/cascade.cpp
   src/interaction.cpp
+  src/foam.cpp
   src/c_api.cpp
 )
 add_library(ocean::ocean ALIAS ocean)

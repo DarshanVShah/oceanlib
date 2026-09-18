@@ -16,6 +16,7 @@
 #include "vk_math.hpp"
 
 #include "ocean/cascade.hpp"
+#include "ocean/foam.hpp"
 #include "ocean/interaction.hpp"
 #include "ocean/ocean.hpp"
 
@@ -62,7 +63,9 @@ public:
     // use.
     void record(VkContext& ctx, VkCommandBuffer cmd, std::uint32_t image_index,
                 std::uint32_t frame, const ocean::CascadeStack& stack,
-                const ocean::InteractionField& field, const Globals& globals);
+                const ocean::InteractionField& field,
+                const std::vector<const ocean::FoamField*>& foam,
+                const Globals& globals);
 
     void set_wireframe(bool on) { wireframe_ = on; }
     [[nodiscard]] bool wireframe() const { return wireframe_; }

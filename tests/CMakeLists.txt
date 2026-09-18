@@ -23,6 +23,7 @@ add_executable(ocean_tests
   test_interaction.cpp
   test_velocity.cpp
   test_c_interaction.cpp
+  test_foam.cpp
   test_cascade.cpp
   test_c_api.cpp
   c_header_check.c
