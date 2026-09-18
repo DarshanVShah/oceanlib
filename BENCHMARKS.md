@@ -477,3 +477,32 @@ legal sizes, so the crossover can only be located to (16384, 65536]; the
 threshold is set to 32768 between them, which brings 128² back to parity
 (0.96x). The principle is ADR-012's and is the defensible part: threading must
 never make things worse.
+
+### Orbital velocity
+
+Measured 2026-09-18, i7-14700HX, AVX2, threaded. `OceanDesc::compute_velocity`
+is off by default; an integration that does not ask for it pays nothing.
+
+| N     | ocean (ms) | with velocity (ms) | ratio |
+|------:|-----------:|-------------------:|------:|
+| 128²  |      0.390 |              0.436 | 1.12x |
+| 256²  |      0.554 |              0.664 | 1.20x |
+| 512²  |      1.351 |              2.000 | 1.48x |
+
+Three extra real spectra pack into two more complex fields, so the frame runs
+**six** inverse transforms instead of four. 6/4 = 1.5x on the FFT stage alone,
+which is what 512² converges to as the transforms come to dominate; at smaller
+sizes the fixed costs dilute it.
+
+The velocity spectra are computed in a **second pass** over the same rows
+rather than as an extension of `evolve_rows`. That costs a second argument
+reduction and `sincos` pair per cell, and it means the velocity half is
+currently scalar while the base half stays AVX2 - but it leaves the existing
+evolve kernel completely untouched, so switching velocity on cannot perturb a
+single bit of the surface an existing integration already renders. A test
+asserts exactly that with `memcmp` across four times.
+
+Fusing the two passes and writing the AVX2 velocity kernel is the obvious
+optimisation. It is deliberately not done yet: the standing practice here is to
+measure before optimising, and nothing has yet shown a real scene limited by
+this.

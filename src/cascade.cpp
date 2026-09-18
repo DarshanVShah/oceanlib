@@ -104,6 +104,12 @@ Surface CascadeStack::sample_at(float world_x, float world_z) const noexcept
     // simultaneous fold events compound toward but never exceed full coverage.
     float foam_transparency = 1.0f;
 
+    // Orbital velocity sums EXACTLY, for the same reason height does: each
+    // level's velocity field is an independent real vector field over world
+    // position, and the composite flow is the superposition of the individual
+    // wave trains. No renormalising, no blending - unlike the normal below.
+    float vx = 0.0f, vy = 0.0f, vz = 0.0f;
+
     for (const Ocean& o : impl_->levels) {
         const Surface s = o.sample_at(world_x, world_z);
         height   += s.height;
@@ -112,6 +118,9 @@ Surface CascadeStack::sample_at(float world_x, float world_z) const noexcept
         normal_x += s.normal_x;
         normal_y += s.normal_y;
         normal_z += s.normal_z;
+        vx += s.velocity_x;
+        vy += s.velocity_y;
+        vz += s.velocity_z;
         foam_transparency *= (1.0f - s.foam);
     }
 
@@ -120,6 +129,9 @@ Surface CascadeStack::sample_at(float world_x, float world_z) const noexcept
     out.offset_x = offset_x;
     out.offset_z = offset_z;
     out.foam     = 1.0f - foam_transparency;
+    out.velocity_x = vx;
+    out.velocity_y = vy;
+    out.velocity_z = vz;
 
     const float len2 = normal_x * normal_x + normal_y * normal_y + normal_z * normal_z;
     if (len2 > 0.0f) {

@@ -93,6 +93,7 @@ struct Ocean::Impl {
     // Public outputs, GPU-texture-shaped: 4 floats per cell.
     detail::AlignedBuffer<float> displacement;
     detail::AlignedBuffer<float> normal;
+    detail::AlignedBuffer<float> velocity;   // empty unless compute_velocity
 
     [[nodiscard]] float* scratch_for(std::uint32_t task) noexcept
     {
@@ -108,7 +109,10 @@ struct Ocean::Impl {
           normal(cells * 4)
     {
         detail::build_spectrum(desc, spectrum);
-        fields.allocate(d.size);
+        fields.allocate(d.size, d.compute_velocity);
+        if (d.compute_velocity) {
+            velocity = detail::AlignedBuffer<float>(cells * 4);
+        }
 
         // Work out the decomposition first, so we can decide whether a pool
         // is worth creating at all.
@@ -176,6 +180,10 @@ struct Ocean::Impl {
         detail::chunk_range(i, m.task_count, m.desc.size, begin, end);
         if (begin < end) {
             detail::evolve_rows(m.spectrum, sc.t, m.fields, begin, end);
+            if (m.desc.compute_velocity) {
+                detail::evolve_velocity_rows(m.spectrum, sc.t, m.fields, begin,
+                                             end);
+            }
         }
     }
 
@@ -187,7 +195,9 @@ struct Ocean::Impl {
         Impl& m = *static_cast<StageCtx*>(ctx)->self;
         const std::uint32_t n = m.desc.size;
         std::uint32_t begin, end;
-        detail::chunk_range(i, m.task_count, 4u * n, begin, end);
+        const std::uint32_t nf =
+            static_cast<std::uint32_t>(m.fields.complex_fields);
+        detail::chunk_range(i, m.task_count, nf * n, begin, end);
         float* scratch = m.scratch_for(i);
         for (std::uint32_t idx = begin; idx < end; ++idx) {
             const int         f   = static_cast<int>(idx / n);
@@ -207,7 +217,9 @@ struct Ocean::Impl {
         const std::uint32_t n      = m.desc.size;
         const std::uint32_t groups = n / detail::kColumnBatch;
         std::uint32_t begin, end;
-        detail::chunk_range(i, m.task_count, 4u * groups, begin, end);
+        const std::uint32_t nf =
+            static_cast<std::uint32_t>(m.fields.complex_fields);
+        detail::chunk_range(i, m.task_count, nf * groups, begin, end);
         float* scratch = m.scratch_for(i);
         for (std::uint32_t idx = begin; idx < end; ++idx) {
             const int         f = static_cast<int>(idx / groups);
@@ -229,6 +241,10 @@ struct Ocean::Impl {
             detail::finalize_rows(m.fields, m.desc.choppiness,
                                   m.desc.foam_threshold, m.displacement.data(),
                                   m.normal.data(), begin, end);
+            if (m.desc.compute_velocity) {
+                detail::finalize_velocity_rows(m.fields, m.velocity.data(),
+                                               begin, end);
+            }
         }
     }
 
@@ -277,6 +293,7 @@ Buffers Ocean::buffers() const noexcept
     Buffers b;
     b.displacement = impl_->displacement.data();
     b.normal       = impl_->normal.data();
+    b.velocity     = impl_->velocity.empty() ? nullptr : impl_->velocity.data();
     b.size         = impl_->desc.size;
     b.patch_length = impl_->desc.patch_length;
     return b;
@@ -421,6 +438,16 @@ Surface Ocean::sample_at(float world_x, float world_z) const noexcept
     s.normal_x = nx;
     s.normal_y = ny;
     s.normal_z = nz;
+
+    if (!m.velocity.empty()) {
+        // Sampled at the SAME solved parameter position as everything else, so
+        // the velocity reported at a point belongs to the same piece of water
+        // as the height reported there.
+        const float* vel = m.velocity.data();
+        s.velocity_x = fetch(vel, t, 0);
+        s.velocity_y = fetch(vel, t, 1);
+        s.velocity_z = fetch(vel, t, 2);
+    }
     return s;
 }
 

@@ -222,6 +222,28 @@ int main(int argc, char** argv)
         std::printf("%6u %14.3f %16.3f\n", n, ot.median_ms, it.median_ms);
     }
 
+    // --- the cost of orbital velocity --------------------------------------
+    std::printf("\nOrbital velocity: six inverse transforms instead of four,\n"
+                "plus a second argument reduction and sincos per cell\n");
+    std::printf("%6s %14s %16s %10s\n", "N", "ocean ms", "with velocity", "ratio");
+    for (std::uint32_t n : sizes) {
+        ocean::OceanDesc od;
+        od.size         = n;
+        od.patch_length = 200.0f;
+        od.thread_count = threads;
+
+        ocean::OceanDesc ov = od;
+        ov.compute_velocity = true;
+
+        ocean::Ocean plain{od};
+        ocean::Ocean vel{ov};
+        const int iters = iterations_for(n);
+        const Timing a = measure([&](int i) { plain.update(100.0 + i * 0.0137); }, 20, iters);
+        const Timing b = measure([&](int i) { vel.update(100.0 + i * 0.0137); }, 20, iters);
+        std::printf("%6u %14.3f %16.3f %9.2fx\n", n, a.median_ms, b.median_ms,
+                    b.median_ms / a.median_ms);
+    }
+
     std::printf("\nOne update() at 60 fps runs exactly one substep, so the\n");
     std::printf("interaction column is also the per-frame cost at 60 fps.\n");
     return 0;

@@ -7,11 +7,18 @@
 
 namespace ocean::detail {
 
-void FieldSet::allocate(std::uint32_t size)
+void FieldSet::allocate(std::uint32_t size, bool with_velocity)
 {
     n     = size;
     cells = static_cast<std::size_t>(size) * size;
-    storage = AlignedBuffer<float>(8u * cells);
+    // Eight real planes normally; twelve with velocity, of which eleven carry
+    // data. The twelfth is the unused imaginary half of the field that holds
+    // u_z, and it is the price of packing an ODD number of real fields two to
+    // a complex transform. Filling it with a real-input transform trick would
+    // save half a transform out of six and cost a special case in the plan.
+    const unsigned planes = with_velocity ? 12u : 8u;
+    complex_fields = with_velocity ? 6 : 4;
+    storage = AlignedBuffer<float>(planes * cells);
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +116,88 @@ void evolve_rows_scalar(const SpectrumTables& tables, double time,
             p1_re[i] = dz_re  - hx_im;   p1_im[i] = dz_im  + hx_re;
             p2_re[i] = hz_re  - jxx_im;  p2_im[i] = hz_im  + jxx_re;
             p3_re[i] = jzz_re - jxz_im;  p3_im[i] = jzz_im + jxz_re;
+        }
+    }
+}
+
+void evolve_velocity_rows(const SpectrumTables& tables, double time,
+                          FieldSet& fields, std::uint32_t row_begin,
+                          std::uint32_t row_end) noexcept
+{
+    const std::uint32_t n = tables.n;
+    const double time_over_two_pi = time * kInvTwoPiD;
+
+    float* p4_re = fields.re(4); float* p4_im = fields.im(4);
+    float* p5_re = fields.re(5); float* p5_im = fields.im(5);
+
+    for (std::uint32_t y = row_begin; y < row_end; ++y) {
+        for (std::uint32_t x = 0; x < n; ++x) {
+            const std::size_t i = static_cast<std::size_t>(y) * n + x;
+
+            const float phase = reduced_phase(tables.omega[i], time_over_two_pi);
+            float s = 0.0f, c = 0.0f;
+            sincos_f32(phase, s, c);
+
+            const float a_re = tables.h0_re[i];
+            const float a_im = tables.h0_im[i];
+            const float b_re = tables.h0c_re[i];
+            const float b_im = tables.h0c_im[i];
+
+            const float fwd_re = a_re * c - a_im * s;
+            const float fwd_im = a_re * s + a_im * c;
+            const float bwd_re = b_re * c + b_im * s;
+            const float bwd_im = b_im * c - b_re * s;
+
+            // D = A - B, the DIFFERENCE of the two counter-propagating trains.
+            //
+            // The sum is the surface height; the difference is what the
+            // velocity potential sees, because the dynamic boundary condition
+            // dphi/dt = -g*h integrates with opposite sign on the two branches
+            // (they carry opposite signs of omega). Taking -i*omega*h instead -
+            // the obvious move - is wrong, and gives a non-Hermitian spectrum
+            // that transforms to an imaginary "velocity".
+            //
+            // D is anti-Hermitian, D(-k) = -conj(D(k)), which is precisely what
+            // makes all three products below Hermitian and hence real fields.
+            const float dr = fwd_re - bwd_re;
+            const float di = fwd_im - bwd_im;
+
+            const float w  = tables.omega[i];
+            const float kx = tables.kx[i];
+            const float kz = tables.kz[i];
+            const float ki = tables.k_inv[i];
+            const float sx = kx * ki;
+            const float sz = kz * ki;
+
+            // u_x = -omega*(kx/|k|)*D,  u_z likewise,  u_y = i*omega*D.
+            const float wsx = w * sx;
+            const float wsz = w * sz;
+            const float ux_re = -wsx * dr, ux_im = -wsx * di;
+            const float uz_re = -wsz * dr, uz_im = -wsz * di;
+            const float uy_re = -w * di,   uy_im =  w * dr;
+
+            // Pack A + i*B exactly as evolve_rows_scalar does.
+            p4_re[i] = ux_re - uy_im;  p4_im[i] = ux_im + uy_re;
+            p5_re[i] = uz_re;          p5_im[i] = uz_im;
+        }
+    }
+}
+
+void finalize_velocity_rows(const FieldSet& fields, float* velocity,
+                            std::uint32_t row_begin,
+                            std::uint32_t row_end) noexcept
+{
+    const std::uint32_t n = fields.n;
+    const float* f4_re = fields.re(4); const float* f4_im = fields.im(4);
+    const float* f5_re = fields.re(5);
+
+    for (std::uint32_t y = row_begin; y < row_end; ++y) {
+        for (std::uint32_t x = 0; x < n; ++x) {
+            const std::size_t i = static_cast<std::size_t>(y) * n + x;
+            velocity[4 * i + 0] = f4_re[i];   // u_x
+            velocity[4 * i + 1] = f4_im[i];   // u_y
+            velocity[4 * i + 2] = f5_re[i];   // u_z
+            velocity[4 * i + 3] = 0.0f;       // reserved
         }
     }
 }

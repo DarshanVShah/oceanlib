@@ -37,7 +37,10 @@ struct FieldSet {
     // 64-byte aligned because cells is a multiple of 16 for every legal N.
     AlignedBuffer<float> storage;
 
-    void allocate(std::uint32_t size);
+    // Number of COMPLEX fields: 4 normally, 6 when orbital velocity is on.
+    int complex_fields = 4;
+
+    void allocate(std::uint32_t size, bool with_velocity = false);
 
     [[nodiscard]] float* re(int f) noexcept
     {
@@ -76,6 +79,29 @@ void evolve_rows_avx2(const SpectrumTables& tables, double time,
                       FieldSet& fields, std::uint32_t row_begin,
                       std::uint32_t row_end) noexcept;
 #endif
+
+// Write the two extra velocity spectra into fields 4 and 5, for rows
+// [row_begin, row_end).
+//
+// A SECOND PASS over the same rows, rather than an extension of evolve_rows.
+// It costs a second argument reduction and sincos pair per cell, which is not
+// free - but it leaves the existing AVX2 evolve kernel completely untouched,
+// so enabling velocity cannot perturb a single bit of the surface an existing
+// integration already renders. Fusing the two and writing the AVX2 velocity
+// kernel is the obvious optimisation, and it is worth doing only once
+// profiling shows a real scene is limited by it (the standing practice in
+// ADR-020).
+//
+// Scalar only for now, so bit-exactness across kernels is trivially satisfied
+// while the vector version does not exist.
+void evolve_velocity_rows(const SpectrumTables& tables, double time,
+                          FieldSet& fields, std::uint32_t row_begin,
+                          std::uint32_t row_end) noexcept;
+
+// Unpack the transformed velocity fields into the public interleaved buffer.
+void finalize_velocity_rows(const FieldSet& fields, float* velocity,
+                            std::uint32_t row_begin,
+                            std::uint32_t row_end) noexcept;
 
 // Turn the four transformed fields into the public interleaved buffers, for
 // rows [row_begin, row_end). Computes displacement, the exact normal of the

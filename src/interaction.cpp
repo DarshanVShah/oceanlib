@@ -866,7 +866,14 @@ Surface WaterSurface::sample_at(float world_x, float world_z) const noexcept
                        : ocean_->sample_at(world_x, world_z);
     const InteractionSample e = field_->sample_at(world_x, world_z);
 
-    s.height += e.height;
+    s.height     += e.height;
+
+    // The interaction field contributes VERTICAL velocity only. Its horizontal
+    // orbital velocity would need the Riesz transform of dEta/dt - a second and
+    // third convolution per substep, tripling the hot loop - and is not
+    // computed. Stated here rather than left for a caller to discover: a hull
+    // feels its own wake heave it, not the wake's horizontal orbital drift.
+    s.velocity_y += e.velocity_y;
 
     // Compose through SLOPES, not by summing unit normals.
     //

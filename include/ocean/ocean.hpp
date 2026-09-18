@@ -105,6 +105,28 @@ struct OceanDesc {
     // Only consulted when parallel_for is null. 0 means "one worker per
     // hardware thread".
     std::uint32_t thread_count = 0;
+
+    // Compute the 3-D orbital velocity field as well.
+    //
+    // OFF by default, because it is not free: it needs three more spectra,
+    // which pack into two more complex fields, so the frame runs SIX inverse
+    // transforms instead of four. An integration that does not ask for it pays
+    // nothing at all - neither the transforms nor the memory.
+    //
+    // Derivation. The velocity potential satisfies dphi/dt = -g*h at the
+    // surface, solved PER BRANCH because the two counter-propagating trains
+    // h(k,t) = A + B carry opposite signs of omega (a single -i*omega
+    // multiplier would be wrong, and would come out non-Hermitian). Writing
+    // D = A - B:
+    //
+    //     u_y = i*omega*D                 (equals dh/dt, as the kinematic
+    //                                      boundary condition requires)
+    //     u_x = -omega*(kx/|k|)*D
+    //     u_z = -omega*(kz/|k|)*D
+    //
+    // D is ANTI-Hermitian, which is exactly what makes all three products
+    // Hermitian and therefore real after transform.
+    bool compute_velocity = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -129,6 +151,12 @@ inline constexpr std::size_t kBufferAlignment = 64;
 struct Buffers {
     const float*  displacement = nullptr;
     const float*  normal       = nullptr;
+
+    // Orbital velocity in m/s, or null when OceanDesc::compute_velocity is
+    // false. Laid out as another RGBA32F-shaped buffer:
+    //   velocity[4*i + 0..2] = vx, vy, vz
+    //   velocity[4*i + 3]    = 0 (reserved)
+    const float*  velocity     = nullptr;
     std::uint32_t size         = 0;     // N; each buffer holds N*N*4 floats
     float         patch_length = 0.0f;  // metres per tile edge
 };
@@ -142,6 +170,13 @@ struct Surface {
     float normal_y   = 1.0f;
     float normal_z   = 0.0f;
     float foam       = 0.0f;
+
+    // Orbital velocity of the water at that point, m/s. Zero unless
+    // OceanDesc::compute_velocity was set (and, for a combined query through
+    // WaterSurface, plus the interaction field's own contribution).
+    float velocity_x = 0.0f;
+    float velocity_y = 0.0f;
+    float velocity_z = 0.0f;
 };
 
 // ---------------------------------------------------------------------------
