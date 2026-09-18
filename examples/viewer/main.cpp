@@ -13,6 +13,7 @@
 //   --cam-x/y/z V     camera position; --cam-yaw/--cam-pitch V its heading
 //   --isolate         start with the interaction field shown on its own
 //   --no-foam-advect  fall back to the instantaneous Jacobian foam
+//   --no-detail-fade  keep every cascade at full strength to the horizon
 //   --foam-decay R    foam decay rate, 1/s (default 0.30, half-life 2.3 s)
 //   --foam-gain G     how fast breaking injects foam, 1/s (default 4)
 //   --foam-advect S   multiplier on the advecting current (default 1)
@@ -89,6 +90,7 @@ struct Options {
     bool          cam_set = false;
     float         impulse = 0.45f, impulse_radius = 0.55f;
     bool          no_foam_advect = false;
+    bool          no_detail_fade = false;
     // Steady-state coverage under a sustained source is source_gain/decay, so
     // this ratio is the knob that decides whether foam reads as whitecaps or
     // as milk. 4/0.3 = 13x saturated the entire ocean; 1.5/0.4 = 3.75x lets a
@@ -131,6 +133,7 @@ Options parse_args(int argc, char** argv)
         else if (a == "--impulse")        o.impulse = std::strtof(next(), nullptr);
         else if (a == "--impulse-radius") o.impulse_radius = std::strtof(next(), nullptr);
         else if (a == "--no-foam-advect") o.no_foam_advect = true;
+        else if (a == "--no-detail-fade") o.no_detail_fade = true;
         else if (a == "--foam-decay")  o.foam_decay  = std::strtof(next(), nullptr);
         else if (a == "--foam-gain")   o.foam_gain   = std::strtof(next(), nullptr);
         else if (a == "--foam-advect") o.foam_advect = std::strtof(next(), nullptr);
@@ -855,6 +858,23 @@ int main(int argc, char** argv)
         // can all catch the glare spike at once, washing out the sky.
         globals.shading[2] = 0.0015f; // fog density
         globals.shading[3] = input.choppiness;
+
+        // Detail fade needs each cascade's texel size and the angular size of
+        // one pixel. tan(fov/2)*2/height is the world size a pixel covers per
+        // metre of distance, which is what turns a texel size into a
+        // texels-per-pixel ratio in the shader.
+        for (std::uint32_t i = 0; i < 3; ++i) {
+            const std::size_t lvl = std::min<std::size_t>(i, levels.size() - 1);
+            globals.cascade_texel[i] =
+                levels[lvl].patch_length / static_cast<float>(levels[lvl].size);
+        }
+        // 0 makes the shader's texels-per-pixel ratio diverge, so every
+        // cascade stays fully on - the A/B control for the fade.
+        globals.cascade_texel[3] =
+            opt.no_detail_fade
+                ? 0.0f
+                : 2.0f * std::tan(0.5f * 1.05f) /
+                      static_cast<float>(ctx.extent.height);
 
         const ocean::InteractionBuffers ib = field.buffers();
         globals.interaction[0] = ib.origin_x;

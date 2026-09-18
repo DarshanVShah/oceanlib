@@ -19,6 +19,7 @@ layout(location = 2) in  vec2  vUV1;
 layout(location = 3) in  vec2  vUV2;
 layout(location = 4) in  float vFoam;
 layout(location = 5) in  vec4  vInteraction;
+layout(location = 6) in  vec3  vFade;
 
 layout(location = 0) out vec4 outColor;
 
@@ -37,10 +38,25 @@ void main()
     // approximation here as the CPU query keeps rendering and physics
     // consistent with each other rather than just each being locally
     // plausible.
+    // Combined in SLOPE space, not by summing unit normals.
+    //
+    // The fade has to be applied to something that can be scaled, and a unit
+    // normal cannot: multiplying it by 0.5 does not halve the bump, it just
+    // produces a shorter vector that renormalises straight back. Slopes do
+    // scale - halving a slope halves the tilt - so converting, weighting,
+    // summing and converting back is what actually fades a band out.
+    //
+    // It is also closer to correct than the sum-and-renormalise ADR-020 had to
+    // settle for: heights add in world space, so world-space slopes add.
     vec3 n0 = texture(uNormal0, vUV0).xyz;
     vec3 n1 = texture(uNormal1, vUV1).xyz;
     vec3 n2 = texture(uNormal2, vUV2).xyz;
-    vec3 N = normalize(n0 + n1 + n2);
+
+    vec2 slope = vec2(0.0);
+    slope += vec2(-n0.x, -n0.z) / max(n0.y, 1e-4) * vFade.x;
+    slope += vec2(-n1.x, -n1.z) / max(n1.y, 1e-4) * vFade.y;
+    slope += vec2(-n2.x, -n2.z) / max(n2.y, 1e-4) * vFade.z;
+    vec3 N = normalize(vec3(-slope.x, 1.0, -slope.y));
 
     // Add the interaction field's slope, so the ripples CATCH THE LIGHT rather
     // than merely displacing the mesh.
@@ -137,9 +153,9 @@ void main()
     // The screen blend 1 - product(1 - f_i) is the same one
     // CascadeStack::sample_at uses on the CPU, so a physics query and a pixel
     // agree about how much foam is at a point.
-    float f0 = texture(uDisplacement0, vUV0).w;
-    float f1 = texture(uDisplacement1, vUV1).w;
-    float f2 = texture(uDisplacement2, vUV2).w;
+    float f0 = texture(uDisplacement0, vUV0).w * vFade.x;
+    float f1 = texture(uDisplacement1, vUV1).w * vFade.y;
+    float f2 = texture(uDisplacement2, vUV2).w * vFade.z;
     float coverage = 1.0 - (1.0 - f0) * (1.0 - f1) * (1.0 - f2);
 
     // A gentle contrast curve. Advected foam has a long thin tail as it decays,

@@ -21,6 +21,7 @@ layout(location = 2) out vec2  vUV1;
 layout(location = 3) out vec2  vUV2;
 layout(location = 4) out float vFoam;
 layout(location = 5) out vec4  vInteraction;
+layout(location = 6) out vec3  vFade;
 
 void main()
 {
@@ -55,10 +56,23 @@ void main()
     vec4 d1 = textureLod(uDisplacement1, uv1, 0.0);
     vec4 d2 = textureLod(uDisplacement2, uv2, 0.0);
 
+    // Distance-based detail fade. Weighted BEFORE the sum, because the
+    // cascades are a frequency decomposition and fading one out is dropping
+    // its band - which is what a low-pass filter would do to geometry too
+    // small to draw.
+    //
+    // Distance is measured to the undisplaced position: using the displaced
+    // one would make the weight depend on the displacement it is about to
+    // scale, which is circular and pops as waves move.
+    float dist = length(g.camPos.xyz - vec3(base.x, 0.0, base.y));
+    vFade = vec3(detail_fade(dist, g.cascadeTexel.x),
+                 detail_fade(dist, g.cascadeTexel.y),
+                 detail_fade(dist, g.cascadeTexel.z));
+
     // Height and horizontal offset: exact linear superposition (ADR-020) -
     // each cascade's displacement is a real field over world position, so
     // summing them is not an approximation.
-    vec3 dSum = d0.xyz + d1.xyz + d2.xyz;
+    vec3 dSum = d0.xyz * vFade.x + d1.xyz * vFade.y + d2.xyz * vFade.z;
 
     // The interaction field is a pure HEIGHT field - no horizontal
     // displacement - so it is sampled at the world position the vertex
@@ -75,6 +89,7 @@ void main()
         vWorld = vec3(base.x, inter.x, base.y);
         vUV0 = uv0; vUV1 = uv1; vUV2 = uv2;
         vFoam = 0.0;
+        vFade = vec3(1.0);
         gl_Position = g.viewProj * vec4(vWorld, 1.0);
         return;
     }
@@ -87,7 +102,8 @@ void main()
     // Foam: same "screen"/OR blend as CascadeStack::sample_at on the CPU side
     // (1 - product(1-foam_i)), kept identical so the GPU-rendered foam and a
     // physics query at the same point agree in character, not just height.
-    vFoam = 1.0 - (1.0 - d0.w) * (1.0 - d1.w) * (1.0 - d2.w);
+    vFoam = 1.0 - (1.0 - d0.w * vFade.x) * (1.0 - d1.w * vFade.y) *
+                  (1.0 - d2.w * vFade.z);
 
     gl_Position = g.viewProj * vec4(vWorld, 1.0);
 }

@@ -27,10 +27,36 @@ layout(set = 0, binding = 0) uniform Globals {
     vec4 params;       // x = time, y = mesh resolution, z = sky
                        // turbidity, w = sky luminance scale
     vec4 shading;      // x foam strength, y exposure, z fog density, w unused
+    vec4 cascadeTexel; // xyz = world size of one texel in cascades 0,1,2;
+                       // w   = world units per pixel per metre of distance
     vec4 interaction;  // xy = world position of the field's low corner,
                        // z  = field extent in metres,
                        // w  = 1 to show the interaction field in isolation
 } g;
+
+// How much of a cascade survives at this distance, in [0,1].
+//
+// A cascade whose texels project to less than a pixel cannot be resolved: what
+// reaches the screen is not detail but ALIASING, and it is the worst kind -
+// it shimmers as the camera moves, because which sub-texel each pixel lands on
+// changes every frame. The finest cascade is the worst offender, since it has
+// the smallest texels and is still being sampled out to the horizon.
+//
+// So each cascade is faded out once its texel drops below roughly a pixel.
+// This is mip-mapping's argument applied at the level of a whole frequency
+// band: the band is removed rather than filtered, because the cascades ARE a
+// frequency decomposition and dropping the top band is exactly what a low-pass
+// filter would do.
+//
+// The far cascade is unaffected in any normal view - its texels are metres
+// across - so the horizon keeps its large-scale shape and only loses the
+// detail that could not have been drawn correctly anyway.
+float detail_fade(float dist, float texelWorld)
+{
+    // Texels per pixel at this distance. Above 1 the band is resolvable.
+    float perPixel = texelWorld / max(dist * g.cascadeTexel.w, 1e-6);
+    return smoothstep(0.9, 2.6, perPixel);
+}
 
 // The local interaction field (ADR-021): eta, dEta/dx, dEta/dz, dEta/dt.
 //

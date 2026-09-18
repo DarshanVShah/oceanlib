@@ -43,6 +43,9 @@ struct Globals {
                                  // w = tiles per side of the outer mesh
     float     params[4];         // x = time, y = mesh resolution, z,w unused
     float     shading[4];        // foam strength, exposure, fog density, unused
+    float     cascade_texel[4];  // x,y,z = world size of one texel per
+                                 // cascade; w = world units per pixel per
+                                 // metre of distance
     float     interaction[4];    // x,y = world low corner of the interaction
                                  // field; z = its extent; w = isolate flag
 };
