@@ -39,7 +39,7 @@ CascadeStack::~CascadeStack()                                     = default;
 CascadeStack::CascadeStack(CascadeStack&&) noexcept                = default;
 CascadeStack& CascadeStack::operator=(CascadeStack&&) noexcept     = default;
 
-void CascadeStack::update(double time)
+void CascadeStack::update(double time) noexcept
 {
     // Sequential across levels for now: each level already parallelises
     // internally (its own thread pool or the shared host scheduler), and this

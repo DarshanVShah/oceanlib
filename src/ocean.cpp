@@ -265,7 +265,7 @@ Ocean::~Ocean() = default;
 Ocean::Ocean(Ocean&&) noexcept = default;
 Ocean& Ocean::operator=(Ocean&&) noexcept = default;
 
-void Ocean::update(double time)
+void Ocean::update(double time) noexcept
 {
     // Absolute, not incremental: the surface is a pure function of
     // (seed, desc, time). Seeking or replaying reproduces it exactly.

@@ -9,6 +9,10 @@
 //
 // This header is entirely additive: ocean::Ocean is completely unchanged, and
 // every existing single-patch integration is unaffected by this addition.
+//
+// C++ only, deliberately, for v1.0: there is no ocean_cascade_* surface in
+// ocean.h yet, so bindings from other languages cannot reach this class.
+// A C API for CascadeStack is planned for a v1.1 release; see CHANGELOG.md.
 #pragma once
 
 #include "ocean/ocean.hpp"
@@ -56,7 +60,7 @@ public:
     // Advances every level to the same absolute time. Performs no heap
     // allocation, exactly like Ocean::update() - it is a fixed-size loop over
     // already-allocated Ocean instances.
-    void update(double time);
+    void update(double time) noexcept;
 
     [[nodiscard]] std::size_t level_count() const noexcept;
 

@@ -164,7 +164,7 @@ public:
     // This is a pure function of (seed, desc, time) - not of previous calls -
     // which is what makes promise #3 hold under seeking, pausing and replay.
     // Performs no heap allocation.
-    void update(double time);
+    void update(double time) noexcept;
 
     // Valid until the Ocean is destroyed; contents change on every update().
     [[nodiscard]] Buffers buffers() const noexcept;

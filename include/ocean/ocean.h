@@ -65,6 +65,13 @@ typedef void (*ocean_parallel_for_fn)(void* user, ocean_task_fn task, void* ctx,
  * Configuration
  * ------------------------------------------------------------------------- */
 
+/* DO NOT add fields to this struct. It is embedded BY VALUE inside
+ * ocean_desc, ahead of choppiness, foam_threshold, seed and the threading
+ * fields - so any field appended here would shift the byte offset of every
+ * field that follows it in ocean_desc, silently breaking the struct_size
+ * prefix-compatibility guarantee documented below for existing callers.
+ * A new spectrum option belongs at the true end of ocean_desc instead,
+ * exactly like water_depth - see the comment on that field. */
 typedef struct ocean_spectrum_desc {
     float wind_speed;        /* U10, m/s                                     */
     float fetch;             /* metres of open water the wind has crossed    */
