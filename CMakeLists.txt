@@ -27,6 +27,7 @@ add_library(ocean STATIC
   src/core/fft_kernel_avx2.cpp
   src/core/fft_kernel_neon.cpp
   src/core/spectrum.cpp
+  src/core/iwave_kernel.cpp
   src/core/evolve.cpp
   src/core/evolve_kernel_avx2.cpp
   src/core/thread_pool.cpp
