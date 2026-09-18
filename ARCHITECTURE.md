@@ -1569,3 +1569,96 @@ check they are not NaN or degenerate; and, decisively, diff actual pixel
 values against a trusted reference rather than trusting a rescaled,
 recompressed visual impression. The last of these settled the question in one
 step after several plausible-sounding hypotheses had already been ruled out.
+
+---
+
+## ADR-021 — Mesh LOD: a geometry clipmap, decoupled from cascade scale
+
+### The problem
+
+ADR-015 already named this limitation: every tile in the viewer's mesh draws
+at the same resolution regardless of distance, so distant triangles collapse
+to sub-pixel size and waste vertex work for nothing. At defaults (256 quads
+per tile, 7x7 tiles) that is 6.42M triangles, the overwhelming majority of
+them past the point of contributing a visible pixel.
+
+### Decision: concentric clipmap rings, geometry decoupled from cascade scale
+
+A geometry clipmap: `R` concentric square rings centred on the camera, each
+ring twice the previous ring's cell spacing and twice its world footprint,
+each ring holding a *constant* vertex count regardless of level. That bounds
+total triangle count to `O(R * m^2)` rather than scaling with visible area,
+which is the entire value of the technique — the alternatives compared
+against it (screen-space projected grid, quadtree + geomorphing) are recorded
+in the discussion that led here; the projected grid was the strongest
+runner-up (least code, cheapest at runtime) but ties triangle allocation to
+what is on screen for a free-fly camera that can pitch toward straight-down,
+which a fixed ring budget does not.
+
+**Ring geometry is sized independently of the three cascade patch lengths
+(800/150/25 m), not aligned to them.** Cascade patch lengths were chosen in
+ADR-020 specifically *without* common factors, so that the cascades'
+periodic tiling never re-aligns into a visible repeat. A clipmap ring
+progression wants the opposite property — a clean power-of-two doubling, so
+that ring boundaries nest exactly and adjacent rings differ by a single,
+predictable factor. Forcing one scheme to serve both goals would fight both
+of them for no benefit. The two concerns are genuinely independent: ring
+geometry answers "how many triangles, and where", cascade sampling answers
+"which wavelength bands still matter here" — both read the same
+distance-from-camera value, but neither needs to share the other's units.
+
+### Why this is simpler than a classic geometry clipmap
+
+The textbook technique (Losasso & Hoppe) is complicated primarily because it
+streams a heightmap: each ring mip-maps a different, actually-smoothed copy
+of terrain height data, and keeping that data resident under a moving camera
+needs toroidal updates - only the thin border that just entered a ring's
+footprint is re-fetched each frame, because re-uploading a whole ring's
+texture data every frame would be far too much bandwidth.
+
+None of that applies here. There is no heightmap. Every vertex's position is
+computed live in the vertex shader by sampling the cascade textures at that
+vertex's world (x, z) - exactly what the single-tile mesh already does today.
+A ring's vertex and index buffers are therefore fully static, built once at
+init exactly like today's mesh, and the only thing that changes per frame is
+the ring's world-space centre offset, uploaded the same way the existing
+per-tile offset already is. There is no texture data to stream, so there is
+no toroidal update to implement at all.
+
+One consequence worth stating plainly: because every ring samples the exact
+same cascade textures at the exact same world position, **a vertex's height
+never disagrees between rings.** The signal is identical everywhere; only the
+mesh's sampling *density* of that signal changes with ring level. This rules
+out the classic clipmap "height pop" (where a coarser mip genuinely holds a
+different, filtered height) by construction. What is left to solve is purely
+geometric: the T-junction where a fine ring's densely-spaced boundary meets a
+coarse ring's sparsely-spaced one, and the coarser *effective sample rate*
+itself, which can make a fine ripple vanish or appear abruptly as a ring
+boundary sweeps across it even with the crack closed.
+
+### Boundary handling: trim strips + a geomorphing blend band
+
+Three options were weighed against the "no visible popping" requirement:
+skirts alone (hide the crack, cheapest, does not address the density-change
+pop at all), trim strips alone (close the crack exactly, but the sampling
+density still jumps discontinuously at the boundary, so fine detail can still
+appear/disappear abruptly), and trim strips plus a geomorphing blend band
+(closes the crack and fades the transition). Only the third actually
+satisfies "no visible popping" rather than "no visible crack" - the other two
+were rejected on that basis, not on cost.
+
+**Trim-strip orientation is fixed, not rotated per frame.** The classic
+technique snaps each ring's centre to a multiple of *its own* cell size,
+which leaves the boundary offset against the next coarser ring's grid
+ambiguous (up to one coarse cell, in either of two directions), and needs
+four pre-built rotated trim variants plus per-frame selection to cover every
+case. Snapping each ring's centre to a multiple of *its coarser neighbour's*
+cell size instead (i.e. twice its own) fixes that parity permanently: the
+boundary always meets the coarser grid the same way, so exactly one trim
+shape is ever needed. The cost is that a ring can lag the camera by up to one
+coarse cell before re-centring, rather than one fine cell - imperceptible,
+because that slack is largest on the outermost rings, precisely where a
+one-cell wobble is smallest relative to what is already on screen.
+
+*(Implementation, measured triangle counts and frame times follow as they
+land.)*
