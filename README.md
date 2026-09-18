@@ -1,5 +1,7 @@
 # oceanlib
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A small, dependency-free, engine-agnostic C++20 library for real-time ocean
 waves: a JONSWAP directional spectrum, an in-tree multithreaded SIMD FFT, and
 CPU-side displacement / normal / foam buffers any renderer can upload.
@@ -43,6 +45,22 @@ Four promises, and every one of them is tested rather than asserted:
 4. **Easy to integrate.** The output buffers are laid out as RGBA32F textures,
    so uploading the whole ocean is two `memcpy`s and two image copies.
 
+## What it does and doesn't do
+
+**Does:** a JONSWAP directional wave spectrum (optionally finite-depth), an
+FFT-based CPU displacement/normal/foam field per patch, exact world-space
+height/normal/foam queries against what's actually drawn, multi-scale
+cascades (several patches at different scales summed into one sea state),
+and a reference Vulkan viewer to see it in.
+
+**Doesn't do:** GPU compute (the FFT is CPU-only, by design - see promise
+#1), foam *advection* (foam is a per-frame Jacobian threshold, not simulated
+particles that persist and drift), buoyancy or rigid-body solving (you get
+`height_at`/`sample_at`; physics integration is yours), rendering (the
+viewer is a reference integration, not an engine), or non-power-of-two grid
+sizes (the FFT is radix-2). Shallow water gets the correct dispersion
+relation but not a re-derived TMA spectrum shape - see `SpectrumDesc::depth`.
+
 ## Building
 
 ```sh
@@ -58,7 +76,33 @@ With tests off, the build needs no network and no external dependency of any
 kind. doctest is fetched only for tests; Vulkan and GLFW are needed only for
 the viewer.
 
+### CMake FetchContent
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(oceanlib
+  GIT_REPOSITORY https://github.com/DarshanVShah/oceanlib.git
+  GIT_TAG        v1.0.0)
+set(OCEAN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(OCEAN_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(oceanlib)
+
+target_link_libraries(your_target PRIVATE ocean::ocean)
+```
+
 ## Using it
+
+The whole integration, five lines:
+
+```cpp
+ocean::OceanDesc desc;
+desc.spectrum.wind_speed = 12.0f;       // m/s
+ocean::Ocean sim{desc};                 // everything allocates here, once
+sim.update(absolute_time_seconds);      // per frame - no heap allocation
+float water_height = sim.height_at(x, z);
+```
+
+In context, with the buffers a renderer actually needs:
 
 ```cpp
 #include "ocean/ocean.hpp"
@@ -83,7 +127,27 @@ const ocean::Buffers b = sim.buffers();
 float water_height = sim.height_at(boat_x, boat_z);
 ```
 
-A C API is in `include/ocean/ocean.h` for bindings from other languages.
+### C API
+
+For bindings from C, Rust, C#, Python, Swift, or any host that speaks the C
+ABI. Declared in `include/ocean/ocean.h`.
+
+```c
+#include "ocean/ocean.h"
+
+ocean_desc desc;
+ocean_desc_init(&desc);              // fills defaults, sets struct_size
+desc.spectrum.wind_speed = 12.0f;
+
+ocean_status status;
+ocean_sim* sim = ocean_create(&desc, &status);
+
+ocean_update(sim, absolute_time_seconds);
+ocean_buffers b = ocean_get_buffers(sim);
+float water_height = ocean_height_at(sim, x, z);
+
+ocean_destroy(sim);
+```
 
 To plug in an engine's scheduler instead of the built-in thread pool, set
 `desc.parallel_for` to anything with the shape of `ParallelFor` /
@@ -109,6 +173,31 @@ Needs the Vulkan SDK (for headers and `glslc`); GLFW is fetched automatically.
 Flags: `--size N --mesh M --tiles T --wind U --chop C --foam F --wireframe
 --screenshot out.bmp --frames N`.
 
+## Performance
+
+Measured, not projected. Full methodology, stage breakdowns and how each
+number was reached: [BENCHMARKS.md](BENCHMARKS.md).
+
+**Machine:** Intel Core i7-14700HX (8 P-cores + 12 E-cores, 28 threads), no
+AVX-512. MSVC 19.44.35208, CMake `Release`, Ninja. Flags: `/O2 /Ob2 /DNDEBUG
+-std:c++20 -MD /W4 /permissive- /fp:precise`.
+
+**512x512 `Ocean::update()`, one build at a time, serial and threaded (ms):**
+
+| build                             | serial (ms) | threaded (ms) |
+|------------------------------------|------------:|--------------:|
+| scalar, single-threaded            |      23.620 |             - |
+| + threads (28 hw threads)          |      25.558 |          2.919 |
+| + AVX2 FFT (naive)                 |      18.301 |          2.422 |
+| + batched FFT columns              |      13.371 |          1.913 |
+| + own polynomial sincos            |      12.234 |          1.862 |
+| + floor-based phase fold           |      11.805 |          1.608 |
+| + AVX2 evolve                      |   **8.378** |      **1.426** |
+
+**16.6x overall** from the scalar single-threaded baseline: a 512x512 ocean
+updates in 1.43 ms, leaving 15.2 ms of a 60 Hz frame for everything else.
+`height_at()` costs well under a microsecond.
+
 ## Documentation
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - every design decision and why,
@@ -118,8 +207,10 @@ Flags: `--size N --mesh M --tiles T --wind U --chop C --foam F --wireframe
 
 ## Status
 
-Version 1 core is complete: spectrum, FFT, threading, SIMD, queries, C API,
-and the Vulkan viewer. Version 2 in progress: shallow-water dispersion,
-NEON verified under aarch64 QEMU emulation, and cascades (`ocean::CascadeStack`,
-in `include/ocean/cascade.hpp`) are done. Remaining: foam advection, GPU
-compute, and time-looped baking.
+v1.0.0. Spectrum, FFT, threading, SIMD, queries, C API, cascades
+(`ocean::CascadeStack`), shallow-water dispersion, NEON verified under
+aarch64 QEMU emulation, and the Vulkan viewer are all done.
+
+Cascades are C++ only for now - no `ocean_cascade_*` C API yet. That, plus
+foam advection, GPU compute, and time-looped baking, are the plan for v1.1
+and beyond.
