@@ -16,6 +16,7 @@
 #include "vk_math.hpp"
 
 #include "ocean/cascade.hpp"
+#include "ocean/interaction.hpp"
 #include "ocean/ocean.hpp"
 
 #include <array>
@@ -41,6 +42,8 @@ struct Globals {
                                  // w = tiles per side of the outer mesh
     float     params[4];         // x = time, y = mesh resolution, z,w unused
     float     shading[4];        // foam strength, exposure, fog density, unused
+    float     interaction[4];    // x,y = world low corner of the interaction
+                                 // field; z = its extent; w = isolate flag
 };
 
 class OceanView {
@@ -50,7 +53,8 @@ public:
     // (the largest scale's) patch per side of the outer mesh (odd, centred on
     // the origin).
     bool init(VkContext& ctx, const std::vector<ocean::OceanDesc>& levels,
-              std::uint32_t mesh_resolution, std::uint32_t tiles);
+              std::uint32_t mesh_resolution, std::uint32_t tiles,
+              std::uint32_t interaction_size);
     void shutdown(VkContext& ctx);
 
     // Copies every cascade level's buffers into this frame's textures and
@@ -58,7 +62,7 @@ public:
     // use.
     void record(VkContext& ctx, VkCommandBuffer cmd, std::uint32_t image_index,
                 std::uint32_t frame, const ocean::CascadeStack& stack,
-                const Globals& globals);
+                const ocean::InteractionField& field, const Globals& globals);
 
     void set_wireframe(bool on) { wireframe_ = on; }
     [[nodiscard]] bool wireframe() const { return wireframe_; }
@@ -75,6 +79,7 @@ private:
 
     std::size_t   level_count_      = 0;
     std::array<std::uint32_t, kMaxCascades> level_sizes_{};
+    std::uint32_t interaction_size_ = 0;
     std::uint32_t mesh_resolution_ = 0;
     std::uint32_t tiles_           = 0;
     std::uint32_t index_count_     = 0;
@@ -112,6 +117,14 @@ private:
         void*          staging_mapped = nullptr;
         std::array<VkDeviceSize, kMaxCascades> staging_offset{};
 
+        // The interaction field: one more RGBA32F texture, uploaded from the
+        // same persistently-mapped staging buffer.
+        VkImage        interaction             = VK_NULL_HANDLE;
+        VkDeviceMemory interaction_memory      = VK_NULL_HANDLE;
+        VkImageView    interaction_view        = VK_NULL_HANDLE;
+        VkDeviceSize   interaction_offset      = 0;
+        bool           interaction_initialised = false;
+
         VkBuffer        uniform        = VK_NULL_HANDLE;
         VkDeviceMemory  uniform_memory = VK_NULL_HANDLE;
         void*           uniform_mapped = nullptr;
@@ -134,6 +147,12 @@ private:
     VkImageView    dummy_normal_view_          = VK_NULL_HANDLE;
 
     VkSampler             sampler_        = VK_NULL_HANDLE;
+
+    // A second sampler, CLAMP_TO_BORDER with a transparent-black border, for
+    // the interaction field. The cascade sampler REPEATs because those fields
+    // really are periodic; this one is not, and reusing the repeating sampler
+    // would tile one splash across the whole ocean.
+    VkSampler             clamp_sampler_  = VK_NULL_HANDLE;
     VkDescriptorPool      descriptor_pool_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout_     = VK_NULL_HANDLE;
     VkPipelineLayout      pipeline_layout_ = VK_NULL_HANDLE;

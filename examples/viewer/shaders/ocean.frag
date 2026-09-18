@@ -11,6 +11,7 @@ layout(location = 1) in  vec2  vUV0;
 layout(location = 2) in  vec2  vUV1;
 layout(location = 3) in  vec2  vUV2;
 layout(location = 4) in  float vFoam;
+layout(location = 5) in  vec4  vInteraction;
 
 layout(location = 0) out vec4 outColor;
 
@@ -33,6 +34,37 @@ void main()
     vec3 n1 = texture(uNormal1, vUV1).xyz;
     vec3 n2 = texture(uNormal2, vUV2).xyz;
     vec3 N = normalize(n0 + n1 + n2);
+
+    // Add the interaction field's slope, so the ripples CATCH THE LIGHT rather
+    // than merely displacing the mesh.
+    //
+    // Composed through SLOPES, not by summing unit normals. The cascade sum
+    // above has to blend normals because each cascade only exposes an already
+    // normalised one (ADR-020); here we have a genuine height field, and
+    // heights adding in world space means slopes add in world space - an
+    // identity, not an approximation. This is the same arithmetic
+    // WaterSurface::sample_at performs on the CPU, so shading and physics
+    // agree rather than each being separately plausible.
+    // Sampled HERE, per pixel, not taken from the interpolated vertex value.
+    //
+    // This matters more than it looks. The mesh is about 3 m per quad (256
+    // quads across the far cascade's 800 m patch), while the interaction field
+    // carries ripples of 0.5 to 4 m. Interpolating a per-vertex sample across
+    // a 3 m quad aliases those ripples away completely - the field is there,
+    // the texture is bound, and the water still looks flat. A per-pixel fetch
+    // reads the field at its own resolution, which is what makes the ripples
+    // catch the light rather than merely move the mesh.
+    vec4 inter = interaction_sample(vWorld.xz);
+
+    if (g.interaction.w > 0.5) {
+        // Isolation mode: the surface IS the interaction field, so its normal
+        // is the plain height-field normal.
+        N = normalize(vec3(-inter.y, 1.0, -inter.z));
+    } else if (N.y > 1e-6) {
+        vec2 slope = vec2(-N.x / N.y + inter.y,
+                          -N.z / N.y + inter.z);
+        N = normalize(vec3(-slope.x, 1.0, -slope.y));
+    }
 
     // Backfacing normals occur where the surface has folded (jacobian < 0).
     // Flipping rather than discarding keeps breaking crests lit instead of

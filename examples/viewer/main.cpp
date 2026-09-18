@@ -9,6 +9,19 @@
 //   --mesh M          mesh quads per tile edge (default 256)
 //   --tiles T         tiles per side of the outer (far-cascade) mesh, odd (default 7)
 //   --cascades N      number of cascade scales, 1-3 (default 3; ADR-020)
+//   --interaction N   interaction field resolution, power of two (default 256)
+//   --cam-x/y/z V     camera position; --cam-yaw/--cam-pitch V its heading
+//   --isolate         start with the interaction field shown on its own
+//   --splash N        drop a scripted rock at the focus point on frame N, so
+//                     --screenshot can capture ripples without a mouse. The
+//                     position and frame are fixed, and --screenshot already
+//                     advances on a fixed virtual timestep, so the captured
+//                     image is reproducible across machines.
+//
+// Interaction (ADR-021):
+//   LEFT CLICK        drop a rock where the ray meets the DISPLACED surface
+//   - / =             impulse strength      [ / ]   impulse radius
+//   I                 show the interaction field on its own, without the swell
 //   --wind U          wind speed in m/s (default 12)
 //   --depth D         water depth in metres for shallow-water dispersion
 //                     (default 0 = deep water; try 3-8 for visibly shoaled waves)
@@ -27,6 +40,7 @@
 #include "vk_math.hpp"
 
 #include "ocean/cascade.hpp"
+#include "ocean/interaction.hpp"
 #include "ocean/ocean.h"    // for ocean_simd_level(); the viewer
                             // deliberately uses only public headers
 #include "ocean/ocean.hpp"
@@ -54,6 +68,14 @@ struct Options {
     std::string   simd;           // "" = native max; else scalar|sse2|avx2|neon
     std::uint32_t threads = 0;    // 0 = one worker per hardware thread
     std::uint32_t cascades = 3;   // 1-3, see ADR-020
+    std::uint32_t interaction = 256;  // interaction field resolution (ADR-021)
+    int           splash = -1;    // frame to inject a scripted impulse on, -1 = never
+    bool          isolate = false;  // start with the interaction field shown alone
+    // Camera placement, so a capture can be framed from the command line.
+    float         cam_x = 0.0f, cam_y = 18.0f, cam_z = 60.0f;
+    float         cam_yaw = -1.6f, cam_pitch = -0.18f;
+    bool          cam_set = false;
+    float         impulse = 0.45f, impulse_radius = 0.55f;
     int           frames = 90;
     bool          validation = true;
 };
@@ -77,6 +99,16 @@ Options parse_args(int argc, char** argv)
         else if (a == "--simd")        o.simd = next();
         else if (a == "--threads")     o.threads = std::strtoul(next(), nullptr, 10);
         else if (a == "--cascades")    o.cascades = std::strtoul(next(), nullptr, 10);
+        else if (a == "--interaction") o.interaction = std::strtoul(next(), nullptr, 10);
+        else if (a == "--splash")     o.splash = std::atoi(next());
+        else if (a == "--isolate")    o.isolate = true;
+        else if (a == "--impulse")        o.impulse = std::strtof(next(), nullptr);
+        else if (a == "--impulse-radius") o.impulse_radius = std::strtof(next(), nullptr);
+        else if (a == "--cam-x")     { o.cam_x = std::strtof(next(), nullptr); o.cam_set = true; }
+        else if (a == "--cam-y")     { o.cam_y = std::strtof(next(), nullptr); o.cam_set = true; }
+        else if (a == "--cam-z")     { o.cam_z = std::strtof(next(), nullptr); o.cam_set = true; }
+        else if (a == "--cam-yaw")   { o.cam_yaw = std::strtof(next(), nullptr); o.cam_set = true; }
+        else if (a == "--cam-pitch") { o.cam_pitch = std::strtof(next(), nullptr); o.cam_set = true; }
         else if (a == "--screenshot")  o.screenshot = next();
         else if (a == "--frames")      o.frames = std::atoi(next());
         else if (a == "--no-validation") o.validation = false;
@@ -209,6 +241,154 @@ bool capture_frame(viewer::VkContext& ctx, std::uint32_t image_index,
     return ok;
 }
 
+// --- ray marching against the displaced surface ---------------------------
+
+// A conservative bound on |surface height| in metres.
+//
+// Used only to bracket the march. Too small and the ray can start below a
+// crest and miss it; too large and the bracket is wider than it needs to be
+// and costs a few extra steps. It is a constant rather than a measured
+// per-frame maximum because scanning every cascade's height channel each frame
+// would cost more than the march it is meant to accelerate, and the march is
+// only ever driven by a mouse click.
+constexpr float kSurfaceBound = 14.0f;
+
+struct RayHit {
+    vkm::Vec3 point{};
+    bool      hit = false;
+    int       steps = 0;
+};
+
+// March a ray against the DISPLACED ocean surface - not the flat y = 0 plane.
+//
+// ALGORITHM. The surface is single-valued in (x, z) almost everywhere, so
+// define f(t) = ray(t).y - surface_height(ray(t).xz). f starts positive (the
+// ray begins above the water) and we look for its first sign change, then
+// refine.
+//
+// The march uses a step proportional to distance travelled rather than a fixed
+// one, because perspective means a step that is one pixel wide near the camera
+// is many pixels wide far away: a fixed world step wastes hundreds of samples
+// in the foreground to pay for the horizon. The floor keeps the step from
+// collapsing to nothing right in front of the eye.
+//
+// Refinement is the ILLINOIS method (modified regula falsi) rather than plain
+// bisection or a secant step. It keeps the bracket, so it cannot diverge the
+// way a secant can on a function this bumpy, while converging superlinearly
+// instead of bisection's one bit per iteration. The halving of the retained
+// endpoint's value is what stops the classic regula-falsi stall where one end
+// never moves.
+//
+// FAILURE CASES, all of them real at grazing angles:
+//
+//  - A ray nearly parallel to the surface covers a huge horizontal distance
+//    per unit of vertical drop, so between two samples it can pass clean over
+//    a crest and come down the far side. The click then lands on a wave much
+//    further away than the one under the cursor. Rejecting |D.y| below a
+//    threshold bounds how bad this gets, at the cost of refusing near-horizon
+//    clicks outright - which is better than silently dropping a rock 4 km away.
+//  - A choppy surface genuinely folds at breaking crests, where it is not a
+//    function of (x, z) at all. There f is multi-valued and "the first
+//    crossing" is only approximately meaningful. This is the same limit
+//    ADR-011's fixed-point inversion has, inherited.
+//  - Far from the camera, float precision in both the ray parameterisation and
+//    the surface query becomes comparable to the step, so the refinement stops
+//    buying accuracy. The march distance is capped for that reason.
+//
+// The scalable fix for the first case is a max-mipmap of the height field with
+// cone or hierarchical stepping, which can take provably safe long strides.
+// That is a real renderer's answer; for a demo driven by mouse clicks, a
+// distance-proportional march with a bounded step count is the honest trade.
+RayHit raymarch_ocean(const ocean::WaterSurface& water, vkm::Vec3 origin,
+                      vkm::Vec3 dir, float max_dist)
+{
+    RayHit out;
+    dir = vkm::normalize(dir);
+
+    // Looking up, or so close to horizontal that the failure above dominates.
+    if (dir.y > -0.02f) return out;
+
+    auto f_at = [&](float t) {
+        const vkm::Vec3 p = origin + dir * t;
+        return p.y - water.height_at(p.x, p.z);
+    };
+
+    // Bracket: enter at the top of the possible surface band, leave at its
+    // bottom. Skipping the empty sky above the waves is free accuracy.
+    float t0 = 0.0f;
+    if (origin.y > kSurfaceBound) t0 = (origin.y - kSurfaceBound) / -dir.y;
+    float t1 = (origin.y + kSurfaceBound) / -dir.y;
+    if (t1 > max_dist) t1 = max_dist;
+    if (t0 >= t1) return out;
+
+    float ta = t0, fa = f_at(ta);
+    if (fa < 0.0f) {                 // already under water at the entry point
+        out.point = origin + dir * ta;
+        out.hit   = true;
+        return out;
+    }
+
+    constexpr int kMaxSteps = 512;
+    float tb = ta, fb = fa;
+    bool bracketed = false;
+    for (int i = 0; i < kMaxSteps && ta < t1; ++i) {
+        const float step = std::fmax(0.20f, ta * 0.01f);
+        tb = std::fmin(ta + step, t1);
+        fb = f_at(tb);
+        out.steps = i + 1;
+        if (fb <= 0.0f) { bracketed = true; break; }
+        ta = tb; fa = fb;
+    }
+    if (!bracketed) return out;
+
+    // Illinois refinement. 40 iterations is far more than needed - it
+    // converges in about 6 - but each one is a single surface query and this
+    // runs once per click, not once per pixel.
+    for (int i = 0; i < 40; ++i) {
+        const float denom = fb - fa;
+        if (std::fabs(denom) < 1e-12f) break;
+        float tc = (ta * fb - tb * fa) / denom;
+        if (!(tc > std::fmin(ta, tb) && tc < std::fmax(ta, tb))) {
+            tc = 0.5f * (ta + tb);       // fall back to bisection if it strays
+        }
+        const float fc = f_at(tc);
+        if (std::fabs(fc) < 1e-4f) { ta = tc; break; }
+        if ((fc < 0.0f) == (fb < 0.0f)) {
+            tb = tc; fb = fc; fa *= 0.5f;
+        } else {
+            ta = tc; fa = fc; fb *= 0.5f;
+        }
+    }
+
+    out.point = origin + dir * (0.5f * (ta + tb));
+    out.hit   = true;
+    return out;
+}
+
+// Unproject a pixel into a world-space ray.
+vkm::Vec3 pixel_ray(const vkm::Mat4& inv_view_proj, double mx, double my,
+                    std::uint32_t width, std::uint32_t height)
+{
+    // Vulkan NDC: x and y both in [-1, 1] with y pointing DOWN, which matches
+    // GLFW's cursor origin at the top-left, so no flip is needed here.
+    const float nx = 2.0f * static_cast<float>(mx) / static_cast<float>(width) - 1.0f;
+    const float ny = 2.0f * static_cast<float>(my) / static_cast<float>(height) - 1.0f;
+
+    auto unproject = [&](float z) {
+        float v[4] = {nx, ny, z, 1.0f};
+        float r[4] = {0, 0, 0, 0};
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 4; ++col) {
+                r[row] += inv_view_proj.m[col][row] * v[col];
+            }
+        }
+        const float inv_w = 1.0f / r[3];
+        return vkm::Vec3{r[0] * inv_w, r[1] * inv_w, r[2] * inv_w};
+    };
+    // Vulkan depth range is [0, 1], so the near plane is z = 0.
+    return vkm::normalize(unproject(1.0f) - unproject(0.0f));
+}
+
 // --- input state ---------------------------------------------------------
 
 struct Input {
@@ -218,6 +398,13 @@ struct Input {
     bool   paused = false;
     bool   wireframe = false;
     float  choppiness = 1.0f;
+
+    // Interaction debug controls.
+    float  impulse_strength = 0.45f;
+    float  impulse_radius   = 0.55f;
+    bool   isolate          = false;
+    bool   click_pending    = false;
+    double click_x = 0.0, click_y = 0.0;
 };
 
 void key_callback(GLFWwindow* w, int key, int, int action, int)
@@ -231,8 +418,29 @@ void key_callback(GLFWwindow* w, int key, int, int action, int)
         case GLFW_KEY_R:      in->camera.reset(); break;
         case GLFW_KEY_1:      in->choppiness = std::fmax(0.0f, in->choppiness - 0.25f); break;
         case GLFW_KEY_2:      in->choppiness = std::fmin(4.0f, in->choppiness + 0.25f); break;
+        // Interaction debug controls.
+        case GLFW_KEY_I:      in->isolate = !in->isolate; break;
+        case GLFW_KEY_MINUS:
+            in->impulse_strength = std::fmax(0.02f, in->impulse_strength - 0.05f); break;
+        case GLFW_KEY_EQUAL:
+            in->impulse_strength = std::fmin(4.0f, in->impulse_strength + 0.05f); break;
+        case GLFW_KEY_LEFT_BRACKET:
+            in->impulse_radius = std::fmax(0.15f, in->impulse_radius - 0.05f); break;
+        case GLFW_KEY_RIGHT_BRACKET:
+            in->impulse_radius = std::fmin(3.0f, in->impulse_radius + 0.05f); break;
         default: break;
     }
+}
+
+void mouse_button_callback(GLFWwindow* w, int button, int action, int)
+{
+    if (button != GLFW_MOUSE_BUTTON_LEFT || action != GLFW_PRESS) return;
+    auto* in = static_cast<Input*>(glfwGetWindowUserPointer(w));
+    // The click is only RECORDED here. Resolving it needs the view-projection
+    // matrix and the ocean state, neither of which exists inside a GLFW
+    // callback, so the actual ray march happens in the frame loop.
+    glfwGetCursorPos(w, &in->click_x, &in->click_y);
+    in->click_pending = true;
 }
 
 }  // namespace
@@ -261,9 +469,18 @@ int main(int argc, char** argv)
 
     Input input;
     input.choppiness = opt.chop;
+    input.isolate          = opt.isolate;
+    input.impulse_strength = opt.impulse;
+    input.impulse_radius   = opt.impulse_radius;
+    if (opt.cam_set) {
+        input.camera.position = {opt.cam_x, opt.cam_y, opt.cam_z};
+        input.camera.yaw      = opt.cam_yaw;
+        input.camera.pitch    = opt.cam_pitch;
+    }
     input.wireframe  = opt.wireframe;
     glfwSetWindowUserPointer(window, &input);
     glfwSetKeyCallback(window, key_callback);
+    glfwSetMouseButtonCallback(window, mouse_button_callback);
 
     viewer::VkContext ctx;
     if (!ctx.init(window, opt.validation)) {
@@ -314,6 +531,25 @@ int main(int argc, char** argv)
     ocean::CascadeStack stack{std::span<const ocean::OceanDesc>(levels)};
     float active_choppiness = input.choppiness;
 
+    // The local interaction field (ADR-021). 64 m across at 256^2 gives 0.25 m
+    // cells, so the accurate band runs from about 0.5 m to 4 m wavelengths -
+    // exactly the range a rock splash produces.
+    ocean::InteractionDesc idesc;
+    idesc.size         = opt.interaction;
+    idesc.extent       = 64.0f;
+    idesc.damping      = 0.25f;
+    idesc.absorb_cells = 20;
+    idesc.thread_count = opt.threads;
+    ocean::InteractionField field{idesc};
+    ocean::WaterSurface water{stack, field};
+
+    std::printf("interaction: %ux%u over %.0f m (dx = %.3f m), kernel P=%u, "
+                "dt = %.4f s (limit %.4f s), dispersion error %.1f%%\n",
+                idesc.size, idesc.size, idesc.extent,
+                idesc.extent / idesc.size, idesc.kernel_radius,
+                field.fixed_dt(), field.stable_dt_limit(),
+                100.0f * field.kernel_dispersion_error());
+
     char depth_desc[64];
     if (opt.depth > 0.0f) {
         std::snprintf(depth_desc, sizeof(depth_desc), "%.1f m (shallow)", opt.depth);
@@ -326,7 +562,7 @@ int main(int argc, char** argv)
                 opt.wind, depth_desc, ocean_simd_level());
 
     viewer::OceanView view;
-    if (!view.init(ctx, levels, opt.mesh, opt.tiles)) {
+    if (!view.init(ctx, levels, opt.mesh, opt.tiles, idesc.size)) {
         ctx.shutdown();
         glfwDestroyWindow(window);
         glfwTerminate();
@@ -341,6 +577,7 @@ int main(int argc, char** argv)
     double sim_time = 0.0;
     auto   last     = std::chrono::steady_clock::now();
     double ocean_ms_avg = 0.0;
+    double inter_ms_avg = 0.0;
     double fps_avg = 0.0;
     int    frame_counter = 0;
     std::uint32_t last_image = 0;
@@ -415,6 +652,91 @@ int main(int argc, char** argv)
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - sim_start).count();
 
+        // --- interaction --------------------------------------------------
+        //
+        // Recentre on the camera every frame. The move snaps to whole cells,
+        // so it is an exact shift with nothing resampled - there is no jolt to
+        // smooth over. Done BEFORE resolving the click so the impulse lands in
+        // the grid the renderer will actually sample this frame.
+        // Recentre on what the camera is LOOKING AT, not on where it is.
+        //
+        // The field is 64 m across, which is the right size for resolving
+        // ripples (0.25 m cells) but small against a scene several kilometres
+        // wide. Anchoring it to the camera puts it under the viewer's feet,
+        // where nothing is happening, while the water they are actually
+        // looking at - a hundred metres ahead - falls outside the grid and
+        // silently swallows every impulse aimed at it. Anchoring it to the
+        // view ray's meeting with the mean water level puts the resolution
+        // where the attention is.
+        const vkm::Vec3 cam_fwd = input.camera.forward();
+        float focus_t = 60.0f;
+        if (cam_fwd.y < -0.01f) focus_t = input.camera.position.y / -cam_fwd.y;
+        focus_t = std::fmax(8.0f, std::fmin(focus_t, 90.0f));
+        const vkm::Vec3 focus = input.camera.position + cam_fwd * focus_t;
+        field.recenter(focus.x, focus.z);
+
+        // Scripted splash for reproducible captures: same frame, same place,
+        // same fixed virtual timestep, therefore the same pixels anywhere.
+        if (opt.splash >= 0 && frame_counter == opt.splash) {
+            ocean::Disturbance d;
+            d.world_x    = focus.x;
+            d.world_z    = focus.z;
+            d.radius     = input.impulse_radius;
+            d.strength   = input.impulse_strength;
+            d.velocity_y = -4.0f * input.impulse_strength;
+            field.add(d);
+            std::printf("scripted splash at (%.1f, %.1f) on frame %d\n", focus.x, focus.z, opt.splash);
+        }
+
+        if (input.click_pending) {
+            input.click_pending = false;
+
+            // The view-projection from LAST frame is the one the user was
+            // looking at when they clicked, and it is what is rebuilt below;
+            // rebuilding it here keeps the ray consistent with the pixels that
+            // were on screen.
+            const float aspect_now = static_cast<float>(ctx.extent.width) /
+                                     static_cast<float>(ctx.extent.height);
+            const vkm::Mat4 proj_now =
+                vkm::perspective(1.05f, aspect_now, 0.3f, 8000.0f);
+            const vkm::Mat4 view_now =
+                vkm::look_at(input.camera.position,
+                             input.camera.position + input.camera.forward(),
+                             {0.0f, 1.0f, 0.0f});
+            const vkm::Mat4 inv_vp = vkm::inverse(proj_now * view_now);
+
+            const vkm::Vec3 dir = pixel_ray(inv_vp, input.click_x, input.click_y,
+                                            ctx.extent.width, ctx.extent.height);
+            const RayHit h = raymarch_ocean(water, input.camera.position, dir,
+                                            2000.0f);
+            if (h.hit) {
+                ocean::Disturbance d;
+                d.world_x    = h.point.x;
+                d.world_z    = h.point.z;
+                d.radius     = input.impulse_radius;
+                d.strength   = input.impulse_strength;
+                // A rock arrives with downward momentum, not just displaced
+                // volume. Scaling with the crater depth keeps the two halves of
+                // the impact consistent as the debug slider moves.
+                d.velocity_y = -4.0f * input.impulse_strength;
+                d.kind       = ocean::SourceKind::Impulse;
+                field.add(d);
+                std::printf("splash at (%.2f, %.2f, %.2f) after %d march steps"
+                            "  [strength %.2f m, radius %.2f m]\n",
+                            h.point.x, h.point.y, h.point.z, h.steps,
+                            input.impulse_strength, input.impulse_radius);
+            } else {
+                std::printf("no surface hit (ray too shallow, or past the "
+                            "2 km march cap)\n");
+            }
+        }
+
+        const auto inter_start = std::chrono::steady_clock::now();
+        field.update(input.paused ? 0.0f : static_cast<float>(dt));
+        const double inter_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - inter_start).count();
+
         view.set_wireframe(input.wireframe);
 
         // --- draw ---------------------------------------------------------
@@ -457,21 +779,34 @@ int main(int argc, char** argv)
         globals.shading[2] = 0.0015f; // fog density
         globals.shading[3] = input.choppiness;
 
-        view.record(ctx, cmd, image_index, ctx.frame_index, stack, globals);
+        const ocean::InteractionBuffers ib = field.buffers();
+        globals.interaction[0] = ib.origin_x;
+        globals.interaction[1] = ib.origin_z;
+        globals.interaction[2] = ib.extent;
+        globals.interaction[3] = input.isolate ? 1.0f : 0.0f;
+
+        view.record(ctx, cmd, image_index, ctx.frame_index, stack, field, globals);
         ctx.end_frame(image_index);
 
         // --- HUD ----------------------------------------------------------
-        ocean_ms_avg = ocean_ms_avg * 0.95 + ocean_ms * 0.05;
+        ocean_ms_avg = ocean_ms_avg * 0.95 + (ocean_ms + inter_ms) * 0.05;
+        inter_ms_avg = inter_ms_avg * 0.95 + inter_ms * 0.05;
         fps_avg = fps_avg * 0.95 + (dt > 0.0 ? 1.0 / dt : 0.0) * 0.05;
         if (++frame_counter % 15 == 0) {
-            const float h = stack.height_at(input.camera.position.x,
+            // Queried through WaterSurface, so the number in the title bar
+            // includes the wake - the whole point of the combined query.
+            const float h = water.height_at(input.camera.position.x,
                                             input.camera.position.z);
-            char title[256];
+            char title[320];
             std::snprintf(title, sizeof(title),
-                          "oceanlib  |  %.0f fps  |  ocean %.2f ms  |  %ux%u  |  "
-                          "chop %.2f  |  water under camera %+.2f m%s",
-                          fps_avg, ocean_ms_avg, opt.size, opt.size,
-                          input.choppiness, h, input.paused ? "  [PAUSED]" : "");
+                          "oceanlib  |  %.0f fps  |  sim %.2f ms (wake %.2f)  |  "
+                          "%ux%u  |  chop %.2f  |  water %+.2f m  |  "
+                          "impulse %.2f m / r %.2f m%s%s",
+                          fps_avg, ocean_ms_avg, inter_ms_avg, opt.size, opt.size,
+                          input.choppiness, h,
+                          input.impulse_strength, input.impulse_radius,
+                          input.isolate ? "  [WAKE ONLY]" : "",
+                          input.paused ? "  [PAUSED]" : "");
             glfwSetWindowTitle(window, title);
         }
 

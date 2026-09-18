@@ -26,7 +26,30 @@ layout(set = 0, binding = 0) uniform Globals {
                        // largest/farthest scale)
     vec4 params;       // x = time, y = mesh resolution, z,w unused
     vec4 shading;      // x foam strength, y exposure, z fog density, w unused
+    vec4 interaction;  // xy = world position of the field's low corner,
+                       // z  = field extent in metres,
+                       // w  = 1 to show the interaction field in isolation
 } g;
+
+// The local interaction field (ADR-021): eta, dEta/dx, dEta/dz, dEta/dt.
+//
+// Sampled with CLAMP_TO_BORDER and a transparent-black border, which is the
+// EXACT OPPOSITE of the cascade textures above. Those are genuinely periodic,
+// so REPEAT is correct for them. This one is not periodic at all - a REPEAT
+// sampler here would tile the ripples from one splash across the entire ocean.
+layout(set = 0, binding = 7) uniform sampler2D uInteraction;
+
+vec4 interaction_sample(vec2 worldXZ)
+{
+    vec2 uv = (worldXZ - g.interaction.xy) / g.interaction.z;
+    // Explicit reject as well as the border colour: belt and braces, and it
+    // makes the intent legible rather than depending on sampler state set up
+    // several hundred lines away in C++.
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return vec4(0.0);
+    // textureLod, not texture: this helper is called from the vertex shader
+    // too, where there are no derivatives and an implicit LOD is undefined.
+    return textureLod(uInteraction, uv, 0.0);
+}
 
 const float kPi = 3.14159265359;
 

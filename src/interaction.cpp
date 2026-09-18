@@ -833,4 +833,59 @@ double InteractionField::energy() const noexcept
     return 0.5 * (kinetic + static_cast<double>(m.desc.gravity) * potential);
 }
 
+// ---------------------------------------------------------------------------
+// WaterSurface
+// ---------------------------------------------------------------------------
+
+WaterSurface::WaterSurface(const Ocean& o, const InteractionField& f) noexcept
+    : ocean_(&o), field_(&f) {}
+
+WaterSurface::WaterSurface(const CascadeStack& s, const InteractionField& f) noexcept
+    : stack_(&s), field_(&f) {}
+
+InteractionSample WaterSurface::interaction_at(float x, float z) const noexcept
+{
+    return field_->sample_at(x, z);
+}
+
+Surface WaterSurface::sample_at(float world_x, float world_z) const noexcept
+{
+    Surface s = stack_ ? stack_->sample_at(world_x, world_z)
+                       : ocean_->sample_at(world_x, world_z);
+    const InteractionSample e = field_->sample_at(world_x, world_z);
+
+    s.height += e.height;
+
+    // Compose through SLOPES, not by summing unit normals.
+    //
+    // Heights add in world space, so world-space slopes add too - that is an
+    // identity. Summing the two unit normals and renormalising, which is the
+    // usual reflex and what ADR-020 had to do for cascades, would be an
+    // approximation here for no reason: we have a genuine height field on one
+    // side, not a second already-normalised normal.
+    if (s.normal_y > 1.0e-6f) {
+        const float inv = 1.0f / s.normal_y;
+        const float sx = -s.normal_x * inv + e.slope_x;
+        const float sz = -s.normal_z * inv + e.slope_z;
+        const float len = std::sqrt(sx * sx + sz * sz + 1.0f);
+        const float il = 1.0f / len;
+        s.normal_x = -sx * il;
+        s.normal_y = il;
+        s.normal_z = -sz * il;
+    }
+    // normal_y <= 0 means the FFT surface has folded over itself (a breaking
+    // crest). There is no single well-defined slope there to add to, so the
+    // FFT normal is left as it stands rather than invented - the same honesty
+    // ADR-011 applies to the query inside a breaker.
+
+    return s;
+}
+
+float WaterSurface::height_at(float world_x, float world_z) const noexcept
+{
+    const float base = stack_ ? stack_->height_at(world_x, world_z)
+                              : ocean_->height_at(world_x, world_z);
+    return base + field_->height_at(world_x, world_z);
+}
+
 }  // namespace ocean

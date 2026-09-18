@@ -25,8 +25,10 @@ VkShaderModule make_module(VkDevice device, const std::uint32_t* code,
 }  // namespace
 
 bool OceanView::init(VkContext& ctx, const std::vector<ocean::OceanDesc>& levels,
-                     std::uint32_t mesh_resolution, std::uint32_t tiles)
+                     std::uint32_t mesh_resolution, std::uint32_t tiles,
+                     std::uint32_t interaction_size)
 {
+    interaction_size_ = interaction_size;
     level_count_ = levels.size();
     if (level_count_ == 0 || level_count_ > kMaxCascades) {
         std::fprintf(stderr,
@@ -172,6 +174,9 @@ bool OceanView::create_textures(VkContext& ctx)
             total_bytes += bytes;                // normal follows immediately after
             total_bytes += bytes;
         }
+        f.interaction_offset = total_bytes;
+        total_bytes += static_cast<VkDeviceSize>(interaction_size_) *
+                       interaction_size_ * 4 * sizeof(float);
 
         for (std::size_t i = 0; i < level_count_; ++i) {
             make_image(level_sizes_[i], f.levels[i].displacement,
@@ -179,6 +184,8 @@ bool OceanView::create_textures(VkContext& ctx)
             make_image(level_sizes_[i], f.levels[i].normal,
                       f.levels[i].normal_memory, f.levels[i].normal_view);
         }
+        make_image(interaction_size_, f.interaction, f.interaction_memory,
+                   f.interaction_view);
 
         ctx.create_buffer(total_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -261,6 +268,16 @@ bool OceanView::create_textures(VkContext& ctx)
     sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
     sci.maxLod       = 0.0f;
     vkCreateSampler(ctx.device, &sci, nullptr, &sampler_);
+
+    // The interaction field is NOT periodic, so it clamps to a transparent
+    // black border instead of repeating. Getting this wrong is not subtle once
+    // you see it - one splash tiles across the entire ocean - but it is very
+    // easy to get wrong by reusing the sampler that is already to hand.
+    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    sci.borderColor  = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    vkCreateSampler(ctx.device, &sci, nullptr, &clamp_sampler_);
     return true;
 }
 
@@ -278,7 +295,11 @@ bool OceanView::create_descriptors(VkContext& ctx)
     // fixed 3-cascade loop can read a harmless, valid image rather than an
     // unbound slot - simpler than making the shader loop count dynamic for a
     // demo that only ever runs with 1-3 fixed cascades.
-    constexpr std::uint32_t kBindingCount = 1 + 2 * static_cast<std::uint32_t>(kMaxCascades);
+    // Binding 7 is the interaction field, read by BOTH stages: the vertex
+    // shader adds its height, the fragment shader adds its slope.
+    constexpr std::uint32_t kInteractionBinding =
+        1 + 2 * static_cast<std::uint32_t>(kMaxCascades);
+    constexpr std::uint32_t kBindingCount = kInteractionBinding + 1;
     VkDescriptorSetLayoutBinding bindings[kBindingCount]{};
     bindings[0].binding         = 0;
     bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -303,6 +324,13 @@ bool OceanView::create_descriptors(VkContext& ctx)
         bindings[norm_binding].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
 
+    bindings[kInteractionBinding].binding         = kInteractionBinding;
+    bindings[kInteractionBinding].descriptorType  =
+        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[kInteractionBinding].descriptorCount = 1;
+    bindings[kInteractionBinding].stageFlags =
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
     VkDescriptorSetLayoutCreateInfo lci{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     lci.bindingCount = kBindingCount;
@@ -313,7 +341,8 @@ bool OceanView::create_descriptors(VkContext& ctx)
     sizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[0].descriptorCount = kFramesInFlight;
     sizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[1].descriptorCount = kFramesInFlight * 2 * static_cast<std::uint32_t>(kMaxCascades);
+    sizes[1].descriptorCount =
+        kFramesInFlight * (2 * static_cast<std::uint32_t>(kMaxCascades) + 1);
 
     VkDescriptorPoolCreateInfo pci{
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -380,6 +409,17 @@ bool OceanView::create_descriptors(VkContext& ctx)
             writes[norm_binding].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             writes[norm_binding].pImageInfo      = &norm_info[lvl];
         }
+
+        const VkDescriptorImageInfo inter_info{
+            clamp_sampler_, f.interaction_view,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        writes[kInteractionBinding].sType  = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[kInteractionBinding].dstSet = f.descriptor;
+        writes[kInteractionBinding].dstBinding      = kInteractionBinding;
+        writes[kInteractionBinding].descriptorCount = 1;
+        writes[kInteractionBinding].descriptorType  =
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[kInteractionBinding].pImageInfo = &inter_info;
 
         vkUpdateDescriptorSets(ctx.device, kBindingCount, writes, 0, nullptr);
     }
@@ -528,7 +568,9 @@ bool OceanView::create_pipelines(VkContext& ctx)
 
 void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
                        std::uint32_t image_index, std::uint32_t frame,
-                       const ocean::CascadeStack& stack, const Globals& globals)
+                       const ocean::CascadeStack& stack,
+                       const ocean::InteractionField& field,
+                       const Globals& globals)
 {
     FrameResources& f = frames_[frame];
 
@@ -545,6 +587,17 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
         auto* dst = static_cast<std::uint8_t*>(f.staging_mapped) + f.staging_offset[i];
         std::memcpy(dst, b.displacement, static_cast<std::size_t>(bytes));
         std::memcpy(dst + bytes, b.normal, static_cast<std::size_t>(bytes));
+    }
+
+    // One more memcpy for the interaction field - same story as the cascades,
+    // because InteractionBuffers uses the same RGBA32F-shaped layout.
+    {
+        const ocean::InteractionBuffers ib = field.buffers();
+        const VkDeviceSize bytes = static_cast<VkDeviceSize>(ib.size) * ib.size *
+                                   4 * sizeof(float);
+        std::memcpy(static_cast<std::uint8_t*>(f.staging_mapped) +
+                        f.interaction_offset,
+                    ib.field, static_cast<std::size_t>(bytes));
     }
 
     std::memcpy(f.uniform_mapped, &globals, sizeof(Globals));
@@ -596,6 +649,40 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
                              VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         }
         lvl.initialised = true;
+    }
+
+    {
+        const VkImageLayout old_layout =
+            f.interaction_initialised ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                      : VK_IMAGE_LAYOUT_UNDEFINED;
+        const VkPipelineStageFlags2 src_stage =
+            f.interaction_initialised ? VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                                      : VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+        const VkAccessFlags2 src_access =
+            f.interaction_initialised ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0;
+
+        transition_image(cmd, f.interaction, VK_IMAGE_ASPECT_COLOR_BIT,
+                         old_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         src_stage, src_access, VK_PIPELINE_STAGE_2_COPY_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent      = {interaction_size_, interaction_size_, 1};
+        copy.bufferOffset     = f.interaction_offset;
+        vkCmdCopyBufferToImage(cmd, f.staging, f.interaction,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+        transition_image(cmd, f.interaction, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COPY_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        f.interaction_initialised = true;
     }
 
     // --- render ----------------------------------------------------------
@@ -690,6 +777,11 @@ void OceanView::shutdown(VkContext& ctx)
             vkDestroyImage(ctx.device, lvl.normal, nullptr);
             vkFreeMemory(ctx.device, lvl.normal_memory, nullptr);
         }
+        if (f.interaction != VK_NULL_HANDLE) {
+            vkDestroyImageView(ctx.device, f.interaction_view, nullptr);
+            vkDestroyImage(ctx.device, f.interaction, nullptr);
+            vkFreeMemory(ctx.device, f.interaction_memory, nullptr);
+        }
     }
 
     vkDestroyImageView(ctx.device, dummy_displacement_view_, nullptr);
@@ -700,6 +792,7 @@ void OceanView::shutdown(VkContext& ctx)
     vkFreeMemory(ctx.device, dummy_normal_memory_, nullptr);
 
     vkDestroySampler(ctx.device, sampler_, nullptr);
+    vkDestroySampler(ctx.device, clamp_sampler_, nullptr);
     vkDestroyPipeline(ctx.device, ocean_pipeline_, nullptr);
     vkDestroyPipeline(ctx.device, ocean_wire_pipeline_, nullptr);
     vkDestroyPipeline(ctx.device, sky_pipeline_, nullptr);

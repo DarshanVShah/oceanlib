@@ -20,6 +20,7 @@ layout(location = 1) out vec2  vUV0;
 layout(location = 2) out vec2  vUV1;
 layout(location = 3) out vec2  vUV2;
 layout(location = 4) out float vFoam;
+layout(location = 5) out vec4  vInteraction;
 
 void main()
 {
@@ -59,7 +60,26 @@ void main()
     // summing them is not an approximation.
     vec3 dSum = d0.xyz + d1.xyz + d2.xyz;
 
-    vWorld = vec3(base.x + dSum.x, dSum.y, base.y + dSum.z);
+    // The interaction field is a pure HEIGHT field - no horizontal
+    // displacement - so it is sampled at the world position the vertex
+    // actually lands at, after the cascades have moved it sideways. Sampling
+    // at the undisplaced position would smear the ripples wherever choppiness
+    // is doing anything.
+    vec2 worldXZ = vec2(base.x + dSum.x, base.y + dSum.z);
+    vec4 inter = interaction_sample(worldXZ);
+    vInteraction = inter;
+
+    // Isolation mode: show ONLY the interaction field, on flat water, so the
+    // ripples can be read without the swell moving underneath them.
+    if (g.interaction.w > 0.5) {
+        vWorld = vec3(base.x, inter.x, base.y);
+        vUV0 = uv0; vUV1 = uv1; vUV2 = uv2;
+        vFoam = 0.0;
+        gl_Position = g.viewProj * vec4(vWorld, 1.0);
+        return;
+    }
+
+    vWorld = vec3(base.x + dSum.x, dSum.y + inter.x, base.y + dSum.z);
     vUV0   = uv0;
     vUV1   = uv1;
     vUV2   = uv2;

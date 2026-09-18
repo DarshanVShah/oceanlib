@@ -25,6 +25,7 @@
 // WaterSurface below composes them for queries.
 #pragma once
 
+#include "ocean/cascade.hpp"
 #include "ocean/ocean.hpp"
 
 #include <cstddef>
@@ -342,6 +343,58 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+// ---------------------------------------------------------------------------
+// Composition
+// ---------------------------------------------------------------------------
+
+// Combined queries over an FFT surface plus an interaction field, so a
+// floating object feels its own wake rather than only the swell.
+//
+// Holds NON-OWNING references. The referenced objects must outlive it, and it
+// reads whatever state they are in when a query is made - it does not step
+// anything itself. That keeps the stepping order the host's business: the
+// ocean advances on absolute time, the field on a delta, and neither one
+// should be hidden inside a query.
+//
+// WHY THE NORMAL COMPOSITION HERE IS EXACT, unlike ADR-020's cascade blend.
+// The FFT normal is the exact normal of the DISPLACED surface (ADR-010), so
+// its world-space slope is (-nx/ny, -nz/ny). The interaction field is a pure
+// height field over world position, so adding it adds its slopes:
+//
+//     sx = -nx/ny + dEta/dx
+//     sz = -nz/ny + dEta/dz
+//     n' = normalize(-sx, 1, -sz)
+//
+// Heights add in world space, therefore slopes add in world space. That is an
+// identity, not an approximation - which is why this does NOT use the
+// sum-the-unit-normals-and-renormalise trick ADR-020 had to settle for when
+// combining two already-normalised cascade normals.
+class WaterSurface {
+public:
+    WaterSurface(const Ocean& ocean, const InteractionField& field) noexcept;
+    WaterSurface(const CascadeStack& stack, const InteractionField& field) noexcept;
+
+    // Full surface query including the interaction field.
+    //
+    // Cost is the underlying FFT query (a fixed-point solve per cascade level,
+    // ADR-011) plus one bilinear tap into the interaction buffer - the field
+    // is a plain height field, so there is no second inversion to do. Measured
+    // overhead is in BENCHMARKS.md.
+    [[nodiscard]] Surface sample_at(float world_x, float world_z) const noexcept;
+    [[nodiscard]] float   height_at(float world_x, float world_z) const noexcept;
+
+    // The interaction field's own contribution at that position, for a caller
+    // that wants to separate wake from swell (the viewer's isolation toggle
+    // uses this).
+    [[nodiscard]] InteractionSample interaction_at(float world_x,
+                                                   float world_z) const noexcept;
+
+private:
+    const Ocean*            ocean_ = nullptr;
+    const CascadeStack*     stack_ = nullptr;
+    const InteractionField* field_ = nullptr;
 };
 
 }  // namespace ocean
