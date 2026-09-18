@@ -117,6 +117,20 @@ typedef struct ocean_desc {
      * fields here, at the true end - never inside a nested struct that is not
      * itself the last member. */
     float water_depth;
+
+    /* Compute the 3-D orbital velocity field as well. Non-zero to enable.
+     *
+     * Appended at the TRUE END of the struct, which is the only placement that
+     * keeps struct_size meaningful - see the comment on water_depth, and
+     * ADR-019 on why a field can hide in tail padding without changing
+     * sizeof(). An old caller who used ocean_desc_init() has a zero here,
+     * which is the correct default.
+     *
+     * The velocity itself is read through ocean_sample_ex() and
+     * ocean_buffers_ex(); ocean_surface and ocean_sample_at() are deliberately
+     * frozen, because ocean_surface is returned BY VALUE and growing it would
+     * break every binary already compiled against it. */
+    int32_t compute_velocity;
 } ocean_desc;
 
 /* Fills `desc` with the same defaults the C++ API uses. Callers should always
@@ -191,8 +205,39 @@ double ocean_get_time(const ocean_sim* sim);
 float ocean_height_at(const ocean_sim* sim, float world_x, float world_z);
 
 /* Same solve, also returning normal and foam. Cheaper than calling
- * ocean_height_at and then sampling separately. */
+ * ocean_height_at and then sampling separately.
+ *
+ * FROZEN. ocean_surface is returned by value, so appending a field to it would
+ * change the ABI of this function and corrupt the return slot of every binary
+ * already compiled against the old size. New outputs go in ocean_surface_ex
+ * below instead. This is the one case where struct_size cannot help: the
+ * caller does not pass this struct in, so there is nothing to version. */
 ocean_surface ocean_sample_at(const ocean_sim* sim, float world_x, float world_z);
+
+/* Everything ocean_surface carries, plus orbital velocity.
+ *
+ * A separate struct rather than an extension, for the reason above. Velocity
+ * is zero unless ocean_desc::compute_velocity was set. */
+typedef struct ocean_surface_ex {
+    float height;
+    float offset_x;
+    float offset_z;
+    float normal_x;
+    float normal_y;
+    float normal_z;
+    float foam;
+    float velocity_x;
+    float velocity_y;
+    float velocity_z;
+} ocean_surface_ex;
+
+void ocean_sample_ex(const ocean_sim* sim, float world_x, float world_z,
+                     ocean_surface_ex* out);
+
+/* The orbital velocity buffer, or NULL when compute_velocity was not set.
+ * N*N*4 floats: vx, vy, vz, 0 (reserved). Same lifetime rules as
+ * ocean_get_buffers. */
+const float* ocean_get_velocity(const ocean_sim* sim);
 
 /* -------------------------------------------------------------------------
  * Introspection
@@ -218,6 +263,156 @@ const char* ocean_force_simd_level(const char* name);
 
 /* Library version, for a host that loads the shared object dynamically. */
 void ocean_version(uint32_t* major, uint32_t* minor, uint32_t* patch);
+
+/* -------------------------------------------------------------------------
+ * Local interaction (ADR-021)
+ *
+ * A local height field, evolved by the iWave convolution and added on top of
+ * the FFT surface: objects disturb the water, the disturbance propagates and
+ * reflects, and queries see it.
+ *
+ * Deliberately a SEPARATE handle with a delta-time update, mirroring the C++
+ * API. ocean_update() takes ABSOLUTE time and is a pure function of
+ * (seed, desc, time); an interaction field is a time-stepped ODE and cannot
+ * be. Keeping them apart means that purity is not quietly demoted for callers
+ * who never asked for interaction.
+ * ------------------------------------------------------------------------- */
+
+typedef struct ocean_interaction ocean_interaction;
+
+/* How solid cells reflect. A rigid hull is no-normal-flow (Neumann) and
+ * reflects a crest as a CREST; zeroing the field (Dirichlet) is physically a
+ * pressure-release surface and flips the sign. */
+typedef enum ocean_obstruction {
+    OCEAN_OBSTRUCTION_NEUMANN   = 0,  /* dEta/dn = 0; correct for hulls   */
+    OCEAN_OBSTRUCTION_DIRICHLET = 1   /* eta = 0; the published iWave     */
+} ocean_obstruction;
+
+typedef enum ocean_source_kind {
+    OCEAN_SOURCE_IMPULSE    = 0,  /* one-off; strength in metres          */
+    OCEAN_SOURCE_CONTINUOUS = 1   /* ongoing; strength in metres/second   */
+} ocean_source_kind;
+
+typedef struct ocean_interaction_desc {
+    /* MUST be set to sizeof(ocean_interaction_desc). Same version tag, same
+     * rules, as ocean_desc: append only, at the true end. */
+    size_t struct_size;
+
+    uint32_t size;          /* grid resolution N, power of two in [32, 1024] */
+    float    extent;        /* world edge length, metres                     */
+    uint32_t kernel_radius; /* P; stencil is (2P+1)^2 taps                   */
+    float    damping;       /* alpha, 1/s                                    */
+    uint32_t absorb_cells;  /* width of the absorbing layer, in cells        */
+    float    fixed_dt;      /* 0 = derive a safe default                     */
+    uint32_t max_substeps;  /* spiral-of-death clamp                         */
+    uint32_t max_sources;   /* queue capacity; submitting never allocates    */
+    float    gravity;
+    float    water_depth;   /* <= 0 = deep water                             */
+    int32_t  obstruction;   /* ocean_obstruction                             */
+
+    ocean_parallel_for_fn parallel_for;      /* NULL = built-in thread pool  */
+    void*                 parallel_for_user;
+    uint32_t              thread_count;
+} ocean_interaction_desc;
+
+/* Fills with the same defaults the C++ API uses, and sets struct_size.
+ * Callers should always start here. */
+void ocean_interaction_desc_init(ocean_interaction_desc* desc);
+
+ocean_interaction* ocean_interaction_create(const ocean_interaction_desc* desc,
+                                            ocean_status* out_status);
+void ocean_interaction_destroy(ocean_interaction* field);
+
+/* One disturbance, in WORLD space.
+ *
+ * `radius` is a wavelength selector, not a vague size: the profile's transform
+ * peaks at sqrt(2)/radius, so the dominant emitted wavelength is about
+ * 4.44*radius. `strength` is the depth of the central depression (metres for
+ * an impulse, metres/second for a continuous source). `velocity_y` is the
+ * vertical speed imparted to the water, negative for a falling rock -
+ * genuinely different from strength, which says the water HAS been pushed
+ * down rather than that it is STILL being pushed. */
+typedef struct ocean_disturbance {
+    float world_x;
+    float world_z;
+    float radius;
+    float strength;
+    float velocity_y;
+    float velocity_x;   /* horizontal motion of the source itself, m/s */
+    float velocity_z;
+    int32_t kind;       /* ocean_source_kind */
+} ocean_disturbance;
+
+/* Queue a disturbance. Never allocates; dropped and counted if the queue is
+ * full. Immediate-mode by design - no handles, so there is no lifetime or
+ * ownership question to answer across this boundary. */
+void     ocean_interaction_add(ocean_interaction* field,
+                               const ocean_disturbance* d);
+uint64_t ocean_interaction_dropped(const ocean_interaction* field);
+
+/* Advance by dt seconds of wall time. Runs a whole number of fixed internal
+ * timesteps from an accumulator, so behaviour does not change with frame rate.
+ * Performs no heap allocation. */
+void ocean_interaction_update(ocean_interaction* field, float dt);
+
+/* Move the field so it is centred as close to (x, z) as a whole number of
+ * cells allows. The shift is exact - nothing is resampled - so there is no
+ * jolt. Returns non-zero if the grid actually moved, which is when a host
+ * owning a world-space obstruction mask must refresh it. */
+int32_t ocean_interaction_recenter(ocean_interaction* field, float world_x,
+                                   float world_z);
+
+/* Mark cells solid. `mask` is size*size bytes, row-major, non-zero = solid.
+ * Copied. NULL clears. Not a per-frame call. */
+void ocean_interaction_set_obstruction(ocean_interaction* field,
+                                       const uint8_t* mask);
+
+typedef struct ocean_interaction_buffers {
+    /* N*N*4 floats: eta, dEta/dx, dEta/dz, dEta/dt.
+     *
+     * NOT periodic. Sample with CLAMP_TO_BORDER and a zero border, never
+     * REPEAT - the exact opposite of the FFT buffers, and a REPEAT sampler
+     * here tiles one splash across the whole ocean. */
+    const float* field;
+    uint32_t     size;
+    float        extent;
+    float        origin_x;   /* world position of cell (0,0); changes on a  */
+    float        origin_z;   /* recentre, so read it every frame            */
+} ocean_interaction_buffers;
+
+ocean_interaction_buffers ocean_interaction_get_buffers(
+    const ocean_interaction* field);
+
+typedef struct ocean_interaction_sample {
+    float height;
+    float slope_x;
+    float slope_z;
+    float velocity_y;
+} ocean_interaction_sample;
+
+void  ocean_interaction_sample_at(const ocean_interaction* field, float world_x,
+                                  float world_z,
+                                  ocean_interaction_sample* out);
+float ocean_interaction_height_at(const ocean_interaction* field, float world_x,
+                                  float world_z);
+
+/* The timestep actually in use, and the largest one this configuration is
+ * stable at (derived from the kernel's realised symbol, not from theory).
+ * Note that stable is not accurate: at the limit the shortest waves are
+ * stable and about 57% wrong in frequency. */
+float ocean_interaction_fixed_dt(const ocean_interaction* field);
+float ocean_interaction_dt_limit(const ocean_interaction* field);
+
+/* Peak relative error of the kernel's dispersion symbol over the band it
+ * claims. The wave-SPEED error is half this. */
+float ocean_interaction_dispersion_error(const ocean_interaction* field);
+
+/* Combined query: the FFT surface plus the interaction field, with normals
+ * composed through slopes (exact - heights adding in world space means
+ * world-space slopes add). */
+void ocean_sample_combined(const ocean_sim* sim, const ocean_interaction* field,
+                           float world_x, float world_z,
+                           ocean_surface_ex* out);
 
 #if defined(__cplusplus)
 }  /* extern "C" */

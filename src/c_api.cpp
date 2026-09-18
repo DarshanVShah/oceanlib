@@ -6,6 +6,8 @@
 
 #include "ocean/ocean.h"
 
+#include "ocean/interaction.hpp"
+
 #include "core/cpu_features.hpp"
 #include "ocean/ocean.hpp"
 
@@ -88,6 +90,7 @@ ocean::OceanDesc translate(const ocean_desc& c)
         reinterpret_cast<ocean::ParallelForFn>(c.parallel_for);
     d.parallel_for_user = c.parallel_for_user;
     d.thread_count      = c.thread_count;
+    d.compute_velocity  = (c.compute_velocity != 0);
     return d;
 }
 
@@ -132,6 +135,7 @@ void ocean_desc_init(ocean_desc* desc)
     desc->seed           = d.seed;
     desc->thread_count   = d.thread_count;
     desc->water_depth    = d.spectrum.depth;
+    desc->compute_velocity = d.compute_velocity ? 1 : 0;
 }
 
 ocean_sim* ocean_create(const ocean_desc* desc, ocean_status* out_status)
@@ -247,5 +251,271 @@ void ocean_version(uint32_t* major, uint32_t* minor, uint32_t* patch)
     if (minor != nullptr) *minor = 0;
     if (patch != nullptr) *patch = 0;
 }
+void ocean_sample_ex(const ocean_sim* sim, float world_x, float world_z,
+                     ocean_surface_ex* out)
+{
+    if (out == nullptr) return;
+    std::memset(out, 0, sizeof(*out));
+    out->normal_y = 1.0f;
+    if (sim == nullptr) return;
+
+    const ocean::Surface s = to_cpp(sim)->sample_at(world_x, world_z);
+    out->height     = s.height;
+    out->offset_x   = s.offset_x;
+    out->offset_z   = s.offset_z;
+    out->normal_x   = s.normal_x;
+    out->normal_y   = s.normal_y;
+    out->normal_z   = s.normal_z;
+    out->foam       = s.foam;
+    out->velocity_x = s.velocity_x;
+    out->velocity_y = s.velocity_y;
+    out->velocity_z = s.velocity_z;
+}
+
+const float* ocean_get_velocity(const ocean_sim* sim)
+{
+    if (sim == nullptr) return nullptr;
+    return to_cpp(sim)->buffers().velocity;
+}
+
+// ---------------------------------------------------------------------------
+// Interaction
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Named distinctly rather than overloading to_cpp: these live inside the
+// extern "C" block, where overloading is not allowed.
+ocean::InteractionField* to_field(ocean_interaction* f) noexcept
+{
+    return reinterpret_cast<ocean::InteractionField*>(f);
+}
+const ocean::InteractionField* to_cfield(const ocean_interaction* f) noexcept
+{
+    return reinterpret_cast<const ocean::InteractionField*>(f);
+}
+ocean_interaction* field_to_c(ocean::InteractionField* f) noexcept
+{
+    return reinterpret_cast<ocean_interaction*>(f);
+}
+
+// Same struct_size contract as copy_desc(): a caller's smaller struct is a
+// byte-for-byte PREFIX of ours, so copy exactly what they provided and leave
+// our defaults in the rest. A LARGER struct_size is an error rather than a
+// truncation - that caller was built against a newer header, and silently
+// ignoring a field they believe they set is worse than refusing.
+bool copy_interaction_desc(const ocean_interaction_desc* src,
+                           ocean_interaction_desc& dst) noexcept
+{
+    if (src == nullptr) return false;
+    if (src->struct_size == 0 ||
+        src->struct_size > sizeof(ocean_interaction_desc)) {
+        return false;
+    }
+    ocean_interaction_desc_init(&dst);
+    std::memcpy(&dst, src, src->struct_size);
+    dst.struct_size = sizeof(ocean_interaction_desc);
+    return true;
+}
+
+ocean::InteractionDesc translate(const ocean_interaction_desc& c) noexcept
+{
+    ocean::InteractionDesc d;
+    d.size          = c.size;
+    d.extent        = c.extent;
+    d.kernel_radius = c.kernel_radius;
+    d.damping       = c.damping;
+    d.absorb_cells  = c.absorb_cells;
+    d.fixed_dt      = c.fixed_dt;
+    d.max_substeps  = c.max_substeps;
+    d.max_sources   = c.max_sources;
+    d.gravity       = c.gravity;
+    d.depth         = c.water_depth;
+    d.obstruction   = (c.obstruction == OCEAN_OBSTRUCTION_DIRICHLET)
+                          ? ocean::Obstruction::Dirichlet
+                          : ocean::Obstruction::Neumann;
+    // Layout-identical by construction, so this is a cast and not a
+    // trampoline on the hot path - exactly as for OceanDesc.
+    d.parallel_for      = reinterpret_cast<ocean::ParallelForFn>(c.parallel_for);
+    d.parallel_for_user = c.parallel_for_user;
+    d.thread_count      = c.thread_count;
+    return d;
+}
+
+}  // namespace
+
+void ocean_interaction_desc_init(ocean_interaction_desc* desc)
+{
+    if (desc == nullptr) return;
+    // Read from the C++ defaults rather than restating them, so the two APIs
+    // cannot drift.
+    const ocean::InteractionDesc d{};
+    std::memset(desc, 0, sizeof(*desc));
+    desc->struct_size   = sizeof(ocean_interaction_desc);
+    desc->size          = d.size;
+    desc->extent        = d.extent;
+    desc->kernel_radius = d.kernel_radius;
+    desc->damping       = d.damping;
+    desc->absorb_cells  = d.absorb_cells;
+    desc->fixed_dt      = d.fixed_dt;
+    desc->max_substeps  = d.max_substeps;
+    desc->max_sources   = d.max_sources;
+    desc->gravity       = d.gravity;
+    desc->water_depth   = d.depth;
+    desc->obstruction   = (d.obstruction == ocean::Obstruction::Dirichlet)
+                              ? OCEAN_OBSTRUCTION_DIRICHLET
+                              : OCEAN_OBSTRUCTION_NEUMANN;
+    desc->thread_count  = d.thread_count;
+}
+
+ocean_interaction* ocean_interaction_create(const ocean_interaction_desc* desc,
+                                            ocean_status* out_status)
+{
+    auto fail = [&](ocean_status st) -> ocean_interaction* {
+        if (out_status != nullptr) *out_status = st;
+        return nullptr;
+    };
+
+    ocean_interaction_desc resolved;
+    if (!copy_interaction_desc(desc, resolved)) {
+        return fail(OCEAN_ERROR_INVALID_ARG);
+    }
+    try {
+        auto* f = new ocean::InteractionField(translate(resolved));
+        if (out_status != nullptr) *out_status = OCEAN_OK;
+        return field_to_c(f);
+    } catch (const std::invalid_argument&) {
+        return fail(OCEAN_ERROR_INVALID_ARG);
+    } catch (const std::bad_alloc&) {
+        return fail(OCEAN_ERROR_OUT_OF_MEMORY);
+    } catch (...) {
+        return fail(OCEAN_ERROR_UNKNOWN);
+    }
+}
+
+void ocean_interaction_destroy(ocean_interaction* field)
+{
+    delete to_field(field);
+}
+
+void ocean_interaction_add(ocean_interaction* field, const ocean_disturbance* d)
+{
+    if (field == nullptr || d == nullptr) return;
+    ocean::Disturbance s;
+    s.world_x    = d->world_x;
+    s.world_z    = d->world_z;
+    s.radius     = d->radius;
+    s.strength   = d->strength;
+    s.velocity_y = d->velocity_y;
+    s.velocity_x = d->velocity_x;
+    s.velocity_z = d->velocity_z;
+    s.kind = (d->kind == OCEAN_SOURCE_CONTINUOUS) ? ocean::SourceKind::Continuous
+                                                  : ocean::SourceKind::Impulse;
+    to_field(field)->add(s);
+}
+
+uint64_t ocean_interaction_dropped(const ocean_interaction* field)
+{
+    return field == nullptr ? 0u : to_cfield(field)->dropped_sources();
+}
+
+void ocean_interaction_update(ocean_interaction* field, float dt)
+{
+    if (field == nullptr) return;
+    to_field(field)->update(dt);
+}
+
+int32_t ocean_interaction_recenter(ocean_interaction* field, float world_x,
+                                   float world_z)
+{
+    if (field == nullptr) return 0;
+    to_field(field)->recenter(world_x, world_z);
+    return to_field(field)->recentered() ? 1 : 0;
+}
+
+void ocean_interaction_set_obstruction(ocean_interaction* field,
+                                       const uint8_t* mask)
+{
+    if (field == nullptr) return;
+    to_field(field)->set_obstruction(mask);
+}
+
+ocean_interaction_buffers ocean_interaction_get_buffers(
+    const ocean_interaction* field)
+{
+    ocean_interaction_buffers b{};
+    if (field == nullptr) return b;
+    const ocean::InteractionBuffers ib = to_cfield(field)->buffers();
+    b.field    = ib.field;
+    b.size     = ib.size;
+    b.extent   = ib.extent;
+    b.origin_x = ib.origin_x;
+    b.origin_z = ib.origin_z;
+    return b;
+}
+
+void ocean_interaction_sample_at(const ocean_interaction* field, float world_x,
+                                 float world_z, ocean_interaction_sample* out)
+{
+    if (out == nullptr) return;
+    std::memset(out, 0, sizeof(*out));
+    if (field == nullptr) return;
+    const ocean::InteractionSample s = to_cfield(field)->sample_at(world_x, world_z);
+    out->height     = s.height;
+    out->slope_x    = s.slope_x;
+    out->slope_z    = s.slope_z;
+    out->velocity_y = s.velocity_y;
+}
+
+float ocean_interaction_height_at(const ocean_interaction* field, float world_x,
+                                  float world_z)
+{
+    return field == nullptr ? 0.0f : to_cfield(field)->height_at(world_x, world_z);
+}
+
+float ocean_interaction_fixed_dt(const ocean_interaction* field)
+{
+    return field == nullptr ? 0.0f : to_cfield(field)->fixed_dt();
+}
+
+float ocean_interaction_dt_limit(const ocean_interaction* field)
+{
+    return field == nullptr ? 0.0f : to_cfield(field)->stable_dt_limit();
+}
+
+float ocean_interaction_dispersion_error(const ocean_interaction* field)
+{
+    return field == nullptr ? 0.0f
+                            : to_cfield(field)->kernel_dispersion_error();
+}
+
+void ocean_sample_combined(const ocean_sim* sim, const ocean_interaction* field,
+                           float world_x, float world_z, ocean_surface_ex* out)
+{
+    if (out == nullptr) return;
+    if (field == nullptr) { ocean_sample_ex(sim, world_x, world_z, out); return; }
+    if (sim == nullptr) {
+        std::memset(out, 0, sizeof(*out));
+        out->normal_y = 1.0f;
+        const ocean::InteractionSample e =
+            to_cfield(field)->sample_at(world_x, world_z);
+        out->height     = e.height;
+        out->velocity_y = e.velocity_y;
+        return;
+    }
+    const ocean::WaterSurface water{*to_cpp(sim), *to_cfield(field)};
+    const ocean::Surface s = water.sample_at(world_x, world_z);
+    out->height     = s.height;
+    out->offset_x   = s.offset_x;
+    out->offset_z   = s.offset_z;
+    out->normal_x   = s.normal_x;
+    out->normal_y   = s.normal_y;
+    out->normal_z   = s.normal_z;
+    out->foam       = s.foam;
+    out->velocity_x = s.velocity_x;
+    out->velocity_y = s.velocity_y;
+    out->velocity_z = s.velocity_z;
+}
+
 
 }  // extern "C"
