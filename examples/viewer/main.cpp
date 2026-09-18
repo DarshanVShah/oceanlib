@@ -33,6 +33,7 @@
                             // deliberately uses only public headers
 #include "ocean/ocean.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -355,6 +356,12 @@ int main(int argc, char** argv)
     double ocean_ms_avg = 0.0;
     double gpu_ms_avg = 0.0;
     double fps_avg = 0.0;
+    // Laptop GPU clock/power-state variance is real (same reasoning
+    // BENCHMARKS.md already applies to the CPU side): an exponential moving
+    // average read at one instant can land anywhere in that swing, so
+    // --screenshot mode instead collects every valid per-frame sample here
+    // and reports the median and minimum at exit, not the running average.
+    std::vector<double> gpu_ms_samples;
     int    frame_counter = 0;
     std::uint32_t last_image = 0;
 
@@ -481,7 +488,10 @@ int main(int argc, char** argv)
         ocean_ms_avg = ocean_ms_avg * 0.95 + ocean_ms * 0.05;
         // gpu_ms is 0 for the first couple of frames (see last_gpu_ms), which
         // would drag the running average down artificially - skip those.
-        if (gpu_ms > 0.0) gpu_ms_avg = gpu_ms_avg * 0.95 + gpu_ms * 0.05;
+        if (gpu_ms > 0.0) {
+            gpu_ms_avg = gpu_ms_avg * 0.95 + gpu_ms * 0.05;
+            gpu_ms_samples.push_back(gpu_ms);
+        }
         fps_avg = fps_avg * 0.95 + (dt > 0.0 ? 1.0 / dt : 0.0) * 0.05;
         if (++frame_counter % 15 == 0) {
             const float h = stack.height_at(input.camera.position.x,
@@ -500,8 +510,12 @@ int main(int argc, char** argv)
                 std::printf("wrote %s (%ux%u)\n", opt.screenshot.c_str(),
                             ctx.extent.width, ctx.extent.height);
             }
-            std::printf("gpu frame time: %.3f ms (exponential moving average, decay 0.95)  |  %u triangles/frame\n",
-                        gpu_ms_avg, view.triangle_count());
+            std::vector<double> sorted = gpu_ms_samples;
+            std::sort(sorted.begin(), sorted.end());
+            const double median = sorted.empty() ? 0.0 : sorted[sorted.size() / 2];
+            const double best   = sorted.empty() ? 0.0 : sorted.front();
+            std::printf("gpu frame time: median %.3f ms, best %.3f ms, over %zu samples  |  %u triangles/frame\n",
+                        median, best, sorted.size(), view.triangle_count());
             break;
         }
     }
