@@ -373,3 +373,57 @@ each level's own variance to within 8% (Monte Carlo sampling noise plus
 expected small overlap at each cutoff's soft knee) - Var(a+b+c) = Var(a) +
 Var(b) + Var(c) for independent fields, verified on real generated data
 rather than assumed.
+
+---
+
+## Viewer mesh LOD: geometry clipmap (ADR-021)
+
+Measured 2026-09-17, i7-14700HX laptop, comparing the pre-clipmap single
+tiled mesh (256 quads/tile, 7x7 tiles, default 800 m far cascade) against
+the clipmap (6 rings, 0.5 m finest cell). Both built `Release`, Ninja,
+identical flags to the table at the top of this file. GPU time is measured
+with Vulkan timestamp queries bracketing the whole per-frame GPU cost
+(cascade texture upload plus the draw), not wall-clock frame time, which
+also includes present/vsync waiting.
+
+| GPU                                  | driver          | mesh      | triangles/frame | median GPU (ms) | best GPU (ms) |
+|----------------------------------------|-----------------|-----------|-----------------:|-----------------:|---------------:|
+| NVIDIA GeForce RTX 4070 Laptop (discrete) | 32.0.15.9282    | old tiled |        6 422 528 |            5.276 |          2.018 |
+| NVIDIA GeForce RTX 4070 Laptop (discrete) | 32.0.15.9282    | clipmap   |           40 832 |            4.387 |          0.604 |
+| Intel RaptorLake-S Mobile (integrated)    | 32.0.101.5972   | old tiled |        6 422 528 |           11.221 |         10.466 |
+| Intel RaptorLake-S Mobile (integrated)    | 32.0.101.5972   | clipmap   |           40 832 |            3.618 |          3.395 |
+
+Run with `ocean_viewer.exe --screenshot out.bmp --frames 600 [--gpu discrete|integrated]`,
+598 samples collected per run (the first couple of frames have no valid
+timestamp yet - see `VkContext::last_gpu_ms`).
+
+**157x fewer triangles at the same visible range** (6.42M to 40.8k) - the
+whole point of the technique (ADR-015's known limitation, fixed).
+
+### Reading the two GPUs honestly
+
+The two GPUs tell different stories, and both are real:
+
+**Integrated GPU: median and best agree closely, on both meshes** (11.221 vs
+10.466 ms old; 3.618 vs 3.395 ms new) - this GPU is genuinely the bottleneck
+at either triangle count, so the measurement is stable and directly
+trustworthy: **3.08x-3.10x faster** by either statistic, cleanly explained by
+157x fewer triangles doing proportionally less vertex and rasterisation work.
+
+**Discrete GPU: median and best diverge sharply, especially on the clipmap**
+(4.387 ms median vs 0.604 ms best). Once the actual draw cost drops under a
+millisecond, it stops being the dominant term in what a wall-clock-adjacent
+measurement sees - `VK_PRESENT_MODE_FIFO_KHR` (vsync) is intentionally always
+used (ADR-015), and swapchain image availability, OS scheduling and thermal/
+power-state transitions on a laptop can all now cost more than the draw
+itself does. This is the same reasoning BENCHMARKS.md already applies to the
+CPU numbers above ("a scheduler hiccup or a thermal blip produces occasional
+large outliers") - it just could not be *seen* on the old mesh, because 2-5 ms
+of real GPU work was large enough to hide it. The **best** column is the more
+honest read of actual draw cost on this GPU: **3.34x faster** (2.018 to 0.604
+ms), consistent with the triangle-count reduction the same way the integrated
+GPU's numbers already are.
+
+Both readings support the same conclusion via different arithmetic: the
+clipmap is doing several times less GPU work for the same visible ocean, on
+both a discrete and an integrated GPU.

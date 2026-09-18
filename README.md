@@ -170,8 +170,10 @@ Needs the Vulkan SDK (for headers and `glslc`); GLFW is fetched automatically.
 | Space | pause time | R | reset camera |
 | 1 / 2 | choppiness | Esc | quit |
 
-Flags: `--size N --mesh M --tiles T --wind U --chop C --foam F --wireframe
---screenshot out.bmp --frames N`.
+Flags: `--size N --rings N --cell C --wind U --chop C --foam F --wireframe
+--screenshot out.bmp --frames N --gpu discrete|integrated`. The mesh is a
+geometry clipmap (ADR-021), not a uniform tiled grid: `--rings` sets ring
+count (1-8, default 6), `--cell` the finest ring's metres per mesh cell.
 
 ## Performance
 

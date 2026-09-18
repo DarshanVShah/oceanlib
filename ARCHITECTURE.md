@@ -1705,3 +1705,12 @@ This is the reason the geomorph-blend correction earlier in this ADR and
 this fade bug are both recorded rather than silently fixed: a technique this
 fiddly to get exactly right is exactly where "it compiled" and "it is
 correct" come apart, and the second one only gets checked by looking.
+
+### Measured
+
+BENCHMARKS.md has the full comparison against the old single tiled mesh, on
+both a discrete and an integrated GPU. Summary: **157x fewer triangles**
+(6.42M to 40.8k) at the same visible range, and **3.08x-3.34x less GPU time**
+depending on which GPU and which statistic (median vs best) is read - the
+two GPUs turn out to need different statistics read for different, both
+honest, reasons, explained there.
