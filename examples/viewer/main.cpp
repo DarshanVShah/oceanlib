@@ -449,9 +449,10 @@ int main(int argc, char** argv)
         // frames ago) is guaranteed complete and its GPU time is valid now.
         const double gpu_ms = ctx.last_gpu_ms();
 
+        constexpr float kFovY = 1.05f;  // radians; also fed to the shader below
         const float aspect = static_cast<float>(ctx.extent.width) /
                              static_cast<float>(ctx.extent.height);
-        const vkm::Mat4 proj = vkm::perspective(1.05f, aspect, 0.3f, 8000.0f);
+        const vkm::Mat4 proj = vkm::perspective(kFovY, aspect, 0.3f, 8000.0f);
         const vkm::Mat4 viewm = vkm::look_at(
             input.camera.position, input.camera.position + fwd, {0.0f, 1.0f, 0.0f});
 
@@ -469,8 +470,8 @@ int main(int argc, char** argv)
         globals.cascade_patch[2] = (levels.size() > 2) ? levels[2].patch_length : levels[0].patch_length;
         globals.cascade_patch[3] = static_cast<float>(opt.size);  // cascade grid resolution N
         globals.params[0]  = static_cast<float>(sim_time);
-        globals.params[1]  = 0.0f;
-        globals.params[2]  = 0.0f;
+        globals.params[1]  = kFovY;
+        globals.params[2]  = static_cast<float>(ctx.extent.height);
         globals.params[3]  = 0.0f;
         globals.shading[0] = 1.0f;     // foam strength
         globals.shading[1] = 1.15f;    // exposure

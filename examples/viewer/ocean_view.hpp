@@ -36,7 +36,10 @@ struct Globals {
     float     cam_pos[4];
     float     sun_dir[4];
     float     cascade_patch[4];  // x,y,z = patch_length of cascades 0,1,2; w = cascade grid resolution N
-    float     params[4];         // x = time, y,z,w unused
+    float     params[4];         // x = time, y = vertical FOV (radians),
+                                  // z = viewport height (pixels), w unused -
+                                  // y,z feed the vertex shader's screen-space
+                                  // subpixel test for the cascade fade (ADR-021)
     float     shading[4];        // foam strength, exposure, fog density, unused
 };
 

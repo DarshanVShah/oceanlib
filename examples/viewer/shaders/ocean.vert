@@ -65,31 +65,40 @@ void main()
     vec2 uv1 = base / patchLen1;
     vec2 uv2 = base / patchLen2;
 
-    // --- fine-cascade distance fade -----------------------------------------
+    // --- fine-cascade subpixel fade -----------------------------------------
     //
-    // Far enough out, the local mesh resolution is already several times
-    // coarser than a cascade's own texel size, so that cascade's high-
-    // frequency content is being undersampled by the MESH regardless of
-    // what the texture holds - the triangle spans many texels, so the fine
-    // ripples it carries are already averaged away geometrically. Sampling
-    // and summing it at that point buys nothing but bandwidth and a risk of
-    // shimmer from an undersampled signal, so fade it to zero smoothly.
-    // Cascade 0 (the big swell) never fades - it is always the coarsest
-    // scale present, so it is never the one being oversampled by the mesh.
+    // "Subpixel" means exactly that: a cascade's texel projects to less than
+    // one screen pixel. Past that point its high-frequency content cannot be
+    // resolved regardless of what the texture holds, so sampling and summing
+    // it buys nothing but bandwidth and a risk of shimmer from an
+    // undersampled signal - fade it to zero smoothly instead. Cascade 0 (the
+    // big swell) never fades - its texels are the largest of the three, so
+    // it is never the one going subpixel first.
     //
-    // Driven by world-space distance from the camera, NOT by ring.cellSize:
-    // cellSize is a per-ring CONSTANT that doubles discretely at every ring
-    // boundary, so fading on it would make a cascade's contribution jump
-    // between two different values exactly at that boundary - a real height
-    // discontinuity between the last vertex of one ring and the first of the
-    // next, independent of how well the mesh itself is stitched. Distance is
-    // continuous across the whole clipmap, including at ring seams, so this
-    // has no jump to begin with.
-    float distFromCam = length(base - g.camPos.xz);
+    // A first version of this drove the fade from ring.cellSize (mesh
+    // resolution) and, separately, from an arbitrary multiple of texel size -
+    // both were wrong: the first made a cascade's contribution jump at every
+    // ring boundary (fixed by switching to distance, see the ADR), and the
+    // second was never checked against a real image and turned out to fade
+    // the near cascade out by 15 m from the camera, visibly flattening the
+    // water (see BENCHMARKS.md / ADR-021's account of the regression). This
+    // version instead computes the actual world-space footprint of one
+    // screen pixel at this vertex's distance - the standard perspective
+    // relationship, footprint = 2 * distance * tan(fovY/2) / viewportHeight -
+    // and compares each cascade's OWN texel size against it directly. That
+    // is what "subpixel" literally means, so there is no arbitrary constant
+    // left to get wrong: get the projection math right and the threshold
+    // falls out of it.
+    float distFromCam   = length(base - g.camPos.xz);
+    float pixelFootprint = 2.0 * distFromCam * tan(g.params.y * 0.5) / g.params.z;
     float texel1 = patchLen1 / cascadeN;
     float texel2 = patchLen2 / cascadeN;
-    vFade1 = 1.0 - smoothstep(texel1 * 40.0, texel1 * 160.0, distFromCam);
-    vFade2 = 1.0 - smoothstep(texel2 * 40.0, texel2 * 160.0, distFromCam);
+    // Fade over a 4x range of the texel-to-pixel ratio, centred where a
+    // texel and a pixel are the same size (ratio 1): comfortably resolved
+    // (ratio >= 2, a texel spans at least 2 pixels) down to clearly aliasing
+    // (ratio <= 0.5, at least 2 texels landing in one pixel).
+    vFade1 = smoothstep(0.5, 2.0, texel1 / pixelFootprint);
+    vFade2 = smoothstep(0.5, 2.0, texel2 / pixelFootprint);
 
     // textureLod, not texture: a vertex shader has no derivatives, so an
     // implicit-LOD sample would be undefined here.

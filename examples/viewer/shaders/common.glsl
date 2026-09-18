@@ -26,7 +26,9 @@ layout(set = 0, binding = 0) uniform Globals {
                        // one N - see main.cpp), used to fade fine cascades
                        // out once a clipmap ring's own cell size is already
                        // coarser than that cascade's texel size (ADR-021)
-    vec4 params;       // x = time, y,z,w unused
+    vec4 params;       // x = time, y = vertical FOV (radians), z = viewport
+                       // height (px), w unused - y,z feed the screen-space
+                       // subpixel test for the cascade fade (ADR-021)
     vec4 shading;      // x foam strength, y exposure, z fog density, w unused
 } g;
 

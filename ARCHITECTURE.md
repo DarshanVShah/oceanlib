@@ -1714,3 +1714,46 @@ both a discrete and an integrated GPU. Summary: **157x fewer triangles**
 depending on which GPU and which statistic (median vs best) is read - the
 two GPUs turn out to need different statistics read for different, both
 honest, reasons, explained there.
+
+### A second regression, caught the same way as the first: by looking
+
+Numbers passing and the mesh being crack-free did not mean the ocean still
+*looked* right. Compared side by side against `docs/ocean-cascades.png` (the
+reference the README ships), the water was visibly flatter and blurrier -
+fine ripple detail that should be visible well past the near field was gone.
+
+The cause was the fine-cascade fade, not the clipmap: the first version
+faded a cascade's contribution once a ring's own `cellSize` grew past a
+handful of arbitrary multiples of that cascade's texel size. Worked out in
+world units, the near cascade (25 m patch, the one carrying all the small
+ripple detail) was fully faded by **15.6 m from the camera** - never
+validated against a real image, it turned out to be wrong by roughly an
+order of magnitude.
+
+Disabling the fade entirely and re-comparing against the reference
+confirmed the clipmap geometry itself was never the problem - with the fade
+off, the two images matched closely. The fix was not to tune the same kind
+of constant more carefully, but to replace the whole approach: "subpixel"
+has an actual, checkable definition - a texel projecting to less than one
+screen pixel - so the fade now compares each cascade's own texel size
+against the real world-space footprint of one screen pixel at that vertex's
+distance (`2 * distance * tan(fovY/2) / viewportHeight`, the standard
+perspective-projection relationship), rather than an unvalidated multiple of
+anything. That footprint calculation needed the camera's vertical FOV and
+the viewport height, which the vertex shader did not previously receive -
+both now travel through `Globals.params.y/z`.
+
+Re-compared against the reference image after the fix: matches closely
+again, and the fade distances it now produces (roughly 38-151 m for the near
+cascade, 230-907 m for the mid cascade, at this viewer's fixed 1.05 rad FOV)
+are independently sane - order-of-magnitude in line with where a 0.1-0.6 m
+texel actually should start losing to pixel size, rather than the previous
+version's 15 m.
+
+The standing lesson, stated plainly because it cost real time twice in one
+feature: a change that passes every test and shows no geometric defect can
+still be visibly wrong, and the only way this project has ever caught that
+class of bug is by rendering the actual output and comparing it - by eye,
+against a trusted reference - not by reasoning about the shader in the
+abstract. Both regressions in this ADR were caught exactly that way, not by
+anything upstream of looking at the image.
