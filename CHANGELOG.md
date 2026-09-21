@@ -44,7 +44,33 @@ reflects, and gameplay queries see it. See ARCHITECTURE.md ADR-021.
   detail fade (62.6% less high-frequency energy at the horizon), slope-space
   normal combination, and an underwater camera with Beer-Lambert absorption and
   Snell's window.
+- **The boat disturbs the water it floats in** (ADR-024). The hull submits a
+  `Continuous` source at its closing speed against the water, and an `Impulse`
+  when a section slams back in - the first use of either in the project. One
+  hull-centred source rather than one per probe, because four corner sources
+  emit a ripple at the hull's own beam and drove a self-excited roll resonance
+  into its clamp.
 
+
+### Fixed
+
+- **The demo boat floated with four centimetres of freeboard** (ADR-024). Its
+  waterline was sized against the hull's bounding box, but a double-ender's
+  gunwale sweeps up at both ends, so the box measured the hull where it is
+  deepest (1.39 m) rather than amidships (0.978 m) - leaving the waterline 4 cm
+  below the midships gunwale and the boat swamped by any real sea. Sized from
+  the middle fifth of the hull now: 0.538 m draft, 0.440 m freeboard.
+- **The boat's heave spring was 2.2x too stiff** (ADR-024). Submersion was
+  measured from the hull's vertical centre, which is not a waterline; from the
+  keel the stiffness is `g/draft`, the correct value for a wall-sided hull. A
+  9 m boat's heave period goes from 0.99 s to 1.47 s.
+- **Props were shaded inside-out at their silhouettes** (ADR-024). The prop
+  shader flipped normals on `dot(N, V) < 0`, which on curved geometry fires for
+  genuine front faces near the edge, because an interpolated normal tips past
+  90 degrees before the true silhouette does. It used `gl_FrontFacing` now.
+- **The sail rendered unlit from both sides** (ADR-024). It is a doubled sheet
+  whose normals sum to zero, and 57% of it computed `N.L == 0` even with the sun
+  behind the camera. Thin canvas now carries a transmission term.
 
 ### Changed
 

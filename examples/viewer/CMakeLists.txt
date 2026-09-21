@@ -74,10 +74,34 @@ ocean_add_shader(shaders/ocean.frag kOceanFragSpv)
 list(APPEND ALL_HEADERS ${OCEAN_SHADER_HEADERS})
 ocean_add_shader(shaders/sky.vert kSkyVertSpv)
 list(APPEND ALL_HEADERS ${OCEAN_SHADER_HEADERS})
+ocean_add_shader(shaders/object.vert kObjectVertSpv)
+set(ALL_HEADERS ${ALL_HEADERS} ${OCEAN_SHADER_HEADERS})
+ocean_add_shader(shaders/object.frag kObjectFragSpv)
+set(ALL_HEADERS ${ALL_HEADERS} ${OCEAN_SHADER_HEADERS})
 ocean_add_shader(shaders/sky.frag kSkyFragSpv)
 list(APPEND ALL_HEADERS ${OCEAN_SHADER_HEADERS})
 
 add_custom_target(ocean_viewer_shaders DEPENDS ${ALL_HEADERS})
+
+# --- boat model ----------------------------------------------------------
+#
+# The boat's real geometry (a Viking faering, assets/gislinge_viking_boat.glb)
+# is baked into a plain header of vertex/index arrays at build time by a small
+# host tool - not loaded at runtime - so the viewer still ships no asset file
+# to find at launch (the same reasoning as embedding the shaders above,
+# applied to a real mesh instead of a procedural one). See tools/gltf_bake.cpp
+# for what it does and does not support.
+add_executable(gltf_bake tools/gltf_bake.cpp)
+
+set(OCEAN_BOAT_GLB "${CMAKE_SOURCE_DIR}/assets/gislinge_viking_boat (1).glb")
+set(OCEAN_BOAT_HDR "${OCEAN_SHADER_DIR}/boat_mesh.h")
+add_custom_command(
+  OUTPUT "${OCEAN_BOAT_HDR}"
+  COMMAND gltf_bake "${OCEAN_BOAT_GLB}" "${OCEAN_BOAT_HDR}"
+  DEPENDS gltf_bake "${OCEAN_BOAT_GLB}"
+  COMMENT "Baking boat_mesh.h from the Viking boat glb"
+  VERBATIM)
+add_custom_target(ocean_viewer_boat_mesh DEPENDS "${OCEAN_BOAT_HDR}")
 
 # --- the viewer ---------------------------------------------------------
 add_executable(ocean_viewer
@@ -85,7 +109,7 @@ add_executable(ocean_viewer
   vk_context.cpp
   ocean_view.cpp
 )
-add_dependencies(ocean_viewer ocean_viewer_shaders)
+add_dependencies(ocean_viewer ocean_viewer_shaders ocean_viewer_boat_mesh)
 target_link_libraries(ocean_viewer PRIVATE ocean Vulkan::Vulkan glfw)
 target_include_directories(ocean_viewer PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}" "${OCEAN_SHADER_DIR}")

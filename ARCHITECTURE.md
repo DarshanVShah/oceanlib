@@ -2087,3 +2087,118 @@ matched by **offset, not by name**. A field inserted at a different position in
 the C++ struct than in the GLSL block silently shifts everything after it and
 the shader reads the wrong `vec4`, with no validation error, because every
 binding is still legitimately bound.
+
+---
+
+## ADR-024 - The boat pushes back, and two bugs found by making it
+
+Viewer-only, and all three parts came out of one question: does the demo's boat
+actually obey the library's own model of the water, or does it just sit on it?
+
+### 1. The hull as a source, and why it is ONE source
+
+The library documents `SourceKind::Continuous` as "an ongoing condition: a hull
+pushing water", and `Obstruction::Neumann` as "correct for hulls". Nothing used
+either. The README's claim that objects disturb the water was carried entirely
+by thrown rocks, while the flagship floating object was a pure reader.
+
+The hull now submits a disturbance driven by **closing speed**: how fast it is
+moving down relative to the water beneath it. That is the same quantity that
+lets drag be measured against the water rather than the world, and both
+velocities are already in hand, so it costs no extra sampling.
+
+**Which source kind applies is decided by measurement.** A sustained push is
+`Continuous`, and it produces almost nothing - correctly. Measured against this
+viewer's own 64 m / 0.25 m field, a 0.05 m/s drive (the hull's actual mean)
+settles at a peak of **0.24 mm**: a slow push does not pile water up, it makes
+it flow, so the wave equation radiates the drive away about as fast as it
+arrives. Delivered as an impulse instead, the same total displacement is ~300x
+more effective. That asymmetry is why a moored boat bobbing on a swell leaves
+the water around it visibly flat.
+
+The term is kept because it is the physically right one and costs one queue
+push. It is **not** scaled up to make it show; the ~60x gain that would take is
+not a hull pushing water any more. What *is* visible is the part that is
+genuinely impulsive - a section that was clear of the water re-entering it fast
+- and that gets an `Impulse`, the same treatment as the rock.
+
+**Obstruction is deliberately not used.** `set_obstruction` rebuilds a
+nearest-fluid table and the header says it is not a per-frame call; the
+viewer's field chases what the camera is looking at, so a world-space mask
+would need rebuilding on almost every frame. The right tool for a mask is a
+static pier, not a demo whose grid follows the view.
+
+**One centred source, not one per probe - and this is the load-bearing part.**
+Four corner sources put the emitted ripple (~2.6 m, at a radius of half the
+beam) at almost exactly the hull's 2.15 m beam, so the ripple the boat had just
+made arrived at its two beam probes with *opposite sign*. That is a roll torque
+the boat applies to itself, and it is regenerative: over four minutes it drove
+roll into its +-40 degree clamp in half of the 30 s windows measured, and
+widened the hull's travel from 28-108% submerged to -5-136%. Four point probes
+alias their own wake.
+
+A single centred source cannot do that. Its ripple is radially symmetric about
+the hull centre, so it reaches all four probes alike - a small symmetric heave
+term, which is a real added-mass-like effect and self-limiting, and essentially
+no pitch or roll torque. Re-measured over 240 s: peak eta settles at 0.05-0.10 m
+with no trend across eight windows, roll 9-17 degrees, pitch 8-15 degrees, no
+clamping. What is given up is telling a bow slam from a stern one, which at a
+0.5-4 m accurate band against a 9 m hull could not be represented faithfully
+anyway.
+
+The boat still *reads* the whole field, so a rock dropped alongside rocks it
+exactly as before.
+
+### 2. The boat had four centimetres of freeboard
+
+The hull's sizing came from the bounding box of its shell meshes, and the
+waterline was set to a fraction of that box's half-height. For a double-ender
+that is the wrong ruler, for the same reason `kHullShellPrefixes` exists at
+all: the gunwale sweeps up toward both ends, so the box measures the hull where
+it is **deepest**, not where it gets wet.
+
+Measured: box depth 1.39 m against an amidships depth of 0.978 m - the stem
+posts inflate it by 42%. The old formula put the waterline at +0.243 m from the
+hull centre while the amidships gunwale sits at +0.283 m. **Four centimetres of
+freeboard**, which is why any real sea closed over the boat rather than being
+ridden by it, and why screenshots kept catching it swamped.
+
+The waterline is now taken from the middle fifth of the hull's length: 55% of
+that section's depth submerged, giving a draft of 0.538 m and a freeboard of
+0.440 m.
+
+### 3. The heave spring was twice as stiff as the hull
+
+Submersion was measured from the hull's vertical **centre**, which is not a
+waterline. The resulting equilibrium depth was 0.243 m on a hull that actually
+draws 0.538 m, so the restoring spring came out 2.2x too stiff and a 9 m boat
+heaved with a 0.99 s period.
+
+Measuring from the keel makes the stiffness `g/draft`, which is the correct
+value for a wall-sided hull floating at that draft, and it now falls out of the
+geometry rather than being chosen to land the boat at a height. The period is
+1.47 s.
+
+### 4. Two shading bugs, one of them mine to have avoided
+
+The prop shader flipped normals on `dot(N, V) < 0`. That is not the same test
+as back-facing and it is wrong on curved geometry: an *interpolated* normal on
+a smooth hull tips past 90 degrees from the eye well before the true
+silhouette, so genuine front faces near the edge were flipped and shaded
+inside-out. That was the dark rim around the hull. `gl_FrontFacing` is the
+winding the rasteriser actually saw, and is the correct test.
+
+The sail is a doubled sheet whose normals sum to exactly zero, and it rendered
+flat sky-grey from **both** sides - 57% of it computed `N.L == 0` even with the
+sun directly behind the camera. Thin canvas passes light, so it now gets a
+Lambertian transmission term on the reversed normal: the cheapest honest stand-
+in for transmission through a thin sheet, and the one lighting condition a sail
+is most recognisable in.
+
+The hull also carries a wet band, and it runs **upward** from the waterline
+rather than down. Everything below the line is hidden behind the ocean surface
+itself, so wetting what is submerged changes nothing anyone can see; the
+visible cue is the strip just above the line that the sea keeps washing over.
+The band is fitted from the same four probes that float the hull, so it tilts
+with the wave rather than cutting the hull dead level - on a 9 m hull in a real
+swell that difference is a good fraction of the freeboard.

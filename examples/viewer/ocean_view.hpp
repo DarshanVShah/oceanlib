@@ -12,6 +12,7 @@
 // distance weighting" decision.
 #pragma once
 
+#include "props.hpp"
 #include "vk_context.hpp"
 #include "vk_math.hpp"
 
@@ -65,12 +66,14 @@ public:
 
     // Copies every cascade level's buffers into this frame's textures and
     // records the draw. `frame` selects which set of per-frame resources to
-    // use.
+    // use. `props` are drawn on top of the ocean: the boat and any rocks in
+    // flight or resting.
     void record(VkContext& ctx, VkCommandBuffer cmd, std::uint32_t image_index,
                 std::uint32_t frame, const ocean::CascadeStack& stack,
                 const ocean::InteractionField& field,
                 const std::vector<const ocean::FoamField*>& foam,
-                const Globals& globals);
+                const Globals& globals,
+                const std::vector<PropInstance>& props);
 
     void set_wireframe(bool on) { wireframe_ = on; }
     [[nodiscard]] bool wireframe() const { return wireframe_; }
@@ -81,6 +84,7 @@ public:
 
 private:
     bool create_mesh(VkContext& ctx);
+    bool create_props(VkContext& ctx);
     bool create_textures(VkContext& ctx);
     bool create_descriptors(VkContext& ctx);
     bool create_pipelines(VkContext& ctx);
@@ -97,6 +101,14 @@ private:
     VkDeviceMemory vertex_memory_ = VK_NULL_HANDLE;
     VkBuffer       index_buffer_  = VK_NULL_HANDLE;
     VkDeviceMemory index_memory_  = VK_NULL_HANDLE;
+
+    // The box and rock meshes (props.hpp), sharing one vertex/index buffer
+    // pair the way the ocean grid does. One PropMeshRange per PropMesh value.
+    std::array<PropMeshRange, static_cast<std::size_t>(PropMesh::Count)> prop_ranges_{};
+    VkBuffer       prop_vertex_buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory prop_vertex_memory_ = VK_NULL_HANDLE;
+    VkBuffer       prop_index_buffer_  = VK_NULL_HANDLE;
+    VkDeviceMemory prop_index_memory_  = VK_NULL_HANDLE;
 
     // One set of textures per frame in flight, per cascade level.
     //
@@ -167,6 +179,7 @@ private:
     VkPipeline            ocean_pipeline_  = VK_NULL_HANDLE;
     VkPipeline            ocean_wire_pipeline_ = VK_NULL_HANDLE;
     VkPipeline            sky_pipeline_    = VK_NULL_HANDLE;
+    VkPipeline            prop_pipeline_   = VK_NULL_HANDLE;
 };
 
 }  // namespace viewer

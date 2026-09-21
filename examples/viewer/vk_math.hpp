@@ -56,6 +56,42 @@ inline Mat4 operator*(const Mat4& a, const Mat4& b)
     return r;
 }
 
+// Rigid-body helpers for placing props. Mat4 is COLUMN-major (m[col][row]),
+// matching the multiply above, so a translation lives in column 3.
+inline Mat4 translate(Vec3 t)
+{
+    Mat4 r = Mat4::identity();
+    r.m[3][0] = t.x; r.m[3][1] = t.y; r.m[3][2] = t.z;
+    return r;
+}
+
+inline Mat4 rotate_x(float a)
+{
+    Mat4 r = Mat4::identity();
+    const float c = std::cos(a), s = std::sin(a);
+    r.m[1][1] = c; r.m[2][1] = -s;
+    r.m[1][2] = s; r.m[2][2] =  c;
+    return r;
+}
+
+inline Mat4 rotate_y(float a)
+{
+    Mat4 r = Mat4::identity();
+    const float c = std::cos(a), s = std::sin(a);
+    r.m[0][0] =  c; r.m[2][0] = s;
+    r.m[0][2] = -s; r.m[2][2] = c;
+    return r;
+}
+
+inline Mat4 rotate_z(float a)
+{
+    Mat4 r = Mat4::identity();
+    const float c = std::cos(a), s = std::sin(a);
+    r.m[0][0] = c; r.m[1][0] = -s;
+    r.m[0][1] = s; r.m[1][1] =  c;
+    return r;
+}
+
 // Right-handed look-at producing a view matrix with -Z forward.
 inline Mat4 look_at(Vec3 eye, Vec3 target, Vec3 up)
 {

@@ -27,8 +27,12 @@
 //                     image is reproducible across machines.
 //
 // Interaction (ADR-021):
-//   LEFT CLICK        drop a rock where the ray meets the DISPLACED surface
+//   LEFT CLICK        throw a rock from the camera; it arcs under gravity and
+//                     splashes where it lands on the DISPLACED surface
 //   - / =             impulse strength      [ / ]   impulse radius
+//
+// A boat (floaters.hpp) floats nearby, its hull sampling and reacting to the
+// same displaced surface the renderer draws - see Boat's class comment.
 //   I                 show the interaction field on its own, without the swell
 //   --wind U          wind speed in m/s (default 12)
 //   --depth D         water depth in metres for shallow-water dispersion
@@ -43,6 +47,7 @@
 //   --frames N        frames to render before the screenshot (default 90)
 //   --no-validation   skip the Vulkan validation layer
 
+#include "floaters.hpp"
 #include "ocean_view.hpp"
 #include "vk_context.hpp"
 #include "vk_math.hpp"
@@ -54,6 +59,7 @@
                             // deliberately uses only public headers
 #include "ocean/ocean.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -583,6 +589,24 @@ int main(int argc, char** argv)
     ocean::InteractionField field{idesc};
     ocean::WaterSurface water{stack, field};
 
+    // Warm the cascades to t=0 so the boat below can spawn already resting on
+    // the REAL surface, before the frame loop's own first stack.update() runs.
+    stack.update(0.0);
+
+    // Props: a floating boat, and rocks thrown by left-clicking the water
+    // (floaters.hpp). Placed ahead of the default camera so it is visible on
+    // launch without having to go looking for it.
+    viewer::Boat boat;
+    boat.reset(-10.0f, -18.0f);
+    // reset() cannot know the wave height on its own (it takes no water
+    // surface), so it leaves position.y at 0 - fine for a flat sea, but on a
+    // real swell that can be a metre or more off. Snapping it here removes
+    // what used to read as the boat "getting submerged" the instant the
+    // viewer launched: it was really the buoyancy spring yanking the hull
+    // down from y=0 to wherever the actual local wave happened to be.
+    boat.position.y = water.height_at(boat.position.x, boat.position.z);
+    viewer::RockThrower rock_thrower;
+
     // One foam field per cascade, because foam is born from each scale's own
     // Jacobian and rides that scale's own current. The shader already combines
     // the levels with a screen blend, so nothing downstream changes.
@@ -780,25 +804,60 @@ int main(int argc, char** argv)
             const RayHit h = raymarch_ocean(water, input.camera.position, dir,
                                             2000.0f);
             if (h.hit) {
-                ocean::Disturbance d;
-                d.world_x    = h.point.x;
-                d.world_z    = h.point.z;
-                d.radius     = input.impulse_radius;
-                d.strength   = input.impulse_strength;
-                // A rock arrives with downward momentum, not just displaced
-                // volume. Scaling with the crater depth keeps the two halves of
-                // the impact consistent as the debug slider moves.
-                d.velocity_y = -4.0f * input.impulse_strength;
-                d.kind       = ocean::SourceKind::Impulse;
-                field.add(d);
-                std::printf("splash at (%.2f, %.2f, %.2f) after %d march steps"
-                            "  [strength %.2f m, radius %.2f m]\n",
-                            h.point.x, h.point.y, h.point.z, h.steps,
-                            input.impulse_strength, input.impulse_radius);
+                // Throw an actual rock rather than stamping an instant
+                // disturbance: it leaves the camera, arcs under gravity, and
+                // the splash below is added only once it lands (see
+                // RockThrower::update) - so the ray march finds WHERE to aim,
+                // not where to splash.
+                rock_thrower.throw_at(input.camera.position, h.point, 0.22f);
+                std::printf("threw a rock at (%.2f, %.2f, %.2f) after %d "
+                            "march steps\n",
+                            h.point.x, h.point.y, h.point.z, h.steps);
             } else {
                 std::printf("no surface hit (ray too shallow, or past the "
                             "2 km march cap)\n");
             }
+        }
+
+        // --- props ----------------------------------------------------------
+        //
+        // Both read the CURRENT water state (this frame's cascades plus
+        // whatever the interaction field still holds from last frame), so
+        // they must run after stack.update() and before field.update() folds
+        // this frame's new splashes in - the same ordering the click handling
+        // above already relies on.
+        boat.update(water, input.paused ? 0.0f : static_cast<float>(dt));
+
+        // The hull pushes back on the water it is floating in. Boat::update
+        // works out how hard from the probes it already took, and leaves the
+        // disturbances here to submit - the same immediate-mode contract the
+        // rock splashes below use, and the reason InteractionField takes
+        // sources rather than handing out handles.
+        //
+        // These are Continuous sources, so they are re-submitted every frame
+        // by design; the library scales them by the timestep, which is what
+        // keeps the wake the same at any frame rate. They are only resolved
+        // while the boat is inside the 64 m interaction field, which follows
+        // what the camera is looking at - look at the boat and its wake is
+        // there, which is exactly when it can be seen.
+        for (const ocean::Disturbance& d : boat.wake()) field.add(d);
+
+        for (const viewer::RockThrower::Splash& s :
+             rock_thrower.update(water, input.paused ? 0.0f : static_cast<float>(dt))) {
+            ocean::Disturbance d;
+            d.world_x  = s.x;
+            d.world_z  = s.z;
+            d.radius   = input.impulse_radius;
+            d.strength = input.impulse_strength;
+            // The rock's own impact speed drives the velocity term, clamped
+            // to the same range the debug slider produces - a real impact,
+            // not an arbitrary constant, but still bounded against the field's
+            // stability limits.
+            d.velocity_y = std::clamp(-s.impact_speed, -8.0f, -0.5f);
+            d.kind       = ocean::SourceKind::Impulse;
+            field.add(d);
+            std::printf("rock landed at (%.2f, %.2f), impact speed %.2f m/s\n",
+                        s.x, s.z, s.impact_speed);
         }
 
         // Foam reads the ocean state, so it is stepped AFTER the stack has
@@ -893,8 +952,12 @@ int main(int argc, char** argv)
         globals.interaction[2] = ib.extent;
         globals.interaction[3] = input.isolate ? 1.0f : 0.0f;
 
+        std::vector<viewer::PropInstance> props;
+        boat.append(props);
+        rock_thrower.append(props);
+
         view.record(ctx, cmd, image_index, ctx.frame_index, stack, field,
-                    foam_ptrs, globals);
+                    foam_ptrs, globals, props);
         ctx.end_frame(image_index);
 
         // --- HUD ----------------------------------------------------------
@@ -910,10 +973,11 @@ int main(int argc, char** argv)
             std::snprintf(title, sizeof(title),
                           "oceanlib  |  %.0f fps  |  sim %.2f ms (wake %.2f)  |  "
                           "%ux%u  |  chop %.2f  |  water %+.2f m  |  "
-                          "impulse %.2f m / r %.2f m%s%s",
+                          "impulse %.2f m / r %.2f m  |  rocks in flight %zu%s%s",
                           fps_avg, ocean_ms_avg, inter_ms_avg, opt.size, opt.size,
                           input.choppiness, h,
                           input.impulse_strength, input.impulse_radius,
+                          rock_thrower.in_flight(),
                           input.isolate ? "  [WAKE ONLY]" : "",
                           input.paused ? "  [PAUSED]" : "");
             glfwSetWindowTitle(window, title);

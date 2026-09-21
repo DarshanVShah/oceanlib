@@ -1,10 +1,13 @@
 #include "ocean_view.hpp"
 
+#include "object_frag.h"
+#include "object_vert.h"
 #include "ocean_frag.h"
 #include "ocean_vert.h"
 #include "sky_frag.h"
 #include "sky_vert.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 
@@ -21,6 +24,45 @@ VkShaderModule make_module(VkDevice device, const std::uint32_t* code,
     vkCreateShaderModule(device, &ci, nullptr, &m);
     return m;
 }
+
+// Uploads `data` into a fresh DEVICE_LOCAL buffer via a throwaway staging
+// buffer. Used for every buffer that is written once at startup and read many
+// times per frame after - the grid mesh, and the box/rock prop meshes.
+void upload_device_local(VkContext& ctx, const void* data, VkDeviceSize size,
+                         VkBufferUsageFlags usage, VkBuffer& buf,
+                         VkDeviceMemory& mem)
+{
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+    ctx.create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      staging, staging_mem);
+    void* mapped = nullptr;
+    vkMapMemory(ctx.device, staging_mem, 0, size, 0, &mapped);
+    std::memcpy(mapped, data, static_cast<std::size_t>(size));
+    vkUnmapMemory(ctx.device, staging_mem);
+
+    ctx.create_buffer(size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buf, mem);
+
+    VkCommandBuffer cmd = ctx.begin_one_shot();
+    VkBufferCopy copy{0, 0, size};
+    vkCmdCopyBuffer(cmd, staging, buf, 1, &copy);
+    ctx.end_one_shot(cmd);
+
+    vkDestroyBuffer(ctx.device, staging, nullptr);
+    vkFreeMemory(ctx.device, staging_mem, nullptr);
+}
+
+// Push constants are the leading bytes of PropInstance (model, scale, color,
+// surf) - everything except `mesh`, which selects the draw call rather than
+// travelling to the shader. offsetof rather than a hardcoded size so adding a
+// field to PropInstance cannot silently leave the range behind; 112 bytes as
+// this stands, against the 128 every Vulkan implementation must offer.
+constexpr VkDeviceSize kPropPushSize = offsetof(PropInstance, mesh);
+static_assert(kPropPushSize <= 128,
+              "prop push constants must fit the guaranteed minimum range");
 
 }  // namespace
 
@@ -43,6 +85,7 @@ bool OceanView::init(VkContext& ctx, const std::vector<ocean::OceanDesc>& levels
     tiles_           = tiles;
 
     if (!create_mesh(ctx)) return false;
+    if (!create_props(ctx)) return false;
     if (!create_textures(ctx)) return false;
     if (!create_descriptors(ctx)) return false;
     return create_pipelines(ctx);
@@ -85,38 +128,37 @@ bool OceanView::create_mesh(VkContext& ctx)
     }
     index_count_ = static_cast<std::uint32_t>(indices.size());
 
-    auto upload = [&](const void* data, VkDeviceSize size,
-                      VkBufferUsageFlags usage, VkBuffer& buf,
-                      VkDeviceMemory& mem) {
-        VkBuffer staging = VK_NULL_HANDLE;
-        VkDeviceMemory staging_mem = VK_NULL_HANDLE;
-        ctx.create_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                          staging, staging_mem);
-        void* mapped = nullptr;
-        vkMapMemory(ctx.device, staging_mem, 0, size, 0, &mapped);
-        std::memcpy(mapped, data, static_cast<std::size_t>(size));
-        vkUnmapMemory(ctx.device, staging_mem);
+    // Device-local for the mesh: it never changes, so paying one staged copy
+    // at startup buys the fastest possible reads forever after.
+    upload_device_local(ctx, vertices.data(), vertices.size() * sizeof(float),
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_buffer_,
+                        vertex_memory_);
+    upload_device_local(ctx, indices.data(),
+                        indices.size() * sizeof(std::uint32_t),
+                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_buffer_,
+                        index_memory_);
+    return true;
+}
 
-        // Device-local for the mesh: it never changes, so paying one staged
-        // copy at startup buys the fastest possible reads forever after.
-        ctx.create_buffer(size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buf, mem);
+// ---------------------------------------------------------------------------
+// Prop meshes (boat, rock)
+// ---------------------------------------------------------------------------
 
-        VkCommandBuffer cmd = ctx.begin_one_shot();
-        VkBufferCopy copy{0, 0, size};
-        vkCmdCopyBuffer(cmd, staging, buf, 1, &copy);
-        ctx.end_one_shot(cmd);
+bool OceanView::create_props(VkContext& ctx)
+{
+    std::vector<PropVertex>    vtx;
+    std::vector<std::uint32_t> idx;
+    append_box(vtx, idx, prop_ranges_[static_cast<std::size_t>(PropMesh::Box)]);
+    append_rock(vtx, idx, prop_ranges_[static_cast<std::size_t>(PropMesh::Rock)]);
+    append_boat_hull(vtx, idx, prop_ranges_[static_cast<std::size_t>(PropMesh::BoatHull)]);
+    append_boat_sail(vtx, idx, prop_ranges_[static_cast<std::size_t>(PropMesh::BoatSail)]);
 
-        vkDestroyBuffer(ctx.device, staging, nullptr);
-        vkFreeMemory(ctx.device, staging_mem, nullptr);
-    };
-
-    upload(vertices.data(), vertices.size() * sizeof(float),
-           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_buffer_, vertex_memory_);
-    upload(indices.data(), indices.size() * sizeof(std::uint32_t),
-           VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_buffer_, index_memory_);
+    upload_device_local(ctx, vtx.data(), vtx.size() * sizeof(PropVertex),
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, prop_vertex_buffer_,
+                        prop_vertex_memory_);
+    upload_device_local(ctx, idx.data(), idx.size() * sizeof(std::uint32_t),
+                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT, prop_index_buffer_,
+                        prop_index_memory_);
     return true;
 }
 
@@ -436,16 +478,28 @@ bool OceanView::create_descriptors(VkContext& ctx)
 
 bool OceanView::create_pipelines(VkContext& ctx)
 {
+    // The prop pipeline's push constants (object.vert/object.frag's `Push`
+    // block: model, scale, color, surf). Declaring the range on the shared
+    // layout costs the ocean/sky pipelines nothing - they never push into it.
+    VkPushConstantRange push_range{};
+    push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    push_range.offset     = 0;
+    push_range.size       = static_cast<std::uint32_t>(kPropPushSize);
+
     VkPipelineLayoutCreateInfo plci{
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plci.setLayoutCount = 1;
-    plci.pSetLayouts    = &set_layout_;
+    plci.setLayoutCount         = 1;
+    plci.pSetLayouts            = &set_layout_;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges    = &push_range;
     vkCreatePipelineLayout(ctx.device, &plci, nullptr, &pipeline_layout_);
 
-    VkShaderModule ocean_vs = make_module(ctx.device, kOceanVertSpv, sizeof(kOceanVertSpv));
-    VkShaderModule ocean_fs = make_module(ctx.device, kOceanFragSpv, sizeof(kOceanFragSpv));
-    VkShaderModule sky_vs   = make_module(ctx.device, kSkyVertSpv, sizeof(kSkyVertSpv));
-    VkShaderModule sky_fs   = make_module(ctx.device, kSkyFragSpv, sizeof(kSkyFragSpv));
+    VkShaderModule ocean_vs  = make_module(ctx.device, kOceanVertSpv, sizeof(kOceanVertSpv));
+    VkShaderModule ocean_fs  = make_module(ctx.device, kOceanFragSpv, sizeof(kOceanFragSpv));
+    VkShaderModule sky_vs    = make_module(ctx.device, kSkyVertSpv, sizeof(kSkyVertSpv));
+    VkShaderModule sky_fs    = make_module(ctx.device, kSkyFragSpv, sizeof(kSkyFragSpv));
+    VkShaderModule object_vs = make_module(ctx.device, kObjectVertSpv, sizeof(kObjectVertSpv));
+    VkShaderModule object_fs = make_module(ctx.device, kObjectFragSpv, sizeof(kObjectFragSpv));
 
     // Dynamic rendering: the pipeline is told its attachment formats directly,
     // with no VkRenderPass and no VkFramebuffer object anywhere in this file.
@@ -483,9 +537,12 @@ bool OceanView::create_pipelines(VkContext& ctx)
     blend.attachmentCount = 1;
     blend.pAttachments    = &blend_attachment;
 
-    auto build = [&](VkShaderModule vs, VkShaderModule fs, bool has_vertex_input,
-                     bool depth_test, VkPolygonMode polygon_mode,
-                     VkPipeline& out) {
+    auto build = [&](VkShaderModule vs, VkShaderModule fs,
+                     const VkVertexInputBindingDescription* bindings,
+                     std::uint32_t binding_count,
+                     const VkVertexInputAttributeDescription* attributes,
+                     std::uint32_t attribute_count, bool depth_test,
+                     VkPolygonMode polygon_mode, VkPipeline& out) {
         VkPipelineShaderStageCreateInfo stages[2]{};
         stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
@@ -496,18 +553,12 @@ bool OceanView::create_pipelines(VkContext& ctx)
         stages[1].module = fs;
         stages[1].pName  = "main";
 
-        VkVertexInputBindingDescription binding{0, sizeof(float) * 2,
-                                                VK_VERTEX_INPUT_RATE_VERTEX};
-        VkVertexInputAttributeDescription attribute{0, 0, VK_FORMAT_R32G32_SFLOAT, 0};
-
         VkPipelineVertexInputStateCreateInfo vertex_input{
             VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-        if (has_vertex_input) {
-            vertex_input.vertexBindingDescriptionCount   = 1;
-            vertex_input.pVertexBindingDescriptions      = &binding;
-            vertex_input.vertexAttributeDescriptionCount = 1;
-            vertex_input.pVertexAttributeDescriptions    = &attribute;
-        }
+        vertex_input.vertexBindingDescriptionCount   = binding_count;
+        vertex_input.pVertexBindingDescriptions      = bindings;
+        vertex_input.vertexAttributeDescriptionCount = attribute_count;
+        vertex_input.pVertexAttributeDescriptions    = attributes;
 
         VkPipelineInputAssemblyStateCreateInfo assembly{
             VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -548,19 +599,41 @@ bool OceanView::create_pipelines(VkContext& ctx)
                                          nullptr, &out) == VK_SUCCESS;
     };
 
+    const VkVertexInputBindingDescription grid_binding{
+        0, sizeof(float) * 2, VK_VERTEX_INPUT_RATE_VERTEX};
+    const VkVertexInputAttributeDescription grid_attribute{
+        0, 0, VK_FORMAT_R32G32_SFLOAT, 0};
+
+    const VkVertexInputBindingDescription prop_binding{
+        0, sizeof(PropVertex), VK_VERTEX_INPUT_RATE_VERTEX};
+    const VkVertexInputAttributeDescription prop_attributes[2] = {
+        {0, 0, VK_FORMAT_R32G32B32_SFLOAT,
+         static_cast<std::uint32_t>(offsetof(PropVertex, px))},
+        {1, 0, VK_FORMAT_R32G32B32_SFLOAT,
+         static_cast<std::uint32_t>(offsetof(PropVertex, nx))},
+    };
+
     bool ok = true;
     // The sky writes no depth, so the ocean always draws over it regardless of
     // the order the depth buffer would otherwise imply.
-    ok &= build(sky_vs, sky_fs, false, false, VK_POLYGON_MODE_FILL, sky_pipeline_);
-    ok &= build(ocean_vs, ocean_fs, true, true, VK_POLYGON_MODE_FILL,
-                ocean_pipeline_);
-    ok &= build(ocean_vs, ocean_fs, true, true, VK_POLYGON_MODE_LINE,
-                ocean_wire_pipeline_);
+    ok &= build(sky_vs, sky_fs, nullptr, 0, nullptr, 0, false,
+               VK_POLYGON_MODE_FILL, sky_pipeline_);
+    ok &= build(ocean_vs, ocean_fs, &grid_binding, 1, &grid_attribute, 1, true,
+               VK_POLYGON_MODE_FILL, ocean_pipeline_);
+    ok &= build(ocean_vs, ocean_fs, &grid_binding, 1, &grid_attribute, 1, true,
+               VK_POLYGON_MODE_LINE, ocean_wire_pipeline_);
+    // Depth-tested like the ocean, but never wireframed - see ocean.frag's
+    // note that props are shaded double-sided, which the shared cullMode =
+    // NONE inside `build` already gives them for free.
+    ok &= build(object_vs, object_fs, &prop_binding, 1, prop_attributes, 2,
+               true, VK_POLYGON_MODE_FILL, prop_pipeline_);
 
     vkDestroyShaderModule(ctx.device, ocean_vs, nullptr);
     vkDestroyShaderModule(ctx.device, ocean_fs, nullptr);
     vkDestroyShaderModule(ctx.device, sky_vs, nullptr);
     vkDestroyShaderModule(ctx.device, sky_fs, nullptr);
+    vkDestroyShaderModule(ctx.device, object_vs, nullptr);
+    vkDestroyShaderModule(ctx.device, object_fs, nullptr);
 
     if (!ok) std::fprintf(stderr, "[vulkan] pipeline creation failed\n");
     return ok;
@@ -575,7 +648,8 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
                        const ocean::CascadeStack& stack,
                        const ocean::InteractionField& field,
                        const std::vector<const ocean::FoamField*>& foam,
-                       const Globals& globals)
+                       const Globals& globals,
+                       const std::vector<PropInstance>& props)
 {
     FrameResources& f = frames_[frame];
 
@@ -770,6 +844,27 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
     vkCmdBindIndexBuffer(cmd, index_buffer_, 0, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(cmd, index_count_, tiles_ * tiles_, 0, 0, 0);
 
+    // Props: the boat and any rocks, one push-constant update and one indexed
+    // draw per instance. Counts here are always small (a boat's three boxes
+    // plus a handful of rocks in flight), so there is no batching to be won -
+    // the push constant IS the per-instance data.
+    if (!props.empty()) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, prop_pipeline_);
+        const VkDeviceSize prop_offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &prop_vertex_buffer_, &prop_offset);
+        vkCmdBindIndexBuffer(cmd, prop_index_buffer_, 0, VK_INDEX_TYPE_UINT32);
+        for (const PropInstance& p : props) {
+            const PropMeshRange& range =
+                prop_ranges_[static_cast<std::size_t>(p.mesh)];
+            vkCmdPushConstants(cmd, pipeline_layout_,
+                              VK_SHADER_STAGE_VERTEX_BIT |
+                                  VK_SHADER_STAGE_FRAGMENT_BIT,
+                              0, static_cast<std::uint32_t>(kPropPushSize), &p);
+            vkCmdDrawIndexed(cmd, range.index_count, 1, range.first_index,
+                             range.vertex_base, 0);
+        }
+    }
+
     vkCmdEndRendering(cmd);
 
     transition_image(cmd, ctx.images[image_index], VK_IMAGE_ASPECT_COLOR_BIT,
@@ -820,6 +915,7 @@ void OceanView::shutdown(VkContext& ctx)
     vkDestroyPipeline(ctx.device, ocean_pipeline_, nullptr);
     vkDestroyPipeline(ctx.device, ocean_wire_pipeline_, nullptr);
     vkDestroyPipeline(ctx.device, sky_pipeline_, nullptr);
+    vkDestroyPipeline(ctx.device, prop_pipeline_, nullptr);
     vkDestroyPipelineLayout(ctx.device, pipeline_layout_, nullptr);
     vkDestroyDescriptorPool(ctx.device, descriptor_pool_, nullptr);
     vkDestroyDescriptorSetLayout(ctx.device, set_layout_, nullptr);
@@ -827,6 +923,10 @@ void OceanView::shutdown(VkContext& ctx)
     vkFreeMemory(ctx.device, vertex_memory_, nullptr);
     vkDestroyBuffer(ctx.device, index_buffer_, nullptr);
     vkFreeMemory(ctx.device, index_memory_, nullptr);
+    vkDestroyBuffer(ctx.device, prop_vertex_buffer_, nullptr);
+    vkFreeMemory(ctx.device, prop_vertex_memory_, nullptr);
+    vkDestroyBuffer(ctx.device, prop_index_buffer_, nullptr);
+    vkFreeMemory(ctx.device, prop_index_memory_, nullptr);
 }
 
 }  // namespace viewer
