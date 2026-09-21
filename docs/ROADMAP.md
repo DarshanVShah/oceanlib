@@ -14,7 +14,7 @@ measured frame budget at every tier down to hardware with no compute shaders
 
 ## Workstream A — the viewer
 
-### Phase 0 · GPU timing
+### Phase 0 · GPU timing  — **done**
 
 Per-pass timestamp queries and a frame breakdown. `BENCHMARKS.md` measures the
 CPU thoroughly and the GPU not at all, so every statement below about cost is
@@ -125,7 +125,32 @@ above:
   is a *quality* argument. It was sold on performance, and at 7% fragment cost
   that argument does not survive contact with the measurement.
 
-### Phase 1 · HDR off-screen target and a post chain
+### Where it stands
+
+Phases 0-3 are done. Frame budget at the new default quality — MSAA 4x, bloom
+on, ACES — minimum over 500 frames at 1600x900:
+
+| span | min ms |
+|------|--------|
+| ocean  | 1.865 |
+| upload | 0.576 |
+| bloom  | 0.114 |
+| sky    | 0.086 |
+| post   | 0.001 |
+| **total** | **2.684** |
+
+Against 2.225 ms before any of it: **+0.46 ms for MSAA 4x, a five-level bloom
+chain and a filmic tone curve.** The prediction that the shading could afford
+to be far more ambitious has held so far — the whole of Phase 2 costs 0.114 ms,
+and every bit of what was added lands in the part of the frame that was
+measured as cheap.
+
+`--msaa`, `--bloom` and `--tonemap` each turn their feature off completely, so
+the tier machinery in Phase 9 already has something to drive.
+
+---
+
+### Phase 1 · HDR off-screen target and a post chain  — **done**
 
 The viewer renders in a single pass straight to the swapchain, with
 `tonemap()` called inline at the end of `ocean.frag`, `object.frag` and
@@ -136,13 +161,13 @@ Scene → `R16G16B16A16_SFLOAT` → post → swapchain, with tonemapping moved o
 of the material shaders into the post pass where it belongs. This phase
 changes no pixels on purpose; it is the gate the next five wait behind.
 
-### Phase 2 · Bloom and a filmic tonemap
+### Phase 2 · Bloom and a filmic tonemap  — **done**
 
 The first visible payoff, and the reason Phase 1 exists. Reinhard is leaving
 real quality on the table, and sun glitter on water is the exact case bloom
 was invented for.
 
-### Phase 3 · MSAA
+### Phase 3 · MSAA  — **done**
 
 There is no anti-aliasing of any kind today (`VK_SAMPLE_COUNT_1_BIT`
 everywhere), which is why the rigging stairsteps in every screenshot. 4x
