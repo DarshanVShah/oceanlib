@@ -34,6 +34,10 @@ layout(set = 0, binding = 0) uniform Globals {
                        // w  = 1 to show the interaction field in isolation
     vec4 water;        // x = camera depth below the surface, metres, positive
                        // when submerged; yzw unused
+    vec4 slopeVar;     // xyz = mean-square slope of cascades 0,1,2, both axes
+                       // summed - a property of the SPECTRUM, so it is
+                       // measured once per sea state rather than per frame;
+                       // w   = the BRDF's base roughness, as GGX alpha
 } g;
 
 // How much of a cascade survives at this distance, in [0,1].

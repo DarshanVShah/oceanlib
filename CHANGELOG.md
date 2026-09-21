@@ -44,6 +44,15 @@ reflects, and gameplay queries see it. See ARCHITECTURE.md ADR-021.
   detail fade (62.6% less high-frequency energy at the horizon), slope-space
   normal combination, and an underwater camera with Beer-Lambert absorption and
   Snell's window.
+- **Sub-pixel slope variance drives the specular lobe** (ADR-023). The slope
+  variance that the detail fade removes from the geometry is added to the GGX
+  roughness instead of being discarded - `alpha^2 += sum (1 - fade^2) * sigma^2`,
+  which is exact for Gaussian slopes. Measured once per sea state from the
+  library's own normal buffer, because slope variance of a stationary sea is
+  time-invariant. At 12 m/s the three cascades total a mean-square slope of
+  0.0385, so a fully unresolved sea reaches `alpha = 0.196` against a base of
+  0.0030. The foreground is bit-for-bit unchanged; the mid-distance sun road
+  gains 74% more specular pixels. `--no-slope-var` is the A/B control.
 - **The boat disturbs the water it floats in** (ADR-024). The hull submits a
   `Continuous` source at its closing speed against the water, and an `Impulse`
   when a section slams back in - the first use of either in the project. One

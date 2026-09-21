@@ -14,6 +14,8 @@
 //   --isolate         start with the interaction field shown on its own
 //   --no-foam-advect  fall back to the instantaneous Jacobian foam
 //   --no-detail-fade  keep every cascade at full strength to the horizon
+//   --no-slope-var    stop the faded cascades' slope variance from feeding the
+//                     specular lobe, leaving the distant sea a mirror (ADR-023)
 //   --foam-decay R    foam decay rate, 1/s (default 0.30, half-life 2.3 s)
 //   --foam-gain G     how fast breaking injects foam, 1/s (default 4)
 //   --foam-advect S   multiplier on the advecting current (default 1)
@@ -97,6 +99,7 @@ struct Options {
     float         impulse = 0.45f, impulse_radius = 0.55f;
     bool          no_foam_advect = false;
     bool          no_detail_fade = false;
+    bool          no_slope_var   = false;
     // Steady-state coverage under a sustained source is source_gain/decay, so
     // this ratio is the knob that decides whether foam reads as whitecaps or
     // as milk. 4/0.3 = 13x saturated the entire ocean; 1.5/0.4 = 3.75x lets a
@@ -140,6 +143,7 @@ Options parse_args(int argc, char** argv)
         else if (a == "--impulse-radius") o.impulse_radius = std::strtof(next(), nullptr);
         else if (a == "--no-foam-advect") o.no_foam_advect = true;
         else if (a == "--no-detail-fade") o.no_detail_fade = true;
+        else if (a == "--no-slope-var")   o.no_slope_var = true;
         else if (a == "--foam-decay")  o.foam_decay  = std::strtof(next(), nullptr);
         else if (a == "--foam-gain")   o.foam_gain   = std::strtof(next(), nullptr);
         else if (a == "--foam-advect") o.foam_advect = std::strtof(next(), nullptr);
@@ -160,6 +164,48 @@ Options parse_args(int argc, char** argv)
     if (o.cascades < 1) o.cascades = 1;
     if (o.cascades > 3) o.cascades = 3;
     return o;
+}
+
+// --- sub-pixel slope statistics -------------------------------------------
+
+// Mean-square slope of one cascade: the average of (dh/dx)^2 + (dh/dz)^2 over
+// its whole patch, both axes summed.
+//
+// This is the number the BRDF needs for the detail it is NOT drawing. When
+// detail_fade() drops a cascade because its texels have fallen below a pixel,
+// the waves in that band do not stop existing - they stop being RESOLVED. Their
+// geometry is correctly discarded; their slope variance is not the renderer's
+// to throw away, because that variance is exactly what makes a distant sea
+// look like a broad sheen rather than a hard mirror. Feeding it back in as
+// roughness is the whole of ADR-023.
+//
+// Measured once per sea state rather than per frame, and that is not an
+// optimisation but a property of the model: for a stationary Gaussian sea the
+// slope variance is a spectral integral, the sum of k^2 S(k) over all k, which
+// carries no time dependence. The sea surface moves; its slope statistics do
+// not. So this is re-measured only when the stack is rebuilt - on a choppiness
+// change, which does alter the displaced surface's slopes.
+//
+// Measured from the library's NORMAL BUFFER rather than from the spectrum in
+// closed form, deliberately. The published normals are the exact
+// displaced-surface normals with choppy displacement included (ADR-005); a
+// closed-form spectral integral would describe the undisplaced Gaussian
+// surface instead, and disagree with the surface actually on screen. Agreeing
+// with what is drawn is the entire point of the exercise.
+float mean_square_slope(const ocean::Buffers& b)
+{
+    if (b.normal == nullptr || b.size == 0) return 0.0f;
+
+    const std::size_t n = static_cast<std::size_t>(b.size) * b.size;
+    double sum = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const float ny  = b.normal[i * 4 + 1];
+        const float inv = 1.0f / std::max(ny, 1e-4f);
+        const double sx = -static_cast<double>(b.normal[i * 4 + 0]) * inv;
+        const double sz = -static_cast<double>(b.normal[i * 4 + 2]) * inv;
+        sum += sx * sx + sz * sz;
+    }
+    return static_cast<float>(sum / static_cast<double>(n));
 }
 
 // --- camera --------------------------------------------------------------
@@ -593,6 +639,28 @@ int main(int argc, char** argv)
     // the REAL surface, before the frame loop's own first stack.update() runs.
     stack.update(0.0);
 
+    // Slope variance per cascade, for the roughness the detail fade would
+    // otherwise discard (ADR-023). Time-invariant for a given sea state, so it
+    // is measured here and refreshed only when the stack is rebuilt.
+    std::vector<float> slope_var(levels.size(), 0.0f);
+    auto measure_slope_var = [&]() {
+        for (std::size_t i = 0; i < levels.size(); ++i) {
+            slope_var[i] = mean_square_slope(stack.buffers(i));
+        }
+    };
+    measure_slope_var();
+    if (opt.no_slope_var) {
+        std::printf("sub-pixel slope variance: OFF (--no-slope-var) - unresolved "
+                    "cascades contribute no roughness\n");
+    }
+    for (std::size_t i = 0; i < levels.size(); ++i) {
+        std::printf("  cascade %zu mean-square slope %.5f "
+                    "(rms slope %.2f deg) -> roughness alpha %.4f when unresolved\n",
+                    i, slope_var[i],
+                    std::atan(std::sqrt(slope_var[i] * 0.5f)) * 57.2958f,
+                    std::sqrt(slope_var[i]));
+    }
+
     // Props: a floating boat, and rocks thrown by left-clicking the water
     // (floaters.hpp). Placed ahead of the default camera so it is visible on
     // launch without having to go looking for it.
@@ -738,6 +806,11 @@ int main(int argc, char** argv)
             ctx.wait_idle();
             stack = ocean::CascadeStack{std::span<const ocean::OceanDesc>(levels)};
             active_choppiness = input.choppiness;
+            // Choppy displacement changes the displaced surface's slopes, so
+            // the variance the BRDF is standing in for has changed too. One
+            // update is needed first: a freshly built stack has no state yet.
+            stack.update(sim_time);
+            measure_slope_var();
         }
 
         const auto sim_start = std::chrono::steady_clock::now();
@@ -903,6 +976,18 @@ int main(int argc, char** argv)
         globals.cascade_patch[1] = (levels.size() > 1) ? levels[1].patch_length : levels[0].patch_length;
         globals.cascade_patch[2] = (levels.size() > 2) ? levels[2].patch_length : levels[0].patch_length;
         globals.cascade_patch[3] = static_cast<float>(opt.tiles);
+        // A cascade the viewer is not running contributes no variance, so the
+        // spare slots stay zero rather than repeating cascade 0's.
+        for (std::size_t i = 0; i < 3; ++i) {
+            globals.slope_var[i] = (!opt.no_slope_var && i < slope_var.size())
+                                       ? slope_var[i] : 0.0f;
+        }
+        // Base roughness: what the BRDF uses where every cascade is fully
+        // resolved and there is no unresolved detail to stand in for. Water
+        // itself is very smooth at that point - this is close to a mirror, and
+        // it is the value the specular lobe carried as a bare constant before
+        // the sub-pixel term existed.
+        globals.slope_var[3] = 0.055f * 0.055f;
         globals.params[0]  = static_cast<float>(sim_time);
         globals.params[1]  = static_cast<float>(opt.mesh);
         globals.params[2]  = opt.turbidity;

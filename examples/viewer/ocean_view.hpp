@@ -51,6 +51,9 @@ struct Globals {
                                  // field; z = its extent; w = isolate flag
     float     water[4];          // x = camera depth below the surface in
                                  // metres, positive when submerged
+    float     slope_var[4];      // x,y,z = mean-square slope of cascades 0,1,2
+                                 // (both axes summed); w = the BRDF's own base
+                                 // roughness, as alpha
 };
 
 class OceanView {

@@ -2090,6 +2090,102 @@ binding is still legitimately bound.
 
 ---
 
+## ADR-023 - Unresolved waves become roughness, not nothing
+
+Viewer-only. ADR-022 added a distance fade that drops a cascade once its texels
+project to less than a pixel, because what reaches the screen at that point is
+not detail but aliasing. That is the right call for *geometry* and it stopped
+the horizon shimmering. It also threw something away that it should not have.
+
+The waves in a faded band do not stop existing. Their slopes are what break a
+distant sun path into a broad sheen instead of a hard mirror, and deleting the
+band deletes that too - so the fade traded a shimmer for a horizon smoother
+than open water has any right to be. Measured on the sun road at 12 m/s, the
+glitter thinned into isolated specks and died well short of the horizon.
+
+A microfacet BRDF is exactly the tool for surface detail below the sampling
+rate: it carries that detail statistically, as a slope distribution, rather
+than geometrically. So the variance the fade removes is not discarded, it is
+**moved from the mesh into the lobe**. This is the same fact about the sea,
+expressed at the scale the renderer can actually carry it.
+
+### The arithmetic, which is exact rather than fitted
+
+Variances of independent contributions add. The fade scales slope *amplitude*,
+so it scales variance by its square. And for the Beckmann slope distribution
+that GGX is matched to through `alpha`, the total slope variance over both axes
+**is** `alpha^2`. Hence
+
+    alpha^2_effective = alpha^2_base + sum_i (1 - fade_i^2) * sigma^2_i
+
+which is the standard LEAN / Toksvig result, and is exact for Gaussian slopes
+rather than a curve fitted to look right.
+
+**No Toksvig `|N|` term is needed, and that is a consequence of ADR-022's
+design rather than an oversight.** Toksvig's factor recovers variance lost to
+mip-filtering a normal map. These cascade textures have no mips at all
+(`mipLevels = 1`, `maxLod = 0`): band fading is this renderer's entire LOD
+mechanism, so the fade weights account for all of the lost variance and none of
+it is hiding in a shortened average normal.
+
+### sigma^2 is measured, and measured only once
+
+Measured from the library's **normal buffer**, not integrated from the spectrum
+in closed form. The published normals are the exact displaced-surface normals
+with choppy displacement included (ADR-005); a closed-form spectral integral
+would describe the *undisplaced* Gaussian surface and disagree with the surface
+actually on screen. Agreeing with what is drawn is the entire point.
+
+Measured **once per sea state**, and that is a property of the model rather
+than an optimisation: for a stationary Gaussian sea the slope variance is a
+spectral integral, the sum of `k^2 S(k)`, which carries no time dependence. The
+sea surface moves; its slope statistics do not. It is re-measured only when the
+stack is rebuilt, which is on a choppiness change - choppy displacement does
+alter the displaced surface's slopes.
+
+At 12 m/s the three cascades measure mean-square slope 0.00663 (800 m), 0.01218
+(150 m) and 0.01966 (25 m), totalling 0.0385 - so a fully unresolved sea
+reaches `alpha = 0.196` against the base `alpha = 0.0030`, a 65x wider lobe.
+
+**Against measurement, this is an underestimate, and knowably so.** Cox & Munk's
+empirical fit gives `sigma^2 = 0.003 + 5.12e-3 * U`, or 0.064 at 12 m/s; this
+sea reports 60% of that. The missing 40% is real and accounted for: the finest
+cascade cuts off at 0.5 m while Cox & Munk measured a sea carrying capillary
+waves down to millimetres. The number is right for the sea being simulated,
+which is the one the BRDF has to describe.
+
+### What it changes, and where it deliberately changes nothing
+
+Per-band mean absolute difference over the frame, 12 m/s, against `--no-slope-var`:
+
+| band                  | mean \|delta\| | max | bright pixels off -> on |
+|-----------------------|---------------|-----|-------------------------|
+| foreground            | **0.00**      | 1   | 0.38% -> 0.38%          |
+| near                  | 0.23          | 65  | 0.23% -> 0.24%          |
+| mid                   | 6.29          | 95  | 0.76% -> **1.32%**      |
+| distant               | 2.78          | 57  | 0.36% -> 0.44%          |
+| far (at the horizon)  | 1.64          | 34  | 0.39% -> 0.52%          |
+
+The foreground is **bit-for-bit unchanged**, which is the correctness property
+worth stating plainly: where every cascade is fully resolved the sum is zero,
+the lobe is the near-mirror it always was, and the term costs nothing it has
+not earned. The effect is concentrated precisely in the band where the fade is
+partial - which is where the aliasing was.
+
+`--no-slope-var` is the A/B control, in the same spirit as `--no-detail-fade`.
+The two compose correctly and independently: with the fade off, every weight is
+1, no variance is lost, and no roughness is added.
+
+**Stated limitation.** Only the sun's specular lobe is roughened. The sky
+reflection still samples a single mirror direction, so a rough distant sea
+reflects the sky more sharply than it should. Doing it properly needs a
+prefiltered environment, and the analytic Preetham sky (ADR-022) is evaluated
+per-pixel rather than stored in a map there is anything to prefilter. The
+Fresnel term is likewise evaluated at the mean normal rather than averaged over
+the slope distribution, which is a second-order error at these roughnesses.
+
+---
+
 ## ADR-024 - The boat pushes back, and two bugs found by making it
 
 Viewer-only, and all three parts came out of one question: does the demo's boat

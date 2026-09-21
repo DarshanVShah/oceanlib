@@ -130,13 +130,61 @@ void main()
 
     vec3 refraction = (deep + scatter * lift * through * 1.6) * ambient;
 
-    // --- sun specular (GGX) ----------------------------------------------
+    // --- sun specular (GGX), roughened by the detail that is not drawn ----
+    //
+    // The roughness here is not a constant, and the reason is the fade above.
+    //
+    // detail_fade() drops a cascade once its texels fall below a pixel,
+    // because what reaches the screen at that point is aliasing rather than
+    // detail. That is the right call for GEOMETRY. But those waves still
+    // exist, and their slopes are what break a distant sun path into a broad
+    // sheen instead of a hard mirror. Discarding the band discards that too,
+    // and the horizon ends up smoother than open water has any right to be -
+    // trading a shimmer for a mirror.
+    //
+    // A microfacet BRDF is precisely the tool for "surface detail below the
+    // sampling rate": it represents that detail statistically, as a slope
+    // distribution, instead of geometrically. So the variance the fade removes
+    // is not thrown away - it is moved from the mesh into the lobe. Unresolved
+    // waves stop being geometry and become roughness, which is the same fact
+    // about the sea expressed at the scale the renderer can actually carry it.
+    //
+    // The arithmetic is exact for Gaussian slopes and is the standard LEAN /
+    // Toksvig result. Variances of independent contributions ADD; the fade
+    // scales slope AMPLITUDE, so it scales variance by its square; and for the
+    // Beckmann slope distribution (which GGX is matched to through alpha) the
+    // total slope variance over both axes IS alpha^2. Hence:
+    //
+    //     alpha^2_effective = alpha^2_base + sum_i (1 - fade_i^2) * sigma^2_i
+    //
+    // with sigma^2_i measured once per sea state from the library's own normal
+    // buffer - see main.cpp's mean_square_slope() for why it is measured from
+    // the published normals rather than integrated from the spectrum.
+    //
+    // Note what is NOT needed here: a Toksvig |N| term. Toksvig's factor
+    // recovers variance lost to mip-filtering a normal map, and these cascade
+    // textures have no mips at all (mipLevels = 1, maxLod = 0). Band fading is
+    // this renderer's entire LOD mechanism, so the fade weights account for all
+    // of the lost variance, with nothing hiding in a shortened average normal.
+    //
+    // At close range every fade is 1, the sum is zero, and the lobe is exactly
+    // the near-mirror it was before. The term only does anything where detail
+    // has actually been dropped, which is where the aliasing was.
+    vec3  lostVar = (vec3(1.0) - vFade * vFade) * g.slopeVar.xyz;
+    float a2      = g.slopeVar.w * g.slopeVar.w
+                  + lostVar.x + lostVar.y + lostVar.z;
+    a2 = clamp(a2, 1e-6, 1.0);
+
     vec3  H     = normalize(L + V);
     float NdotH = max(dot(N, H), 0.0);
-    float rough = 0.055;
-    float a     = rough * rough;
-    float denom = NdotH * NdotH * (a * a - 1.0) + 1.0;
-    float D     = (a * a) / (kPi * denom * denom);
+    float denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    float D     = a2 / (kPi * denom * denom);
+
+    // Energy, not brightness. D is a density: widening the lobe spreads a
+    // fixed amount of reflected light over more directions, so its peak falls
+    // as roughness rises and the total stays put. Scaling by a constant here
+    // would undo that and make the rough horizon brighter than the smooth
+    // water in front of it - the opposite of what roughening means.
     vec3  spec  = vec3(1.0, 0.95, 0.85) * D * 0.35 * max(dot(N, L), 0.0);
 
     vec3 color = mix(refraction, reflection, F) + spec;
