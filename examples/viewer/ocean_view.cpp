@@ -4,6 +4,8 @@
 #include "object_vert.h"
 #include "ocean_frag.h"
 #include "ocean_vert.h"
+#include "bloom_down_frag.h"
+#include "bloom_up_frag.h"
 #include "post_frag.h"
 #include "post_vert.h"
 #include "sky_frag.h"
@@ -385,18 +387,28 @@ bool OceanView::create_descriptors(VkContext& ctx)
     lci.pBindings    = bindings;
     vkCreateDescriptorSetLayout(ctx.device, &lci, nullptr, &set_layout_);
 
-    // The post pass's own layout: one texture, the HDR scene target.
-    VkDescriptorSetLayoutBinding post_binding{};
-    post_binding.binding         = 0;
-    post_binding.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    post_binding.descriptorCount = 1;
-    post_binding.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // The post pass's layout: the HDR scene target, plus level 0 of the bloom
+    // chain (which by composite time holds every level summed into it).
+    VkDescriptorSetLayoutBinding post_bindings[2]{};
+    for (std::uint32_t i = 0; i < 2; ++i) {
+        post_bindings[i].binding         = i;
+        post_bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        post_bindings[i].descriptorCount = 1;
+        post_bindings[i].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
 
     VkDescriptorSetLayoutCreateInfo post_lci{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    post_lci.bindingCount = 1;
-    post_lci.pBindings    = &post_binding;
+    post_lci.bindingCount = 2;
+    post_lci.pBindings    = post_bindings;
     vkCreateDescriptorSetLayout(ctx.device, &post_lci, nullptr, &post_set_layout_);
+
+    // The blur passes read exactly one image, whichever step they are on.
+    VkDescriptorSetLayoutCreateInfo blur_lci{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    blur_lci.bindingCount = 1;
+    blur_lci.pBindings    = &post_bindings[0];
+    vkCreateDescriptorSetLayout(ctx.device, &blur_lci, nullptr, &blur_set_layout_);
 
     VkSamplerCreateInfo post_sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     post_sci.magFilter    = VK_FILTER_LINEAR;
@@ -411,13 +423,15 @@ bool OceanView::create_descriptors(VkContext& ctx)
     sizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[0].descriptorCount = kFramesInFlight;
     sizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    // Plus one per frame for the post pass's view of the HDR target.
+    // Per frame: the cascade textures and the interaction field, the post
+    // pass's two, and one per blur source.
     sizes[1].descriptorCount =
-        kFramesInFlight * (2 * static_cast<std::uint32_t>(kMaxCascades) + 2);
+        kFramesInFlight * (2 * static_cast<std::uint32_t>(kMaxCascades) + 1
+                           + 2 + (kBloomLevels + 1));
 
     VkDescriptorPoolCreateInfo pci{
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pci.maxSets       = kFramesInFlight * 2;   // scene set + post set
+    pci.maxSets       = kFramesInFlight * (2 + kBloomLevels + 1);
     pci.poolSizeCount = 2;
     pci.pPoolSizes    = sizes;
     vkCreateDescriptorPool(ctx.device, &pci, nullptr, &descriptor_pool_);
@@ -440,6 +454,15 @@ bool OceanView::create_descriptors(VkContext& ctx)
         pai.descriptorSetCount = 1;
         pai.pSetLayouts        = &post_set_layout_;
         vkAllocateDescriptorSets(ctx.device, &pai, &f.post_descriptor);
+
+        for (VkDescriptorSet& set : f.blur_src) {
+            VkDescriptorSetAllocateInfo bai{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            bai.descriptorPool     = descriptor_pool_;
+            bai.descriptorSetCount = 1;
+            bai.pSetLayouts        = &blur_set_layout_;
+            vkAllocateDescriptorSets(ctx.device, &bai, &set);
+        }
 
         VkDescriptorBufferInfo ubo{f.uniform, 0, sizeof(Globals)};
 
@@ -546,6 +569,14 @@ bool OceanView::create_pipelines(VkContext& ctx)
     post_plci.pPushConstantRanges    = &post_push;
     vkCreatePipelineLayout(ctx.device, &post_plci, nullptr, &post_pipeline_layout_);
 
+    VkPipelineLayoutCreateInfo blur_plci{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    blur_plci.setLayoutCount         = 1;
+    blur_plci.pSetLayouts            = &blur_set_layout_;
+    blur_plci.pushConstantRangeCount = 1;
+    blur_plci.pPushConstantRanges    = &post_push;
+    vkCreatePipelineLayout(ctx.device, &blur_plci, nullptr, &blur_pipeline_layout_);
+
     VkShaderModule ocean_vs  = make_module(ctx.device, kOceanVertSpv, sizeof(kOceanVertSpv));
     VkShaderModule ocean_fs  = make_module(ctx.device, kOceanFragSpv, sizeof(kOceanFragSpv));
     VkShaderModule sky_vs    = make_module(ctx.device, kSkyVertSpv, sizeof(kSkyVertSpv));
@@ -554,6 +585,8 @@ bool OceanView::create_pipelines(VkContext& ctx)
     VkShaderModule object_fs = make_module(ctx.device, kObjectFragSpv, sizeof(kObjectFragSpv));
     VkShaderModule post_vs   = make_module(ctx.device, kPostVertSpv, sizeof(kPostVertSpv));
     VkShaderModule post_fs   = make_module(ctx.device, kPostFragSpv, sizeof(kPostFragSpv));
+    VkShaderModule bdown_fs  = make_module(ctx.device, kBloomDownFragSpv, sizeof(kBloomDownFragSpv));
+    VkShaderModule bup_fs    = make_module(ctx.device, kBloomUpFragSpv, sizeof(kBloomUpFragSpv));
 
     // Dynamic rendering: the pipeline is told its attachment formats directly,
     // with no VkRenderPass and no VkFramebuffer object anywhere in this file.
@@ -685,16 +718,37 @@ bool OceanView::create_pipelines(VkContext& ctx)
     ok &= build(object_vs, object_fs, &prop_binding, 1, prop_attributes, 2,
                true, VK_POLYGON_MODE_FILL, pipeline_layout_, prop_pipeline_);
 
-    // The post pipeline is the one that writes the swapchain, and the only one
-    // with no depth attachment at all - it covers every pixel exactly once,
-    // so there is nothing to test against and nothing to write.
+    // The blur passes write bloom levels, which carry the HDR format, and like
+    // the post pass have no depth attachment at all.
+    rendering.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
+    ok &= build(post_vs, bdown_fs, nullptr, 0, nullptr, 0, false,
+               VK_POLYGON_MODE_FILL, blur_pipeline_layout_, bloom_down_pipeline_);
+
+    // The upsample ADDS to the level it writes, and the blend state is what
+    // does the adding - the shader emits only its own contribution. That is
+    // what makes the chain progressive: each level ends up holding its own
+    // gathered light plus everything coarser, so level 0 alone carries the
+    // whole multi-scale glow and the composite needs one texture read.
+    blend_attachment.blendEnable         = VK_TRUE;
+    blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend_attachment.colorBlendOp        = VK_BLEND_OP_ADD;
+    blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend_attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend_attachment.alphaBlendOp        = VK_BLEND_OP_ADD;
+    ok &= build(post_vs, bup_fs, nullptr, 0, nullptr, 0, false,
+               VK_POLYGON_MODE_FILL, blur_pipeline_layout_, bloom_up_pipeline_);
+    blend_attachment.blendEnable = VK_FALSE;
+
+    // The post pipeline is the one that writes the swapchain.
     rendering.pColorAttachmentFormats = &ctx.swapchain_format;
-    rendering.depthAttachmentFormat   = VK_FORMAT_UNDEFINED;
     ok &= build(post_vs, post_fs, nullptr, 0, nullptr, 0, false,
                VK_POLYGON_MODE_FILL, post_pipeline_layout_, post_pipeline_);
 
     vkDestroyShaderModule(ctx.device, post_vs, nullptr);
     vkDestroyShaderModule(ctx.device, post_fs, nullptr);
+    vkDestroyShaderModule(ctx.device, bdown_fs, nullptr);
+    vkDestroyShaderModule(ctx.device, bup_fs, nullptr);
     vkDestroyShaderModule(ctx.device, ocean_vs, nullptr);
     vkDestroyShaderModule(ctx.device, ocean_fs, nullptr);
     vkDestroyShaderModule(ctx.device, sky_vs, nullptr);
@@ -961,19 +1015,161 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                      VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 
-    // Written every frame rather than once at startup: ctx.hdr_view is
+    // Written every frame rather than once at startup: these views are
     // recreated with the swapchain, so a descriptor written once would dangle
     // after the first resize. Safe to update here because begin_frame has
-    // already waited on this frame slot's fence, so nothing is reading it.
+    // already waited on this frame slot's fence, so nothing is reading them.
     const VkDescriptorImageInfo scene_info{
         post_sampler_, ctx.hdr_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet post_write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    post_write.dstSet          = f.post_descriptor;
-    post_write.dstBinding      = 0;
-    post_write.descriptorCount = 1;
-    post_write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    post_write.pImageInfo      = &scene_info;
-    vkUpdateDescriptorSets(ctx.device, 1, &post_write, 0, nullptr);
+    const VkDescriptorImageInfo bloom0_info{
+        post_sampler_, ctx.bloom[0].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+
+    VkWriteDescriptorSet post_writes[2]{};
+    post_writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    post_writes[0].dstSet          = f.post_descriptor;
+    post_writes[0].dstBinding      = 0;
+    post_writes[0].descriptorCount = 1;
+    post_writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    post_writes[0].pImageInfo      = &scene_info;
+    post_writes[1]                 = post_writes[0];
+    post_writes[1].dstBinding      = 1;
+    post_writes[1].pImageInfo      = &bloom0_info;
+    vkUpdateDescriptorSets(ctx.device, 2, post_writes, 0, nullptr);
+
+    // One set per blur source: [0] the scene, [i + 1] bloom level i.
+    VkDescriptorImageInfo blur_info[kBloomLevels + 1]{};
+    VkWriteDescriptorSet  blur_writes[kBloomLevels + 1]{};
+    for (std::uint32_t i = 0; i < kBloomLevels + 1; ++i) {
+        blur_info[i] = {post_sampler_,
+                        (i == 0) ? ctx.hdr_view : ctx.bloom[i - 1].view,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        blur_writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        blur_writes[i].dstSet          = f.blur_src[i];
+        blur_writes[i].dstBinding      = 0;
+        blur_writes[i].descriptorCount = 1;
+        blur_writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        blur_writes[i].pImageInfo      = &blur_info[i];
+    }
+    vkUpdateDescriptorSets(ctx.device, kBloomLevels + 1, blur_writes, 0, nullptr);
+
+    // --- bloom chain -------------------------------------------------------
+    //
+    // Down first, gathering light into successively smaller images, then back
+    // up, adding each level into the one above it. By the time this finishes,
+    // level 0 holds every scale summed, so the composite reads one texture.
+    //
+    // At intensity 0 the whole thing is skipped rather than run and multiplied
+    // by nothing - it is ten render passes, and the point of a quality tier is
+    // that turning a feature off stops paying for it.
+    if (bloom_intensity_ > 0.0f) {
+        auto blur_pass = [&](VkPipeline pipeline, VkImageView dst,
+                             VkExtent2D dst_extent, VkExtent2D src_extent,
+                             VkDescriptorSet src_set, bool load, bool first,
+                             float radius) {
+            VkRenderingAttachmentInfo att{
+                VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            att.imageView   = dst;
+            att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            // LOAD on the way up, because the blend adds to what is there;
+            // DONT_CARE on the way down, because every pixel is overwritten.
+            att.loadOp      = load ? VK_ATTACHMENT_LOAD_OP_LOAD
+                                   : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            att.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+
+            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            ri.renderArea           = {{0, 0}, dst_extent};
+            ri.layerCount           = 1;
+            ri.colorAttachmentCount = 1;
+            ri.pColorAttachments    = &att;
+
+            vkCmdBeginRendering(cmd, &ri);
+            const VkViewport bvp{0.0f, 0.0f,
+                                 static_cast<float>(dst_extent.width),
+                                 static_cast<float>(dst_extent.height),
+                                 0.0f, 1.0f};
+            const VkRect2D bsc{{0, 0}, dst_extent};
+            vkCmdSetViewport(cmd, 0, 1, &bvp);
+            vkCmdSetScissor(cmd, 0, 1, &bsc);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    blur_pipeline_layout_, 0, 1, &src_set, 0,
+                                    nullptr);
+            // The filter works in SOURCE texels, so the offsets it needs are
+            // the reciprocal of the source resolution, not the destination's.
+            const float params[4] = {1.0f / static_cast<float>(src_extent.width),
+                                     1.0f / static_cast<float>(src_extent.height),
+                                     first ? 1.0f : 0.0f, radius};
+            vkCmdPushConstants(cmd, blur_pipeline_layout_,
+                               VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(params),
+                               params);
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+            vkCmdEndRendering(cmd);
+        };
+
+        for (std::uint32_t i = 0; i < kBloomLevels; ++i) {
+            // UNDEFINED: this level is fully overwritten below, so last
+            // frame's contents are not worth a preserving transition.
+            transition_image(cmd, ctx.bloom[i].image, VK_IMAGE_ASPECT_COLOR_BIT,
+                             VK_IMAGE_LAYOUT_UNDEFINED,
+                             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
+                             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+            blur_pass(bloom_down_pipeline_, ctx.bloom[i].view,
+                      ctx.bloom[i].extent,
+                      (i == 0) ? ctx.extent : ctx.bloom[i - 1].extent,
+                      f.blur_src[i], false, i == 0, 1.0f);
+
+            transition_image(cmd, ctx.bloom[i].image, VK_IMAGE_ASPECT_COLOR_BIT,
+                             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
+
+        for (std::int32_t i = static_cast<std::int32_t>(kBloomLevels) - 2;
+             i >= 0; --i) {
+            const auto lvl = static_cast<std::uint32_t>(i);
+            // SHADER_READ this time, not UNDEFINED: the blend adds into what
+            // the downsample already put here, so it must be preserved.
+            transition_image(cmd, ctx.bloom[lvl].image, VK_IMAGE_ASPECT_COLOR_BIT,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
+
+            blur_pass(bloom_up_pipeline_, ctx.bloom[lvl].view,
+                      ctx.bloom[lvl].extent, ctx.bloom[lvl + 1].extent,
+                      f.blur_src[lvl + 2], true, false, 1.5f);
+
+            transition_image(cmd, ctx.bloom[lvl].image, VK_IMAGE_ASPECT_COLOR_BIT,
+                             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
+    } else {
+        // Bloom off: the chain never ran, so level 0 is still UNDEFINED while
+        // the post pass's descriptor declares it SHADER_READ_ONLY. The shader
+        // skips the fetch, but the layout has to be legal regardless - and an
+        // undefined image can read back as Inf or NaN, which mix() would
+        // propagate even at a weight of zero.
+        transition_image(cmd, ctx.bloom[0].image, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    }
+    ctx.gpu_mark(cmd, "bloom");
 
     transition_image(cmd, ctx.images[image_index], VK_IMAGE_ASPECT_COLOR_BIT,
                      VK_IMAGE_LAYOUT_UNDEFINED,
@@ -1009,7 +1205,7 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
     // had to agree about it; now exactly one does.
     // x exposure, y tone curve, z bloom intensity (unused yet), w reserved.
     const float post_params[4] = {globals.shading[1], globals.water[1],
-                                  0.0f, 0.0f};
+                                  bloom_intensity_, 0.0f};
     vkCmdPushConstants(cmd, post_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(post_params), post_params);
     vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -1070,6 +1266,12 @@ void OceanView::shutdown(VkContext& ctx)
         vkDestroyPipelineLayout(ctx.device, post_pipeline_layout_, nullptr);
     if (post_set_layout_)
         vkDestroyDescriptorSetLayout(ctx.device, post_set_layout_, nullptr);
+    if (bloom_down_pipeline_) vkDestroyPipeline(ctx.device, bloom_down_pipeline_, nullptr);
+    if (bloom_up_pipeline_) vkDestroyPipeline(ctx.device, bloom_up_pipeline_, nullptr);
+    if (blur_pipeline_layout_)
+        vkDestroyPipelineLayout(ctx.device, blur_pipeline_layout_, nullptr);
+    if (blur_set_layout_)
+        vkDestroyDescriptorSetLayout(ctx.device, blur_set_layout_, nullptr);
     if (post_sampler_) vkDestroySampler(ctx.device, post_sampler_, nullptr);
     vkDestroyPipelineLayout(ctx.device, pipeline_layout_, nullptr);
     vkDestroyDescriptorPool(ctx.device, descriptor_pool_, nullptr);

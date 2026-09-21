@@ -84,6 +84,10 @@ ocean_add_shader(shaders/post.vert kPostVertSpv)
 list(APPEND ALL_HEADERS ${OCEAN_SHADER_HEADERS})
 ocean_add_shader(shaders/post.frag kPostFragSpv)
 list(APPEND ALL_HEADERS ${OCEAN_SHADER_HEADERS})
+ocean_add_shader(shaders/bloom_down.frag kBloomDownFragSpv)
+list(APPEND ALL_HEADERS ${OCEAN_SHADER_HEADERS})
+ocean_add_shader(shaders/bloom_up.frag kBloomUpFragSpv)
+list(APPEND ALL_HEADERS ${OCEAN_SHADER_HEADERS})
 
 add_custom_target(ocean_viewer_shaders DEPENDS ${ALL_HEADERS})
 

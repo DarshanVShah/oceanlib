@@ -17,6 +17,7 @@
 //   --no-slope-var    stop the faded cascades' slope variance from feeding the
 //                     specular lobe, leaving the distant sea a mirror (ADR-023)
 //   --tonemap C       tone curve: aces (default) or reinhard
+//   --bloom F         bloom mix, 0 disables the chain (default 0.06)
 //   --foam-decay R    foam decay rate, 1/s (default 0.30, half-life 2.3 s)
 //   --foam-gain G     how fast breaking injects foam, 1/s (default 4)
 //   --foam-advect S   multiplier on the advecting current (default 1)
@@ -104,6 +105,11 @@ struct Options {
     // 0 = Reinhard on luminance (the original), 1 = ACES. See tonemap.glsl for
     // what the difference actually is.
     float         tonemap = 1.0f;
+    // Fraction of the composite that is the blurred image. Low, because the
+    // mix is a redistribution rather than an addition - see post.frag - so a
+    // little goes a long way, and the sun path is already brighter than the
+    // sea around it by orders of magnitude. 0 skips the chain entirely.
+    float         bloom = 0.06f;
     // Steady-state coverage under a sustained source is source_gain/decay, so
     // this ratio is the knob that decides whether foam reads as whitecaps or
     // as milk. 4/0.3 = 13x saturated the entire ocean; 1.5/0.4 = 3.75x lets a
@@ -148,6 +154,7 @@ Options parse_args(int argc, char** argv)
         else if (a == "--no-foam-advect") o.no_foam_advect = true;
         else if (a == "--no-detail-fade") o.no_detail_fade = true;
         else if (a == "--no-slope-var")   o.no_slope_var = true;
+        else if (a == "--bloom")   o.bloom = std::strtof(next(), nullptr);
         else if (a == "--tonemap") {
             const std::string m = next();
             o.tonemap = (m == "reinhard") ? 0.0f : 1.0f;
@@ -733,6 +740,7 @@ int main(int argc, char** argv)
         glfwTerminate();
         return 1;
     }
+    view.set_bloom(opt.bloom);
     std::printf("mesh: %u quads/tile, %ux%u tiles (of the far cascade), %.2fM triangles/frame\n",
                 opt.mesh, opt.tiles, opt.tiles,
                 view.triangle_count() / 1.0e6);

@@ -67,6 +67,7 @@ bool VkContext::init(GLFWwindow* w, bool enable_validation)
     if (!create_swapchain()) return false;
     if (!create_depth_resources()) return false;
     if (!create_hdr_target()) return false;
+    if (!create_bloom_chain()) return false;
     if (!create_frames()) return false;
     create_timestamp_pool();
     return true;
@@ -412,6 +413,51 @@ bool VkContext::create_hdr_target()
     return vkCreateImageView(device, &vi, nullptr, &hdr_view) == VK_SUCCESS;
 }
 
+bool VkContext::create_bloom_chain()
+{
+    for (std::uint32_t i = 0; i < kBloomLevels; ++i) {
+        BloomLevel& lvl = bloom[i];
+        // Level 0 is half resolution, and each one after that halves again.
+        // Clamped at 1 so a very small or very thin window cannot ask for a
+        // zero-sized image, which is not a legal extent.
+        lvl.extent.width  = (extent.width  >> (i + 1)) ? (extent.width  >> (i + 1)) : 1u;
+        lvl.extent.height = (extent.height >> (i + 1)) ? (extent.height >> (i + 1)) : 1u;
+
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ici.imageType     = VK_IMAGE_TYPE_2D;
+        ici.format        = hdr_format;
+        ici.extent        = {lvl.extent.width, lvl.extent.height, 1};
+        ici.mipLevels     = 1;
+        ici.arrayLayers   = 1;
+        ici.samples       = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        // Each level is written as an attachment on the way down and sampled
+        // on the way back up, so both usages are needed on every level.
+        ici.usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                            VK_IMAGE_USAGE_SAMPLED_BIT;
+        ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(device, &ici, nullptr, &lvl.image) != VK_SUCCESS) return false;
+
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(device, lvl.image, &req);
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize  = req.size;
+        ai.memoryTypeIndex = find_memory_type(req.memoryTypeBits,
+                                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (vkAllocateMemory(device, &ai, nullptr, &lvl.memory) != VK_SUCCESS) return false;
+        vkBindImageMemory(device, lvl.image, lvl.memory, 0);
+
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image            = lvl.image;
+        vi.viewType         = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format           = hdr_format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(device, &vi, nullptr, &lvl.view) != VK_SUCCESS) return false;
+    }
+    return true;
+}
+
 bool VkContext::create_frames()
 {
     for (std::uint32_t i = 0; i < kFramesInFlight; ++i) {
@@ -670,6 +716,13 @@ void VkContext::destroy_swapchain()
         vkFreeMemory(device, hdr_memory, nullptr);
         hdr_view = VK_NULL_HANDLE;
     }
+    for (BloomLevel& lvl : bloom) {
+        if (lvl.view == VK_NULL_HANDLE) continue;
+        vkDestroyImageView(device, lvl.view, nullptr);
+        vkDestroyImage(device, lvl.image, nullptr);
+        vkFreeMemory(device, lvl.memory, nullptr);
+        lvl = BloomLevel{};
+    }
     for (VkSemaphore s : render_finished) vkDestroySemaphore(device, s, nullptr);
     for (VkImageView v : image_views) vkDestroyImageView(device, v, nullptr);
     render_finished.clear();
@@ -697,6 +750,7 @@ void VkContext::recreate_swapchain()
     create_swapchain();
     create_depth_resources();
     create_hdr_target();
+    create_bloom_chain();
 }
 
 void VkContext::shutdown()

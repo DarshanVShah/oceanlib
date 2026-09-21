@@ -161,6 +161,11 @@ private:
         // HDR image - a set that also names that image as a sampled texture
         // would be a read/write hazard on the same resource in the same pass.
         VkDescriptorSet post_descriptor = VK_NULL_HANDLE;
+
+        // One set per thing the blur passes read: [0] is the scene, [i+1] is
+        // bloom level i. Downsample step i reads blur_src[i], upsample step i
+        // reads blur_src[i + 2].
+        std::array<VkDescriptorSet, kBloomLevels + 1> blur_src{};
     };
     FrameResources frames_[kFramesInFlight]{};
 
@@ -202,6 +207,19 @@ private:
     // sampling off the edge - where repeating would wrap the bright side of
     // the image onto the dark one.
     VkSampler             post_sampler_         = VK_NULL_HANDLE;
+
+    // --- bloom -----------------------------------------------------------
+    // One binding, the source image; shared by both blur directions.
+    VkDescriptorSetLayout blur_set_layout_      = VK_NULL_HANDLE;
+    VkPipelineLayout      blur_pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline            bloom_down_pipeline_  = VK_NULL_HANDLE;
+    VkPipeline            bloom_up_pipeline_    = VK_NULL_HANDLE;
+    float                 bloom_intensity_      = 0.0f;
+
+public:
+    // How much of the composite is the blurred image rather than the sharp
+    // one. 0 disables the chain entirely, skipping its passes.
+    void set_bloom(float intensity) { bloom_intensity_ = intensity; }
 };
 
 }  // namespace viewer

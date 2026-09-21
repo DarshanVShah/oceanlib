@@ -32,6 +32,9 @@ struct Frame {
 // tune it.
 inline constexpr std::uint32_t kMaxGpuMarks = 8;
 
+// Levels in the bloom chain, the first at half the swapchain's resolution.
+inline constexpr std::uint32_t kBloomLevels = 5;
+
 // One measured interval: the time from the previous mark to this one.
 struct GpuSpan {
     const char* name = nullptr;
@@ -151,6 +154,27 @@ public:
     VkDeviceMemory hdr_memory = VK_NULL_HANDLE;
     VkImageView    hdr_view   = VK_NULL_HANDLE;
 
+    // The bloom chain: successively halved copies of the scene, gathered on
+    // the way down and summed back on the way up.
+    //
+    // Separate images rather than one image with a mip chain. The two are
+    // equivalent on the GPU, but every barrier here then covers a whole image
+    // and transition_image's one-mip subresource range works unchanged, where
+    // a mip chain would need per-level ranges threaded through it. For five
+    // small allocations that is the better trade in a viewer.
+    //
+    // Five levels from half resolution reaches roughly 1/32 of the frame,
+    // which at 1600x900 is 50x28 - wide enough that the widest bloom spans a
+    // meaningful fraction of the screen without the chain running down to
+    // single texels, where the tent filter stops meaning anything.
+    struct BloomLevel {
+        VkImage        image  = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView    view   = VK_NULL_HANDLE;
+        VkExtent2D     extent{};
+    };
+    std::array<BloomLevel, kBloomLevels> bloom{};
+
     VkCommandPool command_pool = VK_NULL_HANDLE;
     Frame         frames[kFramesInFlight]{};
     std::uint32_t frame_index = 0;
@@ -190,6 +214,7 @@ private:
     void destroy_swapchain();
     bool create_depth_resources();
     bool create_hdr_target();
+    bool create_bloom_chain();
     bool create_frames();
     void create_timestamp_pool();
 };
