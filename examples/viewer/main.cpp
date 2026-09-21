@@ -899,6 +899,11 @@ int main(int argc, char** argv)
         // they must run after stack.update() and before field.update() folds
         // this frame's new splashes in - the same ordering the click handling
         // above already relies on.
+        // Drop the warm-up out of the GPU averages: the first frames pay for
+        // pipeline creation, first-touch allocation and a cold clock state,
+        // none of which is what a steady-state measurement is asking about.
+        if (frame_counter == 60) ctx.gpu_reset_stats();
+
         boat.update(water, input.paused ? 0.0f : static_cast<float>(dt));
 
         // The hull pushes back on the water it is floating in. Boat::update
@@ -1093,12 +1098,16 @@ int main(int argc, char** argv)
         if (!opt.screenshot.empty() && frame_counter >= opt.frames) {
             // The GPU breakdown on the way out, so a headless capture run is
             // also a measurement run - the title bar is no use to a script.
-            if (ctx.gpu_timing_supported() && !ctx.gpu_spans().empty()) {
-                std::printf("gpu: %.3f ms total", ctx.gpu_total_ms());
-                for (const viewer::GpuSpan& sp : ctx.gpu_spans()) {
-                    std::printf(", %s %.3f", sp.name ? sp.name : "?", sp.ms);
+            if (ctx.gpu_timing_supported() && !ctx.gpu_stats().empty()) {
+                const viewer::GpuStat& tot = ctx.gpu_total_stat();
+                std::printf("gpu over %llu frames (mean [min..max] ms):\n",
+                            static_cast<unsigned long long>(tot.count));
+                std::printf("  %-8s %6.3f  [%6.3f .. %6.3f]\n", "total",
+                            tot.mean(), tot.min, tot.max);
+                for (const viewer::GpuStat& st : ctx.gpu_stats()) {
+                    std::printf("  %-8s %6.3f  [%6.3f .. %6.3f]\n",
+                                st.name ? st.name : "?", st.mean(), st.min, st.max);
                 }
-                std::printf("\n");
             }
             for (std::size_t i = 0; i < foam_fields.size(); ++i) {
                 const ocean::Buffers lb = stack.buffers(i);

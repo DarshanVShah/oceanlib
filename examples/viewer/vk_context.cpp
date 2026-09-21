@@ -552,6 +552,30 @@ void VkContext::gpu_collect(std::uint32_t slot)
     const std::uint64_t last  = ticks[m.count - 1] & timestamp_mask_;
     gpu_total_ms_ = static_cast<double>((last - first) & timestamp_mask_) *
                     ns_per_tick * 1e-6;
+
+    // Accumulate. The span list is a fixed sequence for a given build, so an
+    // index is a stable key; the name is carried along only for printing.
+    if (gpu_stats_.size() != gpu_spans_.size()) {
+        gpu_stats_.assign(gpu_spans_.size(), GpuStat{});
+    }
+    auto accumulate = [](GpuStat& st, const char* name, double ms) {
+        st.name = name;
+        if (st.count == 0) { st.min = ms; st.max = ms; }
+        else { st.min = (ms < st.min) ? ms : st.min;
+               st.max = (ms > st.max) ? ms : st.max; }
+        st.sum += ms;
+        ++st.count;
+    };
+    for (std::size_t i = 0; i < gpu_spans_.size(); ++i) {
+        accumulate(gpu_stats_[i], gpu_spans_[i].name, gpu_spans_[i].ms);
+    }
+    accumulate(gpu_total_stat_, "total", gpu_total_ms_);
+}
+
+void VkContext::gpu_reset_stats()
+{
+    gpu_stats_.clear();
+    gpu_total_stat_ = GpuStat{};
 }
 
 bool VkContext::begin_frame(std::uint32_t& image_index, VkCommandBuffer& cmd)

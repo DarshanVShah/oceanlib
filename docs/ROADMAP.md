@@ -24,77 +24,106 @@ after evidence.
 **If this shows the frame is vertex-bound at 6.42M triangles, Phase 8 moves to
 the front.** That is the one result that reorders the plan.
 
-#### Results, and they did reorder it
+#### A first pass at the results, which was wrong
 
-RTX 4070 Laptop, 1600x900, 3 cascades at 256, default settings:
+The first numbers taken here were single samples: one frame's timestamps, read
+at the end of a capture run. They gave `upload 2.24 ms` against a 5.46 ms
+frame — 41% — and a byte sweep that looked convincingly linear at 3.26, 3.29,
+3.17 and 3.28 GB/s across four configurations.
 
-    gpu: 5.46 ms total, upload 2.24, sky 0.17, ocean 3.05, props 0.01
+All four of those had been sampled in the same throttled clock state. Running
+the *identical* configuration three times gave upload = 2.29, 0.61 and 2.51 ms:
+a 4x spread, bimodal, on a laptop GPU whose clocks move underneath the
+measurement. Four consistent readings of a quantity that varies 4x run to run
+is not corroboration, it is four draws from the same mode.
 
-Sweeping mesh density with everything else fixed separates the ocean pass into
-its vertex and fragment halves:
+**One frame's timestamp is not a measurement.** The instrumentation now
+accumulates mean, min and max across every frame after a 60-frame warm-up, and
+the statistic worth comparing turns out to be the **minimum**: across separate
+runs the means disagree by 30% or more while the minima repeat to three decimal
+places (upload 0.575 / 0.574, ocean 1.548 / 1.546, sky 0.071 / 0.070). That is
+what one would expect — contention and downclocking can only ever *add* time,
+so the floor is the clean signal and everything above it is noise.
+
+#### Results
+
+RTX 4070 Laptop, 1600x900, 3 cascades at 256, minimum over 500 frames:
+
+| span   | min ms | share |
+|--------|--------|-------|
+| ocean — vertex   | 1.377 | **62%** |
+| upload           | 0.575 | 26% |
+| ocean — fragment | 0.166 | 7% |
+| sky              | 0.070 | 3% |
+| post             | 0.017 | 1% |
+| props            | 0.001 | — |
+| **total**        | **2.225** | |
+
+Mesh density with everything else fixed splits the ocean pass:
 
 | mesh | triangles | ocean |
 |------|-----------|-------|
-| 256  | 6.42M     | 3.02 ms |
-| 128  | 1.61M     | 1.32 ms |
-| 64   | 0.40M     | 0.85 ms |
-| 32   | 0.10M     | 0.60 ms |
+| 256  | 6.42M     | 1.543 ms |
+| 128  | 1.61M     | 0.525 ms |
+| 64   | 0.40M     | 0.241 ms |
+| 32   | 0.10M     | 0.166 ms |
 
-A 64x reduction in triangles takes the pass from 3.02 ms to 0.60 ms, so about
-**2.4 ms is vertex throughput and about 0.6 ms is everything the fragment
-shader does** — and `upload` does not move at all, as it should not.
+`upload` reads 0.576-0.586 ms across all four, as it must — it does not care
+what is drawn. The 0.10M row is essentially pure fragment work, so the vertex
+half of the full-density pass is about 1.38 ms and the fragment half about
+0.17 ms.
 
-Sweeping the uploaded bytes instead:
+Uploaded bytes, swept independently:
 
-| uploaded per frame | upload | implied rate |
-|--------------------|--------|--------------|
-| 7.34 MB (baseline) | 2.26 ms | 3.26 GB/s |
-| 3.15 MB (1 cascade) | 0.96 ms | 3.29 GB/s |
-| 2.62 MB (cascades at 128) | 0.83 ms | 3.17 GB/s |
-| 6.36 MB (interaction at 64) | 1.94 ms | 3.28 GB/s |
+| uploaded per frame | upload | rate |
+|--------------------|--------|------|
+| 7.34 MB | 0.575 ms | 12.77 GB/s |
+| 3.15 MB | 0.248 ms | 12.70 GB/s |
+| 2.62 MB | 0.211 ms | 12.42 GB/s |
+| 6.36 MB | 0.503 ms | 12.64 GB/s |
 
-Four configurations, one rate. The upload is a **pure bandwidth wall, exactly
-linear in bytes**, with no fixed overhead to amortise away. Halving the bytes
-halves the time.
+Still exactly linear in bytes, but at **12.6 GB/s** — an ordinary PCIe rate,
+not the 3.2 GB/s "bandwidth wall" the first pass reported. The linearity was
+real; the rate was an artifact of measuring throttled frames.
 
-**Three conclusions, none of which the plan had right.**
+**Conclusions.**
 
-1. **The upload is 41% of the frame and was not on the roadmap at all.**
-   Three cascades of displacement and normals plus the interaction field is
-   7.34 MB every frame, 440 MB/s at 60 Hz, and on unified-memory mobile
-   hardware that is cache pressure rather than a spare bus.
-2. **The ocean pass is ~80% vertex-bound.** Phase 8 was scheduled last and is
-   attacking 44% of the frame.
-3. **The entire fragment shader is 0.6 ms — 11%.** The three Preetham
-   evaluations per pixel that Phase 4 exists to remove are a fraction of that.
+1. **The ocean pass is 62% vertex throughput.** Clipmap LOD was scheduled last
+   and is the single biggest item in the frame. It moves to the front.
+2. **The upload is 26%** — smaller than first claimed, still second-largest,
+   and halving its bytes halves its cost exactly.
+3. **The entire fragment shader is 7%.** Every per-pixel cost in this renderer
+   put together — three Preetham evaluations, six texture fetches, the whole
+   BRDF — is a fifteenth of the frame.
 
-The last one is the useful surprise: **fragment cost is not the problem, so
-there is real headroom to make the shading much more ambitious.** Bloom, SSR
-and a better BRDF are all fragment work being charged against the cheapest
-11% of the frame. The quality ambitions are affordable; the triangles and the
-bus are not.
+The third one is the useful one, and the correction strengthens it rather than
+weakening it: **fragment cost is not the problem, so the shading can be far
+more ambitious than planned.** Bloom, SSR and a better BRDF are charged
+against the cheapest 7% of the frame. The pretty things are affordable; the
+triangles and the bus are not.
 
-Caveat: this is one desktop GPU at 1600x900. Lower-end and mobile parts shift
-the balance toward fragment — but they shift it toward upload and vertex too,
-so the ranking is unlikely to inverse. Phase 9 is where that gets measured
-rather than assumed.
+Caveat: one desktop GPU at 1600x900. Lower-end and mobile parts shift the
+balance toward fragment — and toward upload and vertex too — so the ranking is
+unlikely to invert, but Phase 9 measures rather than assumes.
 
 #### Revised order
 
-Phases 1-3 stand: they are the visual payoff the fragment budget can now
-clearly afford, and Phase 1 gates everything after it. Then:
+Phases 1-3 stand: Phase 1 gates everything after it, and 2-3 are the visual
+payoff the fragment budget can clearly afford. Then, reordered by the numbers
+above:
 
-- **Phase 4a (new) · Halve the upload.** `R16G16B16A16_SFLOAT` instead of
-  `R32G32B32A32_SFLOAT` for the cascade and interaction textures. Directly
-  worth ~1.1 ms on the measured rate, the single largest win available, and it
-  costs a float-to-half conversion on the CPU that wants measuring against
-  what it saves. Also consider skipping the interaction upload entirely while
-  the field is quiescent, which is most of the time.
-- **Phase 4b · Clipmap LOD**, promoted from Phase 8. 2.4 ms of vertex work on
-  triangles that are mostly sub-pixel.
-- **Phase 4c · Prefiltered sky**, demoted from Phase 4. Still worth doing for
-  the roughness-aware reflection it enables — which is a *quality* argument,
-  ADR-023's stated limitation, not the performance argument it was sold on.
+- **Phase 4a · Clipmap LOD**, promoted from Phase 8. 1.38 ms of vertex work on
+  triangles that are mostly sub-pixel, and the largest single item in the frame.
+- **Phase 4b · Halve the upload.** `R16G16B16A16_SFLOAT` instead of
+  `R32G32B32A32_SFLOAT` for the cascade and interaction textures — worth about
+  0.29 ms at the measured rate, against the cost of a float-to-half conversion
+  on the CPU that wants measuring against what it saves. Skipping the
+  interaction upload entirely while the field is quiescent is nearly free and
+  worth doing first.
+- **Phase 4c · Prefiltered sky**, demoted from Phase 4. Worth doing for the
+  roughness-aware reflection it enables — ADR-023's stated limitation — which
+  is a *quality* argument. It was sold on performance, and at 7% fragment cost
+  that argument does not survive contact with the measurement.
 
 ### Phase 1 · HDR off-screen target and a post chain
 

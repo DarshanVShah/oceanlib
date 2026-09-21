@@ -38,6 +38,22 @@ struct GpuSpan {
     double      ms   = 0.0;
 };
 
+// The same interval accumulated over many frames.
+//
+// A single frame's timestamp is not a measurement of anything. Measured on
+// this viewer, the upload span alone came back as 2.29, 0.61 and 2.51 ms on
+// three identical runs - a 4x spread - because one sample catches whatever
+// clock state and queue overlap that particular frame happened to be in.
+// Reporting the mean with its range attached is the difference between a
+// number and a number someone could act on.
+struct GpuStat {
+    const char*   name  = nullptr;
+    double        sum   = 0.0;
+    double        min   = 0.0;
+    double        max   = 0.0;
+    std::uint64_t count = 0;
+    [[nodiscard]] double mean() const { return count ? sum / static_cast<double>(count) : 0.0; }
+};
 
 class VkContext {
 public:
@@ -72,6 +88,13 @@ public:
     [[nodiscard]] const std::vector<GpuSpan>& gpu_spans() const { return gpu_spans_; }
     [[nodiscard]] double gpu_total_ms() const { return gpu_total_ms_; }
     [[nodiscard]] bool   gpu_timing_supported() const { return gpu_supported_; }
+
+    // Accumulated across every frame since the last reset. Reset after the
+    // warm-up frames so first-frame allocation and shader compilation do not
+    // sit inside the average.
+    [[nodiscard]] const std::vector<GpuStat>& gpu_stats() const { return gpu_stats_; }
+    [[nodiscard]] const GpuStat& gpu_total_stat() const { return gpu_total_stat_; }
+    void gpu_reset_stats();
 
     // --- small allocation helpers ---------------------------------------
     //
@@ -154,6 +177,8 @@ public:
     std::array<GpuFrameMarks, kFramesInFlight> gpu_marks_{};
     std::vector<GpuSpan> gpu_spans_;
     double               gpu_total_ms_ = 0.0;
+    std::vector<GpuStat> gpu_stats_;
+    GpuStat              gpu_total_stat_{};
 
     void gpu_collect(std::uint32_t slot);
 
