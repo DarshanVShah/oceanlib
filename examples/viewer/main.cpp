@@ -18,6 +18,7 @@
 //                     specular lobe, leaving the distant sea a mirror (ADR-023)
 //   --tonemap C       tone curve: aces (default) or reinhard
 //   --bloom F         bloom mix, 0 disables the chain (default 0.06)
+//   --msaa N          samples per pixel: 1, 2, 4 or 8 (default 4)
 //   --foam-decay R    foam decay rate, 1/s (default 0.30, half-life 2.3 s)
 //   --foam-gain G     how fast breaking injects foam, 1/s (default 4)
 //   --foam-advect S   multiplier on the advecting current (default 1)
@@ -110,6 +111,9 @@ struct Options {
     // little goes a long way, and the sun path is already brighter than the
     // sea around it by orders of magnitude. 0 skips the chain entirely.
     float         bloom = 0.06f;
+    // Samples per pixel for the scene pass. 4 is the usual sweet spot; the
+    // device clamps anything it cannot do.
+    std::uint32_t msaa = 4;
     // Steady-state coverage under a sustained source is source_gain/decay, so
     // this ratio is the knob that decides whether foam reads as whitecaps or
     // as milk. 4/0.3 = 13x saturated the entire ocean; 1.5/0.4 = 3.75x lets a
@@ -155,6 +159,7 @@ Options parse_args(int argc, char** argv)
         else if (a == "--no-detail-fade") o.no_detail_fade = true;
         else if (a == "--no-slope-var")   o.no_slope_var = true;
         else if (a == "--bloom")   o.bloom = std::strtof(next(), nullptr);
+        else if (a == "--msaa")    o.msaa  = std::strtoul(next(), nullptr, 10);
         else if (a == "--tonemap") {
             const std::string m = next();
             o.tonemap = (m == "reinhard") ? 0.0f : 1.0f;
@@ -587,7 +592,14 @@ int main(int argc, char** argv)
     glfwSetMouseButtonCallback(window, mouse_button_callback);
 
     viewer::VkContext ctx;
-    if (!ctx.init(window, opt.validation)) {
+    // Only powers of two up to 8 are legal sample counts; anything else falls
+    // back to none rather than being silently rounded to something nearby.
+    VkSampleCountFlagBits want = VK_SAMPLE_COUNT_1_BIT;
+    if (opt.msaa == 2)      want = VK_SAMPLE_COUNT_2_BIT;
+    else if (opt.msaa == 4) want = VK_SAMPLE_COUNT_4_BIT;
+    else if (opt.msaa == 8) want = VK_SAMPLE_COUNT_8_BIT;
+
+    if (!ctx.init(window, opt.validation, want)) {
         glfwDestroyWindow(window);
         glfwTerminate();
         return 1;

@@ -612,9 +612,12 @@ bool OceanView::create_pipelines(VkContext& ctx)
     dynamic.dynamicStateCount = 2;
     dynamic.pDynamicStates    = dynamic_states;
 
+    // The SCENE pipelines rasterise at the device's chosen sample count. The
+    // blur and post pipelines below are reset to 1, because they run after the
+    // resolve and never see more than one sample per pixel.
     VkPipelineMultisampleStateCreateInfo multisample{
         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    multisample.rasterizationSamples = ctx.msaa_samples;
 
     VkPipelineColorBlendAttachmentState blend_attachment{};
     blend_attachment.colorWriteMask =
@@ -719,8 +722,10 @@ bool OceanView::create_pipelines(VkContext& ctx)
                true, VK_POLYGON_MODE_FILL, pipeline_layout_, prop_pipeline_);
 
     // The blur passes write bloom levels, which carry the HDR format, and like
-    // the post pass have no depth attachment at all.
-    rendering.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
+    // the post pass have no depth attachment at all - nor any multisampling,
+    // since they consume the already-resolved image.
+    rendering.depthAttachmentFormat  = VK_FORMAT_UNDEFINED;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     ok &= build(post_vs, bdown_fs, nullptr, 0, nullptr, 0, false,
                VK_POLYGON_MODE_FILL, blur_pipeline_layout_, bloom_down_pipeline_);
 
@@ -914,18 +919,40 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
     // UNDEFINED as the old layout every frame: the whole attachment is cleared
     // below, so there is nothing in it worth preserving and telling the driver
     // so is free.
+    const bool multisampled = (ctx.msaa_samples != VK_SAMPLE_COUNT_1_BIT);
+
     transition_image(cmd, ctx.hdr_image, VK_IMAGE_ASPECT_COLOR_BIT,
                      VK_IMAGE_LAYOUT_UNDEFINED,
                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    if (multisampled) {
+        transition_image(cmd, ctx.hdr_ms_image, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    }
 
     VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    color.imageView   = ctx.hdr_view;
+    // With MSAA the scene is drawn into the multisampled image and the resolve
+    // writes the single-sample one; without it, straight into the latter.
+    color.imageView   = multisampled ? ctx.hdr_ms_view : ctx.hdr_view;
     color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    if (multisampled) {
+        color.resolveMode        = VK_RESOLVE_MODE_AVERAGE_BIT;
+        color.resolveImageView   = ctx.hdr_view;
+        color.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
     color.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    color.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+    // DONT_CARE for the multisampled image itself: the resolve is what anyone
+    // downstream reads, so storing the per-sample data would be writing a
+    // buffer nothing opens - and on a tiler it is what keeps the samples in
+    // tile memory rather than spilling them to RAM.
+    color.storeOp     = multisampled ? VK_ATTACHMENT_STORE_OP_DONT_CARE
+                                     : VK_ATTACHMENT_STORE_OP_STORE;
     color.clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
 
     VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};

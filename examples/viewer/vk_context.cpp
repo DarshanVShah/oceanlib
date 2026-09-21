@@ -54,9 +54,11 @@ void transition_image(VkCommandBuffer cmd, VkImage image,
     vkCmdPipelineBarrier2(cmd, &dep);
 }
 
-bool VkContext::init(GLFWwindow* w, bool enable_validation)
+bool VkContext::init(GLFWwindow* w, bool enable_validation,
+                     VkSampleCountFlagBits requested_msaa)
 {
     window = w;
+    msaa_samples = requested_msaa;
     if (!create_instance(enable_validation)) return false;
     if (!check(glfwCreateWindowSurface(instance, window, nullptr, &surface),
                "glfwCreateWindowSurface")) {
@@ -65,6 +67,28 @@ bool VkContext::init(GLFWwindow* w, bool enable_validation)
     if (!pick_physical_device()) return false;
     if (!create_device()) return false;
     if (!create_swapchain()) return false;
+    // Both attachments have to agree, so the usable set is the intersection.
+    {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(physical, &props);
+        const VkSampleCountFlags usable =
+            props.limits.framebufferColorSampleCounts &
+            props.limits.framebufferDepthSampleCounts;
+
+        for (VkSampleCountFlagBits b : {VK_SAMPLE_COUNT_8_BIT,
+                                        VK_SAMPLE_COUNT_4_BIT,
+                                        VK_SAMPLE_COUNT_2_BIT}) {
+            if (usable & b) { max_msaa_ = b; break; }
+        }
+        if (!(usable & msaa_samples)) {
+            std::fprintf(stderr,
+                         "MSAA: %ux not supported, falling back to %ux\n",
+                         static_cast<unsigned>(msaa_samples),
+                         static_cast<unsigned>(max_msaa_));
+            msaa_samples = max_msaa_;
+        }
+    }
+
     if (!create_depth_resources()) return false;
     if (!create_hdr_target()) return false;
     if (!create_bloom_chain()) return false;
@@ -345,7 +369,7 @@ bool VkContext::create_depth_resources()
     ici.extent      = {extent.width, extent.height, 1};
     ici.mipLevels   = 1;
     ici.arrayLayers = 1;
-    ici.samples     = VK_SAMPLE_COUNT_1_BIT;
+    ici.samples     = msaa_samples;
     ici.tiling      = VK_IMAGE_TILING_OPTIMAL;
     ici.usage       = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -395,6 +419,38 @@ bool VkContext::create_hdr_target()
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     if (vkCreateImage(device, &ici, nullptr, &hdr_image) != VK_SUCCESS) return false;
+
+    // The multisampled colour target, when there is one. TRANSIENT_ATTACHMENT
+    // alongside COLOR_ATTACHMENT because nothing ever samples it: it is
+    // written, resolved into hdr_image, and discarded within one pass, which
+    // on a tiler lets the driver keep it in tile memory and never write it to
+    // RAM at all. That is most of why MSAA is affordable on mobile.
+    if (msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
+        VkImageCreateInfo mci = ici;
+        mci.samples = msaa_samples;
+        mci.usage   = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+        if (vkCreateImage(device, &mci, nullptr, &hdr_ms_image) != VK_SUCCESS)
+            return false;
+
+        VkMemoryRequirements mreq{};
+        vkGetImageMemoryRequirements(device, hdr_ms_image, &mreq);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize  = mreq.size;
+        mai.memoryTypeIndex = find_memory_type(mreq.memoryTypeBits,
+                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (vkAllocateMemory(device, &mai, nullptr, &hdr_ms_memory) != VK_SUCCESS)
+            return false;
+        vkBindImageMemory(device, hdr_ms_image, hdr_ms_memory, 0);
+
+        VkImageViewCreateInfo mvi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        mvi.image            = hdr_ms_image;
+        mvi.viewType         = VK_IMAGE_VIEW_TYPE_2D;
+        mvi.format           = hdr_format;
+        mvi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(device, &mvi, nullptr, &hdr_ms_view) != VK_SUCCESS)
+            return false;
+    }
 
     VkMemoryRequirements req{};
     vkGetImageMemoryRequirements(device, hdr_image, &req);
@@ -715,6 +771,12 @@ void VkContext::destroy_swapchain()
         vkDestroyImage(device, hdr_image, nullptr);
         vkFreeMemory(device, hdr_memory, nullptr);
         hdr_view = VK_NULL_HANDLE;
+    }
+    if (hdr_ms_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(device, hdr_ms_view, nullptr);
+        vkDestroyImage(device, hdr_ms_image, nullptr);
+        vkFreeMemory(device, hdr_ms_memory, nullptr);
+        hdr_ms_view = VK_NULL_HANDLE;
     }
     for (BloomLevel& lvl : bloom) {
         if (lvl.view == VK_NULL_HANDLE) continue;

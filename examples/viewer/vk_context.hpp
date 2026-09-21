@@ -60,7 +60,9 @@ struct GpuStat {
 
 class VkContext {
 public:
-    bool init(GLFWwindow* window, bool enable_validation);
+    // `requested_msaa` is clamped to what the device supports; pass 1 for none.
+    bool init(GLFWwindow* window, bool enable_validation,
+              VkSampleCountFlagBits requested_msaa = VK_SAMPLE_COUNT_1_BIT);
     void shutdown();
 
     // Acquires the next swapchain image and begins recording. Returns false if
@@ -153,6 +155,27 @@ public:
     VkImage        hdr_image  = VK_NULL_HANDLE;
     VkDeviceMemory hdr_memory = VK_NULL_HANDLE;
     VkImageView    hdr_view   = VK_NULL_HANDLE;
+
+    // Multisampling. The scene renders into hdr_ms_* and is resolved into
+    // hdr_* for everything downstream, so bloom and the post pass never see
+    // more than one sample per pixel.
+    //
+    // Requested by the caller and then clamped to what the device actually
+    // reports for BOTH colour and depth - a device may support 8x for one and
+    // not the other, and attaching mismatched counts is invalid.
+    //
+    // At 1 sample these stay null and the scene renders straight into hdr_*
+    // with no resolve, which is the path the low quality tier wants: not
+    // "MSAA with one sample", just no MSAA.
+    VkSampleCountFlagBits msaa_samples  = VK_SAMPLE_COUNT_1_BIT;
+    VkImage               hdr_ms_image  = VK_NULL_HANDLE;
+    VkDeviceMemory        hdr_ms_memory = VK_NULL_HANDLE;
+    VkImageView           hdr_ms_view   = VK_NULL_HANDLE;
+
+    // Highest count this device supports for both attachments, filled in at
+    // init so the caller can report it or clamp a request against it.
+    [[nodiscard]] VkSampleCountFlagBits max_msaa_samples() const { return max_msaa_; }
+    VkSampleCountFlagBits max_msaa_ = VK_SAMPLE_COUNT_1_BIT;
 
     // The bloom chain: successively halved copies of the scene, gathered on
     // the way down and summed back on the way up.
