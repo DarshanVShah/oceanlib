@@ -8,6 +8,7 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -24,6 +25,19 @@ struct Frame {
     VkFence         in_flight       = VK_NULL_HANDLE;
 };
 
+// --- GPU timing -----------------------------------------------------------
+
+// Most timestamps any one frame may write. Eight is well past what the viewer
+// needs and costs 8 * 8 bytes per frame in flight, so there is no reason to
+// tune it.
+inline constexpr std::uint32_t kMaxGpuMarks = 8;
+
+// One measured interval: the time from the previous mark to this one.
+struct GpuSpan {
+    const char* name = nullptr;
+    double      ms   = 0.0;
+};
+
 class VkContext {
 public:
     bool init(GLFWwindow* window, bool enable_validation);
@@ -37,6 +51,26 @@ public:
 
     void recreate_swapchain();
     void wait_idle() const { vkDeviceWaitIdle(device); }
+
+    // --- GPU timing ------------------------------------------------------
+    //
+    // Timestamps go into this frame's own slice of one query pool and are read
+    // back kFramesInFlight frames later, when begin_frame() has already waited
+    // on that slot's fence. Reading them any sooner would mean blocking on the
+    // GPU to measure the GPU, which changes the thing being measured - the
+    // results are simply two frames stale instead, which for a running average
+    // on screen is no difference at all.
+    //
+    // A mark is a point, and the span it names is the interval from the
+    // previous mark to it. gpu_begin() lays down the unnamed zero point.
+    void gpu_begin(VkCommandBuffer cmd);
+    void gpu_mark(VkCommandBuffer cmd, const char* name);
+
+    // Spans from the most recently completed frame. Empty until one has
+    // finished, and empty for good on a device whose queue cannot timestamp.
+    [[nodiscard]] const std::vector<GpuSpan>& gpu_spans() const { return gpu_spans_; }
+    [[nodiscard]] double gpu_total_ms() const { return gpu_total_ms_; }
+    [[nodiscard]] bool   gpu_timing_supported() const { return gpu_supported_; }
 
     // --- small allocation helpers ---------------------------------------
     //
@@ -84,6 +118,28 @@ public:
     bool validation_enabled = false;
     VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
 
+    // --- GPU timing state -------------------------------------------------
+    VkQueryPool timestamp_pool_ = VK_NULL_HANDLE;
+    // Nanoseconds per tick, from the device limits. Vendors differ by orders
+    // of magnitude here, so a raw tick delta means nothing on its own.
+    float         timestamp_period_ns_ = 0.0f;
+    // Not every queue family can timestamp, and those that can may implement
+    // fewer than 64 valid bits - the rest are undefined and must be masked off
+    // before subtracting, or a wrap looks like a wildly negative interval.
+    std::uint64_t timestamp_mask_ = 0;
+    bool          gpu_supported_  = false;
+
+    struct GpuFrameMarks {
+        std::array<const char*, kMaxGpuMarks> names{};
+        std::uint32_t count    = 0;
+        bool          recorded = false;   // has this slot ever been submitted
+    };
+    std::array<GpuFrameMarks, kFramesInFlight> gpu_marks_{};
+    std::vector<GpuSpan> gpu_spans_;
+    double               gpu_total_ms_ = 0.0;
+
+    void gpu_collect(std::uint32_t slot);
+
 private:
     bool create_instance(bool enable_validation);
     bool pick_physical_device();
@@ -92,6 +148,7 @@ private:
     void destroy_swapchain();
     bool create_depth_resources();
     bool create_frames();
+    void create_timestamp_pool();
 };
 
 // Records a layout transition with synchronization2. Dependency scopes are

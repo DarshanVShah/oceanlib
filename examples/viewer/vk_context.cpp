@@ -66,7 +66,9 @@ bool VkContext::init(GLFWwindow* w, bool enable_validation)
     if (!create_device()) return false;
     if (!create_swapchain()) return false;
     if (!create_depth_resources()) return false;
-    return create_frames();
+    if (!create_frames()) return false;
+    create_timestamp_pool();
+    return true;
 }
 
 bool VkContext::create_instance(bool enable_validation)
@@ -397,10 +399,131 @@ bool VkContext::create_frames()
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// GPU timing
+// ---------------------------------------------------------------------------
+
+void VkContext::create_timestamp_pool()
+{
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(physical, &props);
+    timestamp_period_ns_ = props.limits.timestampPeriod;
+
+    // Two separate capabilities, and both have to hold. A device can report a
+    // timestamp period while the queue family we actually submit to writes
+    // zero valid bits, which would leave every reading garbage rather than
+    // failing loudly - so the queue family is checked, not just the device.
+    std::uint32_t family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, nullptr);
+    std::vector<VkQueueFamilyProperties> families(family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count,
+                                             families.data());
+
+    const std::uint32_t valid_bits =
+        (queue_family < family_count) ? families[queue_family].timestampValidBits : 0;
+
+    if (timestamp_period_ns_ <= 0.0f || valid_bits == 0) {
+        std::fprintf(stderr,
+                     "GPU timing unavailable: timestampPeriod %.3f, "
+                     "timestampValidBits %u on queue family %u\n",
+                     timestamp_period_ns_, valid_bits, queue_family);
+        return;
+    }
+
+    // Only the low `valid_bits` of each value are defined. Shifting by 64 is
+    // undefined behaviour in C++, so the full-width case is spelled out.
+    timestamp_mask_ = (valid_bits >= 64)
+                          ? ~std::uint64_t{0}
+                          : ((std::uint64_t{1} << valid_bits) - 1);
+
+    VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qpi.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+    qpi.queryCount = kFramesInFlight * kMaxGpuMarks;
+    if (vkCreateQueryPool(device, &qpi, nullptr, &timestamp_pool_) != VK_SUCCESS) {
+        std::fprintf(stderr, "GPU timing unavailable: query pool creation failed\n");
+        return;
+    }
+
+    gpu_supported_ = true;
+}
+
+void VkContext::gpu_begin(VkCommandBuffer cmd)
+{
+    if (!gpu_supported_) return;
+    GpuFrameMarks& m = gpu_marks_[frame_index];
+    m.count = 0;
+
+    // The whole slice is reset even though only `count` of it gets written:
+    // an unwritten query is UNAVAILABLE rather than stale, and reading one is
+    // undefined. Resetting outside a render pass is required, which is why
+    // this belongs in begin_frame and not beside the first draw.
+    vkCmdResetQueryPool(cmd, timestamp_pool_, frame_index * kMaxGpuMarks,
+                        kMaxGpuMarks);
+
+    // BOTTOM_OF_PIPE for the zero point: "after everything submitted so far
+    // has finished". TOP_OF_PIPE would be satisfied the instant the command
+    // reaches the front of the queue, which measures submission, not work.
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                         timestamp_pool_, frame_index * kMaxGpuMarks);
+    m.names[m.count] = nullptr;
+    ++m.count;
+}
+
+void VkContext::gpu_mark(VkCommandBuffer cmd, const char* name)
+{
+    if (!gpu_supported_) return;
+    GpuFrameMarks& m = gpu_marks_[frame_index];
+    if (m.count == 0 || m.count >= kMaxGpuMarks) return;   // no begin, or full
+
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                         timestamp_pool_,
+                         frame_index * kMaxGpuMarks + m.count);
+    m.names[m.count] = name;
+    ++m.count;
+    m.recorded = true;
+}
+
+void VkContext::gpu_collect(std::uint32_t slot)
+{
+    if (!gpu_supported_) return;
+    GpuFrameMarks& m = gpu_marks_[slot];
+    if (!m.recorded || m.count < 2) return;
+
+    std::uint64_t ticks[kMaxGpuMarks]{};
+    // No WAIT bit: begin_frame has already waited on this slot's fence, so the
+    // results are there. Asking the driver to wait as well would be a second,
+    // redundant stall - and if they somehow are not ready, a dropped sample is
+    // the right outcome for a statistic, not a stalled frame.
+    const VkResult r = vkGetQueryPoolResults(
+        device, timestamp_pool_, slot * kMaxGpuMarks, m.count,
+        sizeof(ticks), ticks, sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+    if (r != VK_SUCCESS) return;
+
+    gpu_spans_.clear();
+    const double ns_per_tick = static_cast<double>(timestamp_period_ns_);
+    for (std::uint32_t i = 1; i < m.count; ++i) {
+        const std::uint64_t a = ticks[i - 1] & timestamp_mask_;
+        const std::uint64_t b = ticks[i] & timestamp_mask_;
+        // Masked subtraction in unsigned arithmetic, so a counter that wrapped
+        // between the two marks still yields the true positive interval.
+        const std::uint64_t d = (b - a) & timestamp_mask_;
+        gpu_spans_.push_back({m.names[i], static_cast<double>(d) * ns_per_tick * 1e-6});
+    }
+
+    const std::uint64_t first = ticks[0] & timestamp_mask_;
+    const std::uint64_t last  = ticks[m.count - 1] & timestamp_mask_;
+    gpu_total_ms_ = static_cast<double>((last - first) & timestamp_mask_) *
+                    ns_per_tick * 1e-6;
+}
+
 bool VkContext::begin_frame(std::uint32_t& image_index, VkCommandBuffer& cmd)
 {
     Frame& f = frames[frame_index];
     vkWaitForFences(device, 1, &f.in_flight, VK_TRUE, UINT64_MAX);
+
+    // This slot's previous submission has now completed, so its timestamps are
+    // readable without stalling anything.
+    gpu_collect(frame_index);
 
     const VkResult acq = vkAcquireNextImageKHR(
         device, swapchain, UINT64_MAX, f.image_available, VK_NULL_HANDLE,
@@ -420,6 +543,7 @@ bool VkContext::begin_frame(std::uint32_t& image_index, VkCommandBuffer& cmd)
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(f.cmd, &bi);
+    gpu_begin(f.cmd);
 
     cmd = f.cmd;
     return true;
@@ -518,6 +642,7 @@ void VkContext::shutdown()
             vkDestroyFence(device, frames[i].in_flight, nullptr);
     }
     destroy_swapchain();
+    if (timestamp_pool_) vkDestroyQueryPool(device, timestamp_pool_, nullptr);
     if (command_pool) vkDestroyCommandPool(device, command_pool, nullptr);
     vkDestroyDevice(device, nullptr);
     device = VK_NULL_HANDLE;

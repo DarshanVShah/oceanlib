@@ -1054,12 +1054,34 @@ int main(int argc, char** argv)
             // Queried through WaterSurface, so the number in the title bar
             // includes the wake - the whole point of the combined query.
             const float h = surf_y;
-            char title[320];
+
+            // GPU cost, per pass, measured on the device rather than inferred
+            // from the frame rate - which on a vsynced swapchain measures the
+            // display and nothing else. Two frames stale by construction (see
+            // VkContext::gpu_collect), which no running average can tell.
+            char gpu_desc[160] = "";
+            if (ctx.gpu_timing_supported() && !ctx.gpu_spans().empty()) {
+                int n = std::snprintf(gpu_desc, sizeof(gpu_desc), "  |  gpu %.2f ms (",
+                                      ctx.gpu_total_ms());
+                const auto& spans = ctx.gpu_spans();
+                for (std::size_t i = 0; i < spans.size() && n > 0 &&
+                                        n < static_cast<int>(sizeof(gpu_desc)); ++i) {
+                    n += std::snprintf(gpu_desc + n, sizeof(gpu_desc) - n, "%s%s %.2f",
+                                       i ? " " : "",
+                                       spans[i].name ? spans[i].name : "?", spans[i].ms);
+                }
+                if (n > 0 && n < static_cast<int>(sizeof(gpu_desc))) {
+                    std::snprintf(gpu_desc + n, sizeof(gpu_desc) - n, ")");
+                }
+            }
+
+            char title[512];
             std::snprintf(title, sizeof(title),
-                          "oceanlib  |  %.0f fps  |  sim %.2f ms (wake %.2f)  |  "
+                          "oceanlib  |  %.0f fps  |  sim %.2f ms (wake %.2f)%s  |  "
                           "%ux%u  |  chop %.2f  |  water %+.2f m  |  "
                           "impulse %.2f m / r %.2f m  |  rocks in flight %zu%s%s",
-                          fps_avg, ocean_ms_avg, inter_ms_avg, opt.size, opt.size,
+                          fps_avg, ocean_ms_avg, inter_ms_avg, gpu_desc,
+                          opt.size, opt.size,
                           input.choppiness, h,
                           input.impulse_strength, input.impulse_radius,
                           rock_thrower.in_flight(),
@@ -1069,6 +1091,15 @@ int main(int argc, char** argv)
         }
 
         if (!opt.screenshot.empty() && frame_counter >= opt.frames) {
+            // The GPU breakdown on the way out, so a headless capture run is
+            // also a measurement run - the title bar is no use to a script.
+            if (ctx.gpu_timing_supported() && !ctx.gpu_spans().empty()) {
+                std::printf("gpu: %.3f ms total", ctx.gpu_total_ms());
+                for (const viewer::GpuSpan& sp : ctx.gpu_spans()) {
+                    std::printf(", %s %.3f", sp.name ? sp.name : "?", sp.ms);
+                }
+                std::printf("\n");
+            }
             for (std::size_t i = 0; i < foam_fields.size(); ++i) {
                 const ocean::Buffers lb = stack.buffers(i);
                 double instant = 0.0;

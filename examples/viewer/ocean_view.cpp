@@ -783,6 +783,11 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
         f.interaction_initialised = true;
     }
 
+    // Everything above is staging-buffer to image copies: the per-frame cost of
+    // handing the library's output to the GPU. Worth timing on its own, since
+    // it scales with cascade resolution rather than with anything on screen.
+    ctx.gpu_mark(cmd, "upload");
+
     // --- render ----------------------------------------------------------
     transition_image(cmd, ctx.images[image_index], VK_IMAGE_ASPECT_COLOR_BIT,
                      VK_IMAGE_LAYOUT_UNDEFINED,
@@ -833,6 +838,7 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
     // Sky first: three vertices, no buffers, generated from gl_VertexIndex.
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sky_pipeline_);
     vkCmdDraw(cmd, 3, 1, 0, 0);
+    ctx.gpu_mark(cmd, "sky");
 
     // Ocean: one instance per tile of cascade 0's (the largest scale's) patch.
     // Cascades 1 and 2 are sampled through their own wrapped UVs inside that
@@ -843,6 +849,7 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
     vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer_, &offset);
     vkCmdBindIndexBuffer(cmd, index_buffer_, 0, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(cmd, index_count_, tiles_ * tiles_, 0, 0, 0);
+    ctx.gpu_mark(cmd, "ocean");
 
     // Props: the boat and any rocks, one push-constant update and one indexed
     // draw per instance. Counts here are always small (a boat's three boxes
@@ -864,6 +871,7 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
                              range.vertex_base, 0);
         }
     }
+    ctx.gpu_mark(cmd, "props");
 
     vkCmdEndRendering(cmd);
 
