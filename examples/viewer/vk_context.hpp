@@ -38,6 +38,7 @@ struct GpuSpan {
     double      ms   = 0.0;
 };
 
+
 class VkContext {
 public:
     bool init(GLFWwindow* window, bool enable_validation);
@@ -111,6 +112,22 @@ public:
     VkDeviceMemory depth_memory = VK_NULL_HANDLE;
     VkImageView    depth_view   = VK_NULL_HANDLE;
 
+    // The scene's real render target: linear HDR, tonemapped later by the post
+    // pass rather than by each material shader.
+    //
+    // fp16 rather than the swapchain's 8-bit UNORM because the values written
+    // here are radiance, not colour. Sun glitter on water runs orders of
+    // magnitude above the diffuse sea around it, and clamping that to 1.0 at
+    // the point it is generated throws away exactly the range bloom and a
+    // filmic curve exist to use. fp16 also costs half the bandwidth of fp32
+    // for a dynamic range nothing in this scene comes close to exhausting.
+    //
+    // Sized to the swapchain, so it lives and dies with it.
+    VkFormat       hdr_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkImage        hdr_image  = VK_NULL_HANDLE;
+    VkDeviceMemory hdr_memory = VK_NULL_HANDLE;
+    VkImageView    hdr_view   = VK_NULL_HANDLE;
+
     VkCommandPool command_pool = VK_NULL_HANDLE;
     Frame         frames[kFramesInFlight]{};
     std::uint32_t frame_index = 0;
@@ -147,6 +164,7 @@ private:
     bool create_swapchain();
     void destroy_swapchain();
     bool create_depth_resources();
+    bool create_hdr_target();
     bool create_frames();
     void create_timestamp_pool();
 };

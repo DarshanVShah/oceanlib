@@ -152,6 +152,13 @@ private:
         VkDeviceMemory  uniform_memory = VK_NULL_HANDLE;
         void*           uniform_mapped = nullptr;
         VkDescriptorSet descriptor     = VK_NULL_HANDLE;
+
+        // The post pass reads the HDR target through its own single-binding
+        // set. Separate from `descriptor` rather than one more binding on it,
+        // because the scene pipelines bind that set while rendering INTO the
+        // HDR image - a set that also names that image as a sampled texture
+        // would be a read/write hazard on the same resource in the same pass.
+        VkDescriptorSet post_descriptor = VK_NULL_HANDLE;
     };
     FrameResources frames_[kFramesInFlight]{};
 
@@ -183,6 +190,16 @@ private:
     VkPipeline            ocean_wire_pipeline_ = VK_NULL_HANDLE;
     VkPipeline            sky_pipeline_    = VK_NULL_HANDLE;
     VkPipeline            prop_pipeline_   = VK_NULL_HANDLE;
+
+    // --- post ------------------------------------------------------------
+    VkDescriptorSetLayout post_set_layout_      = VK_NULL_HANDLE;
+    VkPipelineLayout      post_pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline            post_pipeline_        = VK_NULL_HANDLE;
+    // CLAMP_TO_EDGE, unlike either sampler above: a fullscreen pass reads its
+    // own resolution exactly, and the wrap mode only matters once bloom starts
+    // sampling off the edge - where repeating would wrap the bright side of
+    // the image onto the dark one.
+    VkSampler             post_sampler_         = VK_NULL_HANDLE;
 };
 
 }  // namespace viewer

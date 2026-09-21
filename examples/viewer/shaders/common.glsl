@@ -8,6 +8,8 @@
 #ifndef OCEAN_COMMON_GLSL
 #define OCEAN_COMMON_GLSL
 
+#include "tonemap.glsl"
+
 // The viewer demonstrates exactly 3 cascades: a far scale for big swells, a
 // mid scale, and a near scale for fine ripples (see ADR-020). The library's
 // own CascadeStack is not limited to 3 - this is a viewer-only simplification
@@ -293,36 +295,6 @@ vec3 underwater_background(vec3 dir, vec3 sunDir)
     // the water. Darkening downward is the light falling off with depth.
     float down = clamp(-dir.y * 0.5 + 0.5, 0.0, 1.0);
     return deepColor * mix(0.35, 1.0, down);
-}
-
-vec3 tonemap(vec3 linear, float exposure)
-{
-    vec3 c = linear * exposure;
-
-    // Reinhard on LUMINANCE, not per channel.
-    //
-    // Per-channel Reinhard compresses a bright channel harder than a dim one,
-    // so it desaturates everything bright toward grey. That is exactly what
-    // made the Preetham sky look washed out: at the zenith the model produced
-    // linear (0.139, 0.236, 0.471) - blue is 3.4x red, a proper sky - and
-    // per-channel mapping delivered (104, 126, 158), nearly neutral. The
-    // chromaticity the whole model exists to compute was being thrown away in
-    // the last line of the shader.
-    //
-    // Compressing luminance and carrying the chroma through unchanged
-    // preserves hue and saturation exactly.
-    float L  = dot(c, vec3(0.2126, 0.7152, 0.0722));
-    float Lt = L / (1.0 + L);
-    vec3 mapped = c * (Lt / max(L, 1e-5));
-
-    // Except that genuinely intense sources DO read as white - a photograph of
-    // the sun is a white disc, not a saturated orange one. So fade back toward
-    // the per-channel result as luminance climbs, which restores that
-    // behaviour for the sun and its glitter without touching the sky.
-    vec3 perChannel = c / (c + vec3(1.0));
-    mapped = mix(mapped, perChannel, clamp(L * 0.12, 0.0, 1.0));
-
-    return pow(clamp(mapped, 0.0, 1.0), vec3(1.0 / 2.2));
 }
 
 #endif

@@ -88,5 +88,6 @@ void main()
         float fog = 1.0 - exp(-dist * g.shading.z);
         col = mix(col, sky_color(normalize(vWorld - g.camPos.xyz), L), fog);
     }
-    outColor = vec4(tonemap(col, g.shading.y), 1.0);
+    // Linear radiance; the post pass tone maps.
+    outColor = vec4(col, 1.0);
 }

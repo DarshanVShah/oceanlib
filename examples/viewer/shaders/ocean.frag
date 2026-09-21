@@ -249,7 +249,7 @@ void main()
         uwColor = mix(uwColor, foamColor, foam * 0.6);
 
         float d = length(g.camPos.xyz - vWorld);
-        outColor = vec4(tonemap(absorb(uwColor, d), g.shading.y), 1.0);
+        outColor = vec4(absorb(uwColor, d), 1.0);
         return;
     }
 
@@ -260,5 +260,5 @@ void main()
     float fog  = 1.0 - exp(-dist * g.shading.z);
     color = mix(color, sky_color(normalize(vWorld - g.camPos.xyz), L), fog);
 
-    outColor = vec4(tonemap(color, g.shading.y), 1.0);
+    outColor = vec4(color, 1.0);
 }

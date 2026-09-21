@@ -31,5 +31,6 @@ void main()
     } else {
         col = sky_color(dir, L);
     }
-    outColor = vec4(tonemap(col, g.shading.y), 1.0);
+    // Linear radiance. The post pass tone maps once, for everything.
+    outColor = vec4(col, 1.0);
 }

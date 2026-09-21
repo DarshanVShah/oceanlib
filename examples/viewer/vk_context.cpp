@@ -66,6 +66,7 @@ bool VkContext::init(GLFWwindow* w, bool enable_validation)
     if (!create_device()) return false;
     if (!create_swapchain()) return false;
     if (!create_depth_resources()) return false;
+    if (!create_hdr_target()) return false;
     if (!create_frames()) return false;
     create_timestamp_pool();
     return true;
@@ -374,6 +375,43 @@ bool VkContext::create_depth_resources()
                  "vkCreateImageView(depth)");
 }
 
+bool VkContext::create_hdr_target()
+{
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType     = VK_IMAGE_TYPE_2D;
+    ici.format        = hdr_format;
+    ici.extent        = {extent.width, extent.height, 1};
+    ici.mipLevels     = 1;
+    ici.arrayLayers   = 1;
+    ici.samples       = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
+    // Written as an attachment by the scene, read as a texture by the post
+    // pass. Both usages have to be declared up front or the second one is
+    // undefined behaviour that happens to work on the driver you tested.
+    ici.usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                        VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    if (vkCreateImage(device, &ici, nullptr, &hdr_image) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(device, hdr_image, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize  = req.size;
+    ai.memoryTypeIndex = find_memory_type(req.memoryTypeBits,
+                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(device, &ai, nullptr, &hdr_memory) != VK_SUCCESS) return false;
+    vkBindImageMemory(device, hdr_image, hdr_memory, 0);
+
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image            = hdr_image;
+    vi.viewType         = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format           = hdr_format;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    return vkCreateImageView(device, &vi, nullptr, &hdr_view) == VK_SUCCESS;
+}
+
 bool VkContext::create_frames()
 {
     for (std::uint32_t i = 0; i < kFramesInFlight; ++i) {
@@ -602,6 +640,12 @@ void VkContext::destroy_swapchain()
         vkFreeMemory(device, depth_memory, nullptr);
         depth_view = VK_NULL_HANDLE;
     }
+    if (hdr_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(device, hdr_view, nullptr);
+        vkDestroyImage(device, hdr_image, nullptr);
+        vkFreeMemory(device, hdr_memory, nullptr);
+        hdr_view = VK_NULL_HANDLE;
+    }
     for (VkSemaphore s : render_finished) vkDestroySemaphore(device, s, nullptr);
     for (VkImageView v : image_views) vkDestroyImageView(device, v, nullptr);
     render_finished.clear();
@@ -628,6 +672,7 @@ void VkContext::recreate_swapchain()
     destroy_swapchain();
     create_swapchain();
     create_depth_resources();
+    create_hdr_target();
 }
 
 void VkContext::shutdown()

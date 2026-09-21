@@ -4,6 +4,8 @@
 #include "object_vert.h"
 #include "ocean_frag.h"
 #include "ocean_vert.h"
+#include "post_frag.h"
+#include "post_vert.h"
 #include "sky_frag.h"
 #include "sky_vert.h"
 
@@ -383,16 +385,39 @@ bool OceanView::create_descriptors(VkContext& ctx)
     lci.pBindings    = bindings;
     vkCreateDescriptorSetLayout(ctx.device, &lci, nullptr, &set_layout_);
 
+    // The post pass's own layout: one texture, the HDR scene target.
+    VkDescriptorSetLayoutBinding post_binding{};
+    post_binding.binding         = 0;
+    post_binding.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    post_binding.descriptorCount = 1;
+    post_binding.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo post_lci{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    post_lci.bindingCount = 1;
+    post_lci.pBindings    = &post_binding;
+    vkCreateDescriptorSetLayout(ctx.device, &post_lci, nullptr, &post_set_layout_);
+
+    VkSamplerCreateInfo post_sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    post_sci.magFilter    = VK_FILTER_LINEAR;
+    post_sci.minFilter    = VK_FILTER_LINEAR;
+    post_sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    post_sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    post_sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    post_sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    vkCreateSampler(ctx.device, &post_sci, nullptr, &post_sampler_);
+
     VkDescriptorPoolSize sizes[2]{};
     sizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[0].descriptorCount = kFramesInFlight;
     sizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    // Plus one per frame for the post pass's view of the HDR target.
     sizes[1].descriptorCount =
-        kFramesInFlight * (2 * static_cast<std::uint32_t>(kMaxCascades) + 1);
+        kFramesInFlight * (2 * static_cast<std::uint32_t>(kMaxCascades) + 2);
 
     VkDescriptorPoolCreateInfo pci{
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pci.maxSets       = kFramesInFlight;
+    pci.maxSets       = kFramesInFlight * 2;   // scene set + post set
     pci.poolSizeCount = 2;
     pci.pPoolSizes    = sizes;
     vkCreateDescriptorPool(ctx.device, &pci, nullptr, &descriptor_pool_);
@@ -404,6 +429,17 @@ bool OceanView::create_descriptors(VkContext& ctx)
         ai.descriptorSetCount = 1;
         ai.pSetLayouts        = &set_layout_;
         vkAllocateDescriptorSets(ctx.device, &ai, &f.descriptor);
+
+        // Allocated here, but WRITTEN every frame in record(). The HDR target
+        // is recreated whenever the swapchain is, so a view written once at
+        // startup would dangle after the first window resize - and rewriting
+        // one descriptor per frame is cheaper than detecting the resize.
+        VkDescriptorSetAllocateInfo pai{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        pai.descriptorPool     = descriptor_pool_;
+        pai.descriptorSetCount = 1;
+        pai.pSetLayouts        = &post_set_layout_;
+        vkAllocateDescriptorSets(ctx.device, &pai, &f.post_descriptor);
 
         VkDescriptorBufferInfo ubo{f.uniform, 0, sizeof(Globals)};
 
@@ -494,19 +530,39 @@ bool OceanView::create_pipelines(VkContext& ctx)
     plci.pPushConstantRanges    = &push_range;
     vkCreatePipelineLayout(ctx.device, &plci, nullptr, &pipeline_layout_);
 
+    // The post pass takes its parameters as a push constant rather than
+    // through the Globals block, so its layout needs neither that buffer nor
+    // any of the cascade textures - just the one image it reads.
+    VkPushConstantRange post_push{};
+    post_push.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    post_push.offset     = 0;
+    post_push.size       = sizeof(float) * 4;
+
+    VkPipelineLayoutCreateInfo post_plci{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    post_plci.setLayoutCount         = 1;
+    post_plci.pSetLayouts            = &post_set_layout_;
+    post_plci.pushConstantRangeCount = 1;
+    post_plci.pPushConstantRanges    = &post_push;
+    vkCreatePipelineLayout(ctx.device, &post_plci, nullptr, &post_pipeline_layout_);
+
     VkShaderModule ocean_vs  = make_module(ctx.device, kOceanVertSpv, sizeof(kOceanVertSpv));
     VkShaderModule ocean_fs  = make_module(ctx.device, kOceanFragSpv, sizeof(kOceanFragSpv));
     VkShaderModule sky_vs    = make_module(ctx.device, kSkyVertSpv, sizeof(kSkyVertSpv));
     VkShaderModule sky_fs    = make_module(ctx.device, kSkyFragSpv, sizeof(kSkyFragSpv));
     VkShaderModule object_vs = make_module(ctx.device, kObjectVertSpv, sizeof(kObjectVertSpv));
     VkShaderModule object_fs = make_module(ctx.device, kObjectFragSpv, sizeof(kObjectFragSpv));
+    VkShaderModule post_vs   = make_module(ctx.device, kPostVertSpv, sizeof(kPostVertSpv));
+    VkShaderModule post_fs   = make_module(ctx.device, kPostFragSpv, sizeof(kPostFragSpv));
 
     // Dynamic rendering: the pipeline is told its attachment formats directly,
     // with no VkRenderPass and no VkFramebuffer object anywhere in this file.
     VkPipelineRenderingCreateInfo rendering{
         VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rendering.colorAttachmentCount    = 1;
-    rendering.pColorAttachmentFormats = &ctx.swapchain_format;
+    // The SCENE pipelines write the HDR target, not the swapchain. Only the
+    // post pipeline below is built against the swapchain format.
+    rendering.pColorAttachmentFormats = &ctx.hdr_format;
     rendering.depthAttachmentFormat   = ctx.depth_format;
 
     VkPipelineViewportStateCreateInfo viewport{
@@ -542,7 +598,8 @@ bool OceanView::create_pipelines(VkContext& ctx)
                      std::uint32_t binding_count,
                      const VkVertexInputAttributeDescription* attributes,
                      std::uint32_t attribute_count, bool depth_test,
-                     VkPolygonMode polygon_mode, VkPipeline& out) {
+                     VkPolygonMode polygon_mode, VkPipelineLayout layout,
+                     VkPipeline& out) {
         VkPipelineShaderStageCreateInfo stages[2]{};
         stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
@@ -593,7 +650,7 @@ bool OceanView::create_pipelines(VkContext& ctx)
         ci.pDepthStencilState  = &depth;
         ci.pColorBlendState    = &blend;
         ci.pDynamicState       = &dynamic;
-        ci.layout              = pipeline_layout_;
+        ci.layout              = layout;
 
         return vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &ci,
                                          nullptr, &out) == VK_SUCCESS;
@@ -617,17 +674,27 @@ bool OceanView::create_pipelines(VkContext& ctx)
     // The sky writes no depth, so the ocean always draws over it regardless of
     // the order the depth buffer would otherwise imply.
     ok &= build(sky_vs, sky_fs, nullptr, 0, nullptr, 0, false,
-               VK_POLYGON_MODE_FILL, sky_pipeline_);
+               VK_POLYGON_MODE_FILL, pipeline_layout_, sky_pipeline_);
     ok &= build(ocean_vs, ocean_fs, &grid_binding, 1, &grid_attribute, 1, true,
-               VK_POLYGON_MODE_FILL, ocean_pipeline_);
+               VK_POLYGON_MODE_FILL, pipeline_layout_, ocean_pipeline_);
     ok &= build(ocean_vs, ocean_fs, &grid_binding, 1, &grid_attribute, 1, true,
-               VK_POLYGON_MODE_LINE, ocean_wire_pipeline_);
+               VK_POLYGON_MODE_LINE, pipeline_layout_, ocean_wire_pipeline_);
     // Depth-tested like the ocean, but never wireframed - see ocean.frag's
     // note that props are shaded double-sided, which the shared cullMode =
     // NONE inside `build` already gives them for free.
     ok &= build(object_vs, object_fs, &prop_binding, 1, prop_attributes, 2,
-               true, VK_POLYGON_MODE_FILL, prop_pipeline_);
+               true, VK_POLYGON_MODE_FILL, pipeline_layout_, prop_pipeline_);
 
+    // The post pipeline is the one that writes the swapchain, and the only one
+    // with no depth attachment at all - it covers every pixel exactly once,
+    // so there is nothing to test against and nothing to write.
+    rendering.pColorAttachmentFormats = &ctx.swapchain_format;
+    rendering.depthAttachmentFormat   = VK_FORMAT_UNDEFINED;
+    ok &= build(post_vs, post_fs, nullptr, 0, nullptr, 0, false,
+               VK_POLYGON_MODE_FILL, post_pipeline_layout_, post_pipeline_);
+
+    vkDestroyShaderModule(ctx.device, post_vs, nullptr);
+    vkDestroyShaderModule(ctx.device, post_fs, nullptr);
     vkDestroyShaderModule(ctx.device, ocean_vs, nullptr);
     vkDestroyShaderModule(ctx.device, ocean_fs, nullptr);
     vkDestroyShaderModule(ctx.device, sky_vs, nullptr);
@@ -788,16 +855,20 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
     // it scales with cascade resolution rather than with anything on screen.
     ctx.gpu_mark(cmd, "upload");
 
-    // --- render ----------------------------------------------------------
-    transition_image(cmd, ctx.images[image_index], VK_IMAGE_ASPECT_COLOR_BIT,
+    // --- scene pass, into the HDR target ----------------------------------
+    //
+    // UNDEFINED as the old layout every frame: the whole attachment is cleared
+    // below, so there is nothing in it worth preserving and telling the driver
+    // so is free.
+    transition_image(cmd, ctx.hdr_image, VK_IMAGE_ASPECT_COLOR_BIT,
                      VK_IMAGE_LAYOUT_UNDEFINED,
                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                     VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
     VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    color.imageView   = ctx.image_views[image_index];
+    color.imageView   = ctx.hdr_view;
     color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     color.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
     color.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
@@ -875,6 +946,74 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
 
     vkCmdEndRendering(cmd);
 
+    // --- post pass, HDR target to swapchain -------------------------------
+    //
+    // The scene's writes have to be visible to the fragment shader that is
+    // about to sample them, which is what this barrier is for as much as the
+    // layout change: without the COLOR_ATTACHMENT_WRITE -> SHADER_SAMPLED_READ
+    // dependency the post pass could read an attachment the colour pipe has
+    // not finished flushing.
+    transition_image(cmd, ctx.hdr_image, VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                     VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                     VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+
+    // Written every frame rather than once at startup: ctx.hdr_view is
+    // recreated with the swapchain, so a descriptor written once would dangle
+    // after the first resize. Safe to update here because begin_frame has
+    // already waited on this frame slot's fence, so nothing is reading it.
+    const VkDescriptorImageInfo scene_info{
+        post_sampler_, ctx.hdr_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet post_write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    post_write.dstSet          = f.post_descriptor;
+    post_write.dstBinding      = 0;
+    post_write.descriptorCount = 1;
+    post_write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    post_write.pImageInfo      = &scene_info;
+    vkUpdateDescriptorSets(ctx.device, 1, &post_write, 0, nullptr);
+
+    transition_image(cmd, ctx.images[image_index], VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_UNDEFINED,
+                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                     VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+    VkRenderingAttachmentInfo present{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    present.imageView   = ctx.image_views[image_index];
+    present.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    // DONT_CARE, not CLEAR: the fullscreen triangle covers every pixel, so
+    // clearing first would be writing the whole attachment twice.
+    present.loadOp      = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    present.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo post_pass{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    post_pass.renderArea           = {{0, 0}, ctx.extent};
+    post_pass.layerCount           = 1;
+    post_pass.colorAttachmentCount = 1;
+    post_pass.pColorAttachments    = &present;
+
+    vkCmdBeginRendering(cmd, &post_pass);
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, post_pipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            post_pipeline_layout_, 0, 1, &f.post_descriptor,
+                            0, nullptr);
+
+    // Exposure travels with the pass that uses it. It was previously read from
+    // the Globals block by every material shader, which meant three shaders
+    // had to agree about it; now exactly one does.
+    const float post_params[4] = {globals.shading[1], 0.0f, 0.0f, 0.0f};
+    vkCmdPushConstants(cmd, post_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(post_params), post_params);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+    ctx.gpu_mark(cmd, "post");
+
     transition_image(cmd, ctx.images[image_index], VK_IMAGE_ASPECT_COLOR_BIT,
                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                      VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
@@ -924,6 +1063,12 @@ void OceanView::shutdown(VkContext& ctx)
     vkDestroyPipeline(ctx.device, ocean_wire_pipeline_, nullptr);
     vkDestroyPipeline(ctx.device, sky_pipeline_, nullptr);
     vkDestroyPipeline(ctx.device, prop_pipeline_, nullptr);
+    if (post_pipeline_) vkDestroyPipeline(ctx.device, post_pipeline_, nullptr);
+    if (post_pipeline_layout_)
+        vkDestroyPipelineLayout(ctx.device, post_pipeline_layout_, nullptr);
+    if (post_set_layout_)
+        vkDestroyDescriptorSetLayout(ctx.device, post_set_layout_, nullptr);
+    if (post_sampler_) vkDestroySampler(ctx.device, post_sampler_, nullptr);
     vkDestroyPipelineLayout(ctx.device, pipeline_layout_, nullptr);
     vkDestroyDescriptorPool(ctx.device, descriptor_pool_, nullptr);
     vkDestroyDescriptorSetLayout(ctx.device, set_layout_, nullptr);
