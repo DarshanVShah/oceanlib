@@ -43,14 +43,16 @@ struct Globals {
     float     cascade_patch[4];  // x,y,z = patch_length of cascades 0,1,2;
                                  // w = tiles per side of the outer mesh
     float     params[4];         // x = time, y = mesh resolution, z,w unused
-    float     shading[4];        // foam strength, exposure, fog density, unused
+    float     shading[4];        // foam strength, exposure, fog density,
+                                 // choppiness
     float     cascade_texel[4];  // x,y,z = world size of one texel per
                                  // cascade; w = world units per pixel per
                                  // metre of distance
     float     interaction[4];    // x,y = world low corner of the interaction
                                  // field; z = its extent; w = isolate flag
     float     water[4];          // x = camera depth below the surface in
-                                 // metres, positive when submerged
+                                 // metres, positive when submerged;
+                                 // y = tone curve for the post pass
     float     slope_var[4];      // x,y,z = mean-square slope of cascades 0,1,2
                                  // (both axes summed); w = the BRDF's own base
                                  // roughness, as alpha

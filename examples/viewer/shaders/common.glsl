@@ -28,14 +28,16 @@ layout(set = 0, binding = 0) uniform Globals {
                        // largest/farthest scale)
     vec4 params;       // x = time, y = mesh resolution, z = sky
                        // turbidity, w = sky luminance scale
-    vec4 shading;      // x foam strength, y exposure, z fog density, w unused
+    vec4 shading;      // x foam strength, y exposure, z fog density,
+                       // w choppiness
     vec4 cascadeTexel; // xyz = world size of one texel in cascades 0,1,2;
                        // w   = world units per pixel per metre of distance
     vec4 interaction;  // xy = world position of the field's low corner,
                        // z  = field extent in metres,
                        // w  = 1 to show the interaction field in isolation
     vec4 water;        // x = camera depth below the surface, metres, positive
-                       // when submerged; yzw unused
+                       // when submerged; y = tone curve for the post pass
+                       // (0 Reinhard, 1 ACES); zw unused
     vec4 slopeVar;     // xyz = mean-square slope of cascades 0,1,2, both axes
                        // summed - a property of the SPECTRUM, so it is
                        // measured once per sea state rather than per frame;

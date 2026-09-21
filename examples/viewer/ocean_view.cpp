@@ -1007,7 +1007,9 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
     // Exposure travels with the pass that uses it. It was previously read from
     // the Globals block by every material shader, which meant three shaders
     // had to agree about it; now exactly one does.
-    const float post_params[4] = {globals.shading[1], 0.0f, 0.0f, 0.0f};
+    // x exposure, y tone curve, z bloom intensity (unused yet), w reserved.
+    const float post_params[4] = {globals.shading[1], globals.water[1],
+                                  0.0f, 0.0f};
     vkCmdPushConstants(cmd, post_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(post_params), post_params);
     vkCmdDraw(cmd, 3, 1, 0, 0);

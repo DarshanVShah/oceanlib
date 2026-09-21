@@ -16,6 +16,7 @@
 //   --no-detail-fade  keep every cascade at full strength to the horizon
 //   --no-slope-var    stop the faded cascades' slope variance from feeding the
 //                     specular lobe, leaving the distant sea a mirror (ADR-023)
+//   --tonemap C       tone curve: aces (default) or reinhard
 //   --foam-decay R    foam decay rate, 1/s (default 0.30, half-life 2.3 s)
 //   --foam-gain G     how fast breaking injects foam, 1/s (default 4)
 //   --foam-advect S   multiplier on the advecting current (default 1)
@@ -100,6 +101,9 @@ struct Options {
     bool          no_foam_advect = false;
     bool          no_detail_fade = false;
     bool          no_slope_var   = false;
+    // 0 = Reinhard on luminance (the original), 1 = ACES. See tonemap.glsl for
+    // what the difference actually is.
+    float         tonemap = 1.0f;
     // Steady-state coverage under a sustained source is source_gain/decay, so
     // this ratio is the knob that decides whether foam reads as whitecaps or
     // as milk. 4/0.3 = 13x saturated the entire ocean; 1.5/0.4 = 3.75x lets a
@@ -144,6 +148,10 @@ Options parse_args(int argc, char** argv)
         else if (a == "--no-foam-advect") o.no_foam_advect = true;
         else if (a == "--no-detail-fade") o.no_detail_fade = true;
         else if (a == "--no-slope-var")   o.no_slope_var = true;
+        else if (a == "--tonemap") {
+            const std::string m = next();
+            o.tonemap = (m == "reinhard") ? 0.0f : 1.0f;
+        }
         else if (a == "--foam-decay")  o.foam_decay  = std::strtof(next(), nullptr);
         else if (a == "--foam-gain")   o.foam_gain   = std::strtof(next(), nullptr);
         else if (a == "--foam-advect") o.foam_advect = std::strtof(next(), nullptr);
@@ -1032,7 +1040,15 @@ int main(int argc, char** argv)
         const float surf_y = water.height_at(input.camera.position.x,
                                              input.camera.position.z);
         globals.water[0] = surf_y - input.camera.position.y;
-        globals.water[1] = 0.0f;
+        // The tone curve the post pass should use. It rides here rather than
+        // in shading.w, which LOOKED free - the comment said "unused" - but is
+        // written with the choppiness a few lines further down. Writing it
+        // there silently did nothing, because choppiness defaults to 1.0 and
+        // so does ACES, so the A/B flag selected the same curve either way and
+        // the two captures came out byte-identical. Exactly the hazard
+        // ARCHITECTURE.md records about std140 blocks: a stale comment about
+        // which slots are free is worse than no comment.
+        globals.water[1] = opt.tonemap;
         globals.water[2] = 0.0f;
         globals.water[3] = 0.0f;
 

@@ -8,7 +8,8 @@
 layout(set = 0, binding = 0) uniform sampler2D uScene;
 
 layout(push_constant) uniform Push {
-    // x = exposure, yzw reserved for the bloom parameters this pass will grow.
+    // x = exposure, y = tone curve (0 Reinhard, 1 ACES), z = bloom intensity,
+    // w reserved.
     vec4 params;
 } pc;
 
@@ -18,5 +19,5 @@ layout(location = 0) out vec4 outColor;
 void main()
 {
     vec3 hdr = texture(uScene, vUV).rgb;
-    outColor = vec4(tonemap(hdr, pc.params.x), 1.0);
+    outColor = vec4(tonemap(hdr, pc.params.x, pc.params.y), 1.0);
 }
