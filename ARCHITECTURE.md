@@ -2298,3 +2298,101 @@ visible cue is the strip just above the line that the sea keeps washing over.
 The band is fitted from the same four probes that float the hull, so it tilts
 with the wave rather than cutting the hull dead level - on a 9 m hull in a real
 swell that difference is a good fraction of the freeboard.
+
+---
+
+## ADR-025 - Mesh LOD: a geometry clipmap, decoupled from cascade scale
+
+Viewer-only. The mesh was a flat grid tiled over cascade 0's patch: 256 quads
+per tile, 7x7 tiles, **6.42M triangles every frame** at a uniform 3.1 m spacing
+from under the camera to the far edge. That is the wrong distribution at both
+ends — too coarse to resolve a wave three metres away, and far too fine for
+water a kilometre out where a whole quad lands inside one pixel.
+
+ADR-022's distance fade addressed the *shading* half of that (aliasing) and
+ADR-023 recovered the slope variance it dropped. Neither touched the geometry,
+which is where the cost actually was: measured per pass, the ocean draw was
+**62% of the frame and about 80% vertex-bound**.
+
+### LOD and cascade scale are different axes
+
+The old mesh conflated them. A cascade is a band of **wavelengths**; a ring is
+a band of **distances**. Tiling the largest cascade's patch made the visible
+range a function of the spectrum's longest wave, which has nothing to do with
+how far the camera can see — and made mesh density uniform, which has nothing
+to do with anything.
+
+Rings are placed from the camera and sample every cascade at whatever world
+position they land on. The two axes never interact again.
+
+### The structure
+
+Ring 0 is a solid 64x64 grid at `base_cell` metres. Ring i is an annulus with
+a centred hole exactly sized for ring i-1 to nest into, at twice the cell size
+and twice the footprint. Eight rings at a 0.5 m finest cell reach 2048 m.
+
+Each ring snaps to **its own** cell size, which is the finest snap available at
+that scale and what stops near water swimming as the camera moves. The price is
+that neighbouring rings are then generally not aligned with each other — ring
+i's hole edge and ring i-1's actual outer edge can differ by up to half of ring
+i's cell. That offset is a continuous value, not one of a few discrete cases,
+so it is closed by a **stitch band** whose topology is fixed and whose
+positions are regenerated each frame into a preallocated buffer.
+
+### Cracks are removed, not hidden
+
+At a ring boundary the finer side has twice the vertices, so its surface
+follows the water between the coarse vertices while the coarse side draws a
+straight segment — a T-junction, and on displaced water it opens into a visible
+crack rather than a subtle seam.
+
+The fix is geomorphing, not a skirt. Across the outer fraction of each ring,
+vertices blend toward where the *coarser* ring would sample: its cells are
+twice as wide, so its nearest grid line is the local position rounded to the
+nearest even integer. At full blend the odd vertices land exactly on their even
+neighbours, the triangles between them go degenerate, and the boundary becomes
+the same straight segment the coarser ring draws. The two sides agree by
+construction instead of by a skirt hiding the disagreement.
+
+Chebyshev distance drives the blend, not Euclidean: a ring is a square, and
+`length()` would inscribe a circular morph band in a square boundary, leaving
+the corners to reach the edge un-morphed and pop.
+
+### Measured
+
+Minimum over 500 frames, RTX 4070 Laptop at 1600x900, MSAA 4x and bloom on:
+
+| | tiled grid | clipmap |
+|---|---|---|
+| triangles | 6.42M | **54k** (119x fewer) |
+| ocean pass | 1.865 ms | **0.279 ms** (6.7x) |
+| whole frame | 2.684 ms | **1.085 ms** (2.5x) |
+| cell under the camera | 3.1 m | **0.5 m** |
+| reach | 2800 m | 2048 m |
+
+It is worth being clear that this is not a quality-for-speed trade. The near
+water is **six times finer** than the mesh it replaced while costing a
+hundredth of the triangles; the only thing given up is raw reach, and the
+horizon fades into the sky long before the mesh ends.
+
+### Six rings was not enough, and only altitude showed it
+
+The default was first set to six rings — 512 m — which looks perfect from the
+deck. From 120 m up it is plainly broken: the mesh's far edge stands as a hard
+curved boundary against the sky, because the distance fog has not closed by the
+time the water runs out. Every ring doubles the reach for about 6k triangles,
+so the default is eight and the fix cost 13k triangles out of a 119x saving.
+
+The general lesson is the one this project keeps relearning: a renderer checked
+from one camera position has been checked at one camera position. The failure
+was invisible at eye level and unmissable from above.
+
+### What this does not do
+
+The reach is still finite. At high enough altitude eight rings will show the
+same edge six did, and the honest fix at that point is a coarse horizon skirt
+rather than more doublings. Nothing here is adaptive to the view frustum
+either: rings are concentric squares centred on the camera, so a substantial
+fraction of every ring is behind it. Frustum-culling ring quadrants would cut
+the remaining vertex cost further, and at 0.279 ms it is not yet worth the
+complexity.

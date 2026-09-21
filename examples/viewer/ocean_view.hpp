@@ -12,6 +12,7 @@
 // distance weighting" decision.
 #pragma once
 
+#include "clipmap.hpp"
 #include "props.hpp"
 #include "vk_context.hpp"
 #include "vk_math.hpp"
@@ -64,8 +65,11 @@ public:
     // is quads per tile edge; `tiles` is the number of copies of cascade 0's
     // (the largest scale's) patch per side of the outer mesh (odd, centred on
     // the origin).
+    // `rings` is the clipmap's ring count and `base_cell` ring 0's cell size
+    // in metres; together they set both the near detail and the far range
+    // (ADR-025). They are independent of cascade scale by design.
     bool init(VkContext& ctx, const std::vector<ocean::OceanDesc>& levels,
-              std::uint32_t mesh_resolution, std::uint32_t tiles,
+              std::uint32_t rings, float base_cell,
               std::uint32_t interaction_size);
     void shutdown(VkContext& ctx);
 
@@ -82,10 +86,24 @@ public:
 
     void set_wireframe(bool on) { wireframe_ = on; }
     [[nodiscard]] bool wireframe() const { return wireframe_; }
+    // Ring 0 is solid, every other ring is an annulus, and each outer ring
+    // also draws a stitch band against its finer neighbour.
     [[nodiscard]] std::uint32_t triangle_count() const
     {
-        return mesh_resolution_ * mesh_resolution_ * 2u * tiles_ * tiles_;
+        const std::uint32_t outer = (ring_layout_.ring_count > 0)
+                                        ? ring_layout_.ring_count - 1 : 0;
+        return clip_solid_count_ / 3 + outer * (clip_annulus_count_ / 3) +
+               outer * (stitch_index_count_ / 3);
     }
+
+    // The far edge of the outermost ring, in metres - what the clipmap
+    // actually covers.
+    [[nodiscard]] float world_extent() const
+    {
+        return (ring_layout_.ring_count > 0)
+                   ? ring_layout_.footprint(ring_layout_.ring_count - 1) : 0.0f;
+    }
+    [[nodiscard]] const RingLayout& rings() const { return ring_layout_; }
 
 private:
     bool create_mesh(VkContext& ctx);
@@ -97,15 +115,30 @@ private:
     std::size_t   level_count_      = 0;
     std::array<std::uint32_t, kMaxCascades> level_sizes_{};
     std::uint32_t interaction_size_ = 0;
-    std::uint32_t mesh_resolution_ = 0;
-    std::uint32_t tiles_           = 0;
-    std::uint32_t index_count_     = 0;
     bool          wireframe_       = false;
 
-    VkBuffer       vertex_buffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory vertex_memory_ = VK_NULL_HANDLE;
-    VkBuffer       index_buffer_  = VK_NULL_HANDLE;
-    VkDeviceMemory index_memory_  = VK_NULL_HANDLE;
+    // --- clipmap (ADR-025) ------------------------------------------------
+    RingLayout  ring_layout_{};
+    StitchBand  stitch_scratch_{};   // CPU side; rewritten in place each frame
+
+    // One shared local-space vertex grid, drawn once per ring with a different
+    // (offset, cell size) pushed per draw. Two index buffers over it: the
+    // solid grid for ring 0 and the holed one for every ring beyond it.
+    VkBuffer       clip_vertex_buffer_  = VK_NULL_HANDLE;
+    VkDeviceMemory clip_vertex_memory_  = VK_NULL_HANDLE;
+    VkBuffer       clip_solid_indices_  = VK_NULL_HANDLE;
+    VkDeviceMemory clip_solid_memory_   = VK_NULL_HANDLE;
+    VkBuffer       clip_annulus_indices_ = VK_NULL_HANDLE;
+    VkDeviceMemory clip_annulus_memory_  = VK_NULL_HANDLE;
+    std::uint32_t  clip_solid_count_    = 0;
+    std::uint32_t  clip_annulus_count_  = 0;
+
+    // The stitch band's topology never changes, so its indices are uploaded
+    // once and only its positions are rewritten per frame.
+    VkBuffer       stitch_index_buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory stitch_index_memory_ = VK_NULL_HANDLE;
+    std::uint32_t  stitch_index_count_  = 0;
+    VkDeviceSize   stitch_vertex_bytes_ = 0;   // one band's worth
 
     // The box and rock meshes (props.hpp), sharing one vertex/index buffer
     // pair the way the ocean grid does. One PropMeshRange per PropMesh value.
@@ -149,6 +182,13 @@ private:
         VkImageView    interaction_view        = VK_NULL_HANDLE;
         VkDeviceSize   interaction_offset      = 0;
         bool           interaction_initialised = false;
+
+        // One region per outer ring: each ring's stitch is regenerated against
+        // its own finer neighbour, so they cannot share a buffer within a
+        // frame the way a single scratch region could.
+        VkBuffer       stitch_vertex        = VK_NULL_HANDLE;
+        VkDeviceMemory stitch_vertex_memory = VK_NULL_HANDLE;
+        void*          stitch_vertex_mapped = nullptr;
 
         VkBuffer        uniform        = VK_NULL_HANDLE;
         VkDeviceMemory  uniform_memory = VK_NULL_HANDLE;

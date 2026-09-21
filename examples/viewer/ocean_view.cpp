@@ -1,5 +1,7 @@
 #include "ocean_view.hpp"
 
+#include <array>
+
 #include "object_frag.h"
 #include "object_vert.h"
 #include "ocean_frag.h"
@@ -71,9 +73,12 @@ static_assert(kPropPushSize <= 128,
 }  // namespace
 
 bool OceanView::init(VkContext& ctx, const std::vector<ocean::OceanDesc>& levels,
-                     std::uint32_t mesh_resolution, std::uint32_t tiles,
+                     std::uint32_t rings, float base_cell,
                      std::uint32_t interaction_size)
 {
+    ring_layout_.ring_count =
+        (rings < 1u) ? 1u : ((rings > kMaxRings) ? kMaxRings : rings);
+    ring_layout_.base_cell_size = (base_cell > 0.0f) ? base_cell : 0.5f;
     interaction_size_ = interaction_size;
     level_count_ = levels.size();
     if (level_count_ == 0 || level_count_ > kMaxCascades) {
@@ -85,9 +90,6 @@ bool OceanView::init(VkContext& ctx, const std::vector<ocean::OceanDesc>& levels
     for (std::size_t i = 0; i < level_count_; ++i) {
         level_sizes_[i] = levels[i].size;
     }
-    mesh_resolution_ = mesh_resolution;
-    tiles_           = tiles;
-
     if (!create_mesh(ctx)) return false;
     if (!create_props(ctx)) return false;
     if (!create_textures(ctx)) return false;
@@ -101,46 +103,41 @@ bool OceanView::init(VkContext& ctx, const std::vector<ocean::OceanDesc>& levels
 
 bool OceanView::create_mesh(VkContext& ctx)
 {
-    // A flat unit grid in [0,1]^2, tiled over cascade 0's (the largest
-    // scale's) own patch. Two floats per vertex and nothing else - position,
-    // normal and foam all come from the cascade textures at draw time, summed
-    // per ADR-020, so there is no per-frame vertex traffic at all.
-    const std::uint32_t verts_per_side = mesh_resolution_ + 1;
-    std::vector<float> vertices;
-    vertices.reserve(static_cast<std::size_t>(verts_per_side) * verts_per_side * 2);
-    for (std::uint32_t z = 0; z < verts_per_side; ++z) {
-        for (std::uint32_t x = 0; x < verts_per_side; ++x) {
-            vertices.push_back(static_cast<float>(x) / mesh_resolution_);
-            vertices.push_back(static_cast<float>(z) / mesh_resolution_);
-        }
+    // The clipmap's shared local grid (ADR-025). Two floats per vertex and
+    // nothing else - position, normal and foam all come from the cascade
+    // textures at draw time, so the rings cost no per-frame vertex traffic at
+    // all. Only the stitch bands are rewritten each frame, and only their
+    // positions; their topology is fixed.
+    const ClipmapMesh mesh = ClipmapMesh::build();
+    clip_solid_count_   = static_cast<std::uint32_t>(mesh.solid_indices.size());
+    clip_annulus_count_ = static_cast<std::uint32_t>(mesh.annulus_indices.size());
+
+    // Device-local: none of this changes, so one staged copy at startup buys
+    // the fastest possible reads forever after.
+    upload_device_local(ctx, mesh.vertices.data(),
+                        mesh.vertices.size() * sizeof(float),
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                        clip_vertex_buffer_, clip_vertex_memory_);
+    upload_device_local(ctx, mesh.solid_indices.data(),
+                        mesh.solid_indices.size() * sizeof(std::uint32_t),
+                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                        clip_solid_indices_, clip_solid_memory_);
+    upload_device_local(ctx, mesh.annulus_indices.data(),
+                        mesh.annulus_indices.size() * sizeof(std::uint32_t),
+                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                        clip_annulus_indices_, clip_annulus_memory_);
+
+    stitch_scratch_      = StitchBand::build();
+    stitch_index_count_  = static_cast<std::uint32_t>(stitch_scratch_.indices.size());
+    stitch_vertex_bytes_ =
+        static_cast<VkDeviceSize>(stitch_scratch_.vertices.size()) * sizeof(float);
+    if (stitch_index_count_ > 0) {
+        upload_device_local(ctx, stitch_scratch_.indices.data(),
+                            stitch_scratch_.indices.size() * sizeof(std::uint32_t),
+                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                            stitch_index_buffer_, stitch_index_memory_);
     }
 
-    std::vector<std::uint32_t> indices;
-    indices.reserve(static_cast<std::size_t>(mesh_resolution_) *
-                    mesh_resolution_ * 6);
-    for (std::uint32_t z = 0; z < mesh_resolution_; ++z) {
-        for (std::uint32_t x = 0; x < mesh_resolution_; ++x) {
-            const std::uint32_t i0 = z * verts_per_side + x;
-            const std::uint32_t i1 = i0 + 1;
-            const std::uint32_t i2 = i0 + verts_per_side;
-            const std::uint32_t i3 = i2 + 1;
-            // Counter-clockwise when viewed from +Y, matching the front face
-            // set in the pipeline.
-            indices.push_back(i0); indices.push_back(i2); indices.push_back(i1);
-            indices.push_back(i1); indices.push_back(i2); indices.push_back(i3);
-        }
-    }
-    index_count_ = static_cast<std::uint32_t>(indices.size());
-
-    // Device-local for the mesh: it never changes, so paying one staged copy
-    // at startup buys the fastest possible reads forever after.
-    upload_device_local(ctx, vertices.data(), vertices.size() * sizeof(float),
-                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_buffer_,
-                        vertex_memory_);
-    upload_device_local(ctx, indices.data(),
-                        indices.size() * sizeof(std::uint32_t),
-                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_buffer_,
-                        index_memory_);
     return true;
 }
 
@@ -239,6 +236,23 @@ bool OceanView::create_textures(VkContext& ctx)
                           f.staging, f.staging_memory);
         vkMapMemory(ctx.device, f.staging_memory, 0, total_bytes, 0,
                     &f.staging_mapped);
+
+        // One stitch region per OUTER ring. Host-visible and persistently
+        // mapped, because unlike the rings themselves these positions change
+        // every frame - each ring snaps to the camera independently, so the
+        // gap its stitch has to close is a continuously varying offset rather
+        // than one of a few discrete cases.
+        const std::uint32_t outer_rings = (ring_layout_.ring_count > 0)
+                                              ? ring_layout_.ring_count - 1 : 0;
+        if (outer_rings > 0 && stitch_vertex_bytes_ > 0) {
+            const VkDeviceSize bytes = stitch_vertex_bytes_ * outer_rings;
+            ctx.create_buffer(bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                              f.stitch_vertex, f.stitch_vertex_memory);
+            vkMapMemory(ctx.device, f.stitch_vertex_memory, 0, bytes, 0,
+                        &f.stitch_vertex_mapped);
+        }
 
         ctx.create_buffer(sizeof(Globals), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -997,10 +1011,57 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
     // same instanced mesh - see ocean.vert.
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                       wireframe_ ? ocean_wire_pipeline_ : ocean_pipeline_);
-    const VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer_, &offset);
-    vkCmdBindIndexBuffer(cmd, index_buffer_, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, index_count_, tiles_ * tiles_, 0, 0, 0);
+
+    // Every ring is placed independently against the camera, each snapped to
+    // its OWN cell size - the finest snap available at that scale, which is
+    // what stops the near water swimming as the camera moves. The cost is that
+    // neighbouring rings are then generally NOT aligned with each other, and
+    // the stitch bands below are what close the resulting gap.
+    std::array<RingPlacement, kMaxRings> placements{};
+    ring_layout_.place(globals.cam_pos[0], globals.cam_pos[2], placements);
+
+    const VkDeviceSize clip_offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &clip_vertex_buffer_, &clip_offset);
+
+    auto push_ring = [&](std::uint32_t r) {
+        struct RingPush {
+            float offset_x, offset_z, cell_size, morph_start;
+        } push{placements[r].world_x, placements[r].world_z,
+               placements[r].cell_size,
+               // The outermost ring has nothing coarser to hand off to, so it
+               // must not morph - morphing toward a ring that is not there
+               // would pull its outer edge inward and expose the horizon.
+               (r + 1 < ring_layout_.ring_count) ? 0.6f : 1.0f};
+        vkCmdPushConstants(cmd, pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT,
+                           0, sizeof(push), &push);
+    };
+
+    // Ring 0 is solid; it is the only one with no hole, because there is no
+    // finer ring to nest inside it.
+    push_ring(0);
+    vkCmdBindIndexBuffer(cmd, clip_solid_indices_, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(cmd, clip_solid_count_, 1, 0, 0, 0);
+
+    for (std::uint32_t r = 1; r < ring_layout_.ring_count; ++r) {
+        push_ring(r);
+        vkCmdBindVertexBuffers(cmd, 0, 1, &clip_vertex_buffer_, &clip_offset);
+        vkCmdBindIndexBuffer(cmd, clip_annulus_indices_, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, clip_annulus_count_, 1, 0, 0, 0);
+
+        // The stitch is built in THIS ring's local space against the previous
+        // ring's actual outer edge, so it uses the same push constants the
+        // annulus above already bound.
+        if (f.stitch_vertex_mapped != nullptr && stitch_index_count_ > 0) {
+            stitch_scratch_.update(placements[r], placements[r - 1]);
+            const VkDeviceSize region = stitch_vertex_bytes_ * (r - 1);
+            std::memcpy(static_cast<std::uint8_t*>(f.stitch_vertex_mapped) + region,
+                        stitch_scratch_.vertices.data(),
+                        static_cast<std::size_t>(stitch_vertex_bytes_));
+            vkCmdBindVertexBuffers(cmd, 0, 1, &f.stitch_vertex, &region);
+            vkCmdBindIndexBuffer(cmd, stitch_index_buffer_, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, stitch_index_count_, 1, 0, 0, 0);
+        }
+    }
     ctx.gpu_mark(cmd, "ocean");
 
     // Props: the boat and any rocks, one push-constant update and one indexed
@@ -1303,10 +1364,20 @@ void OceanView::shutdown(VkContext& ctx)
     vkDestroyPipelineLayout(ctx.device, pipeline_layout_, nullptr);
     vkDestroyDescriptorPool(ctx.device, descriptor_pool_, nullptr);
     vkDestroyDescriptorSetLayout(ctx.device, set_layout_, nullptr);
-    vkDestroyBuffer(ctx.device, vertex_buffer_, nullptr);
-    vkFreeMemory(ctx.device, vertex_memory_, nullptr);
-    vkDestroyBuffer(ctx.device, index_buffer_, nullptr);
-    vkFreeMemory(ctx.device, index_memory_, nullptr);
+    for (VkBuffer b : {clip_vertex_buffer_, clip_solid_indices_,
+                       clip_annulus_indices_, stitch_index_buffer_}) {
+        if (b) vkDestroyBuffer(ctx.device, b, nullptr);
+    }
+    for (VkDeviceMemory m : {clip_vertex_memory_, clip_solid_memory_,
+                             clip_annulus_memory_, stitch_index_memory_}) {
+        if (m) vkFreeMemory(ctx.device, m, nullptr);
+    }
+    for (FrameResources& fr : frames_) {
+        if (fr.stitch_vertex) {
+            vkDestroyBuffer(ctx.device, fr.stitch_vertex, nullptr);
+            vkFreeMemory(ctx.device, fr.stitch_vertex_memory, nullptr);
+        }
+    }
     vkDestroyBuffer(ctx.device, prop_vertex_buffer_, nullptr);
     vkFreeMemory(ctx.device, prop_vertex_memory_, nullptr);
     vkDestroyBuffer(ctx.device, prop_index_buffer_, nullptr);

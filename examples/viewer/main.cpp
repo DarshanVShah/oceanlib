@@ -6,8 +6,8 @@
 //   1 / 2       choppiness    R                 reset camera
 //
 //   --size N          ocean grid resolution (default 256)
-//   --mesh M          mesh quads per tile edge (default 256)
-//   --tiles T         tiles per side of the outer (far-cascade) mesh, odd (default 7)
+//   --rings N         clipmap ring count, 1-8 (default 6; ADR-025)
+//   --cell S          finest ring's cell size in metres (default 0.5)
 //   --cascades N      number of cascade scales, 1-3 (default 3; ADR-020)
 //   --interaction N   interaction field resolution, power of two (default 256)
 //   --cam-x/y/z V     camera position; --cam-yaw/--cam-pitch V its heading
@@ -77,8 +77,18 @@ namespace {
 
 struct Options {
     std::uint32_t size   = 256;
-    std::uint32_t mesh   = 256;
-    std::uint32_t tiles  = 7;
+    // Clipmap LOD (ADR-025). Eight rings at a 0.5 m finest cell reach 2048 m
+    // with 0.5 m detail underfoot - six times finer near the camera than the
+    // old uniform grid, for a fraction of the triangles.
+    //
+    // Eight rather than six because six was measured to be too few: at a 512 m
+    // reach the mesh's far edge is plainly visible against the sky from 120 m
+    // up, where the fog has not closed by the time the water runs out. Each
+    // extra ring doubles the reach for about 6k triangles, so there is no
+    // reason to be stingy - the near detail is what the ring COUNT does not
+    // control.
+    std::uint32_t rings  = 8;
+    float         cell   = 0.5f;
     float         wind   = 12.0f;
     float         depth  = 0.0f;   // <= 0 = deep water
     float         chop   = 1.0f;
@@ -140,8 +150,8 @@ Options parse_args(int argc, char** argv)
             return (i + 1 < argc) ? argv[++i] : "";
         };
         if (a == "--size")             o.size  = std::strtoul(next(), nullptr, 10);
-        else if (a == "--mesh")        o.mesh  = std::strtoul(next(), nullptr, 10);
-        else if (a == "--tiles")       o.tiles = std::strtoul(next(), nullptr, 10);
+        else if (a == "--rings")       o.rings = std::strtoul(next(), nullptr, 10);
+        else if (a == "--cell")        o.cell  = std::strtof(next(), nullptr);
         else if (a == "--wind")        o.wind  = std::strtof(next(), nullptr);
         else if (a == "--depth")       o.depth = std::strtof(next(), nullptr);
         else if (a == "--chop")        o.chop  = std::strtof(next(), nullptr);
@@ -180,7 +190,6 @@ Options parse_args(int argc, char** argv)
         else if (a == "--frames")      o.frames = std::atoi(next());
         else if (a == "--no-validation") o.validation = false;
     }
-    if (o.tiles % 2 == 0) ++o.tiles;  // must be odd to centre on the origin
     if (o.cascades < 1) o.cascades = 1;
     if (o.cascades > 3) o.cascades = 3;
     return o;
@@ -746,16 +755,21 @@ int main(int argc, char** argv)
                 opt.wind, depth_desc, ocean_simd_level());
 
     viewer::OceanView view;
-    if (!view.init(ctx, levels, opt.mesh, opt.tiles, idesc.size)) {
+    if (!view.init(ctx, levels, opt.rings, opt.cell, idesc.size)) {
         ctx.shutdown();
         glfwDestroyWindow(window);
         glfwTerminate();
         return 1;
     }
     view.set_bloom(opt.bloom);
-    std::printf("mesh: %u quads/tile, %ux%u tiles (of the far cascade), %.2fM triangles/frame\n",
-                opt.mesh, opt.tiles, opt.tiles,
-                view.triangle_count() / 1.0e6);
+    // Kept only so the Globals layout stays the shape the shaders expect; the
+    // mesh resolution it used to carry no longer exists.
+    const float ring_cell_for_report = view.rings().base_cell_size;
+    std::printf("mesh: geometry clipmap, %u rings, finest cell %.2f m, "
+                "reach %.0f m, %.0fk triangles/frame\n",
+                view.rings().ring_count, view.rings().base_cell_size,
+                view.world_extent() * 0.5f,
+                view.triangle_count() / 1.0e3);
 
     // Sun placed from elevation/azimuth rather than a hardcoded vector, so the
     // Preetham sky can actually be driven through a day - which is most of the
@@ -1008,7 +1022,9 @@ int main(int argc, char** argv)
         globals.cascade_patch[0] = levels[0].patch_length;
         globals.cascade_patch[1] = (levels.size() > 1) ? levels[1].patch_length : levels[0].patch_length;
         globals.cascade_patch[2] = (levels.size() > 2) ? levels[2].patch_length : levels[0].patch_length;
-        globals.cascade_patch[3] = static_cast<float>(opt.tiles);
+        // Formerly the tile count. The clipmap places its own rings from the
+        // camera (ADR-025), so the mesh no longer reads this at all.
+        globals.cascade_patch[3] = 0.0f;
         // A cascade the viewer is not running contributes no variance, so the
         // spare slots stay zero rather than repeating cascade 0's.
         for (std::size_t i = 0; i < 3; ++i) {
@@ -1022,7 +1038,7 @@ int main(int argc, char** argv)
         // the sub-pixel term existed.
         globals.slope_var[3] = 0.055f * 0.055f;
         globals.params[0]  = static_cast<float>(sim_time);
-        globals.params[1]  = static_cast<float>(opt.mesh);
+        globals.params[1]  = ring_cell_for_report;
         globals.params[2]  = opt.turbidity;
         globals.params[3]  = opt.sky_scale;
         globals.shading[0] = 1.0f;     // foam strength

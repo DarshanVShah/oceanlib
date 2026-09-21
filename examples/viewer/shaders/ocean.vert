@@ -2,14 +2,30 @@
 
 #include "common.glsl"
 
-// A flat unit grid, tiled to cover cascade 0's (the far/largest scale's) own
-// patch. The mesh itself carries no per-cascade information - all three
-// scales are sampled at the SAME world (x,z), each through its own patch's
-// wrapped UV, exactly the "simple additive sum, no distance weighting"
-// decision in ADR-020: cascades are superposed frequency bands of the same
-// real surface, so summing samples is the mathematically correct thing to
-// do, not a heuristic blend.
-layout(location = 0) in vec2 inGrid;  // [0,1] x [0,1]
+// One ring of a geometry clipmap (ADR-025). The mesh carries no per-cascade
+// information - all three scales are sampled at the SAME world (x,z), each
+// through its own patch's wrapped UV, exactly the "simple additive sum, no
+// distance weighting" decision in ADR-020: cascades are superposed frequency
+// bands of the same real surface, so summing samples is the mathematically
+// correct thing to do, not a heuristic blend.
+//
+// LOD and cascade scale are separate axes and must stay that way. A cascade is
+// a band of WAVELENGTHS; a ring is a band of DISTANCES. The old mesh conflated
+// them by tiling cascade 0's patch, which is why it drew 6.42M triangles to
+// cover a view whose far half was sub-pixel.
+//
+// Local coordinates are integers in [-kRingHalf, kRingHalf] on each axis, and
+// kRingHalf must match clipmap.hpp exactly - the one invariant here kept by
+// hand, because GLSL cannot include a C++ header.
+const int kRingHalf = 32;
+
+layout(push_constant) uniform RingPush {
+    vec2  offset;      // this ring's snapped world-space centre
+    float cellSize;    // world metres per local unit at this ring's level
+    float morphStart;  // fraction of kRingHalf where the geomorph begins
+} ring;
+
+layout(location = 0) in vec2 inLocal;  // this ring's own local (x, z)
 
 layout(set = 0, binding = 1) uniform sampler2D uDisplacement0;
 layout(set = 0, binding = 3) uniform sampler2D uDisplacement1;
@@ -29,16 +45,31 @@ void main()
     float patchLen0 = g.cascadePatch.x;
     float patchLen1 = g.cascadePatch.y;
     float patchLen2 = g.cascadePatch.z;
-    int   tiles     = int(g.cascadePatch.w);
 
-    // The outer mesh tiles cascade 0's patch, centred on the origin - the
-    // same instancing scheme a single-cascade ocean already used, just fixed
-    // to the largest scale so the visible area is set by the far cascade.
-    int ti = gl_InstanceIndex;
-    int tx = (ti % tiles) - (tiles / 2);
-    int tz = (ti / tiles) - (tiles / 2);
+    // --- geomorphing (ADR-025) ---------------------------------------------
+    //
+    // Near this ring's OUTER boundary it hands off to the next COARSER ring -
+    // ring i's footprint edge is exactly ring (i+1)'s hole boundary by
+    // construction - so blend this ring's sample position toward the position
+    // its coarser sibling would use there, across the outer (1 - morphStart)
+    // fraction of the ring's own half-extent.
+    //
+    // Chebyshev distance, not Euclidean, because a ring is a square. Using
+    // length() would make the morph band a circle inscribed in a square
+    // boundary, so the corners would reach the edge un-morphed and pop.
+    float ringDist = max(abs(inLocal.x), abs(inLocal.y)) / float(kRingHalf);
+    float blend    = smoothstep(ring.morphStart, 1.0, ringDist);
 
-    vec2 base = (inGrid + vec2(float(tx), float(tz))) * patchLen0;
+    // Where the coarser ring would sample: its cells are twice as wide, so its
+    // nearest grid line is this local position rounded to the nearest even
+    // integer. At blend = 1 the odd vertices land exactly on their even
+    // neighbours, the triangles between them go degenerate, and the boundary
+    // becomes the same straight segment the coarser ring draws - which is what
+    // removes the T-junction crack rather than hiding it behind a skirt.
+    vec2 coarseLocal = round(inLocal * 0.5) * 2.0;
+    vec2 morphed     = mix(inLocal, coarseLocal, blend);
+
+    vec2 base = ring.offset + morphed * ring.cellSize;
 
     // Each cascade's own UV is world position divided by ITS OWN patch length.
     // A REPEAT sampler makes this correct rather than approximate for cascade
