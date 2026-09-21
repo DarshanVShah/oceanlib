@@ -112,7 +112,7 @@ Phases 1-3 stand: Phase 1 gates everything after it, and 2-3 are the visual
 payoff the fragment budget can clearly afford. Then, reordered by the numbers
 above:
 
-- **Phase 4a · Clipmap LOD**, promoted from Phase 8. 1.38 ms of vertex work on
+- **Phase 4a · Clipmap LOD** — **done**, see ADR-025. 1.38 ms of vertex work on
   triangles that are mostly sub-pixel, and the largest single item in the frame.
 - **Phase 4b · Halve the upload.** `R16G16B16A16_SFLOAT` instead of
   `R32G32B32A32_SFLOAT` for the cascade and interaction textures — worth about
@@ -127,23 +127,31 @@ above:
 
 ### Where it stands
 
-Phases 0-3 are done. Frame budget at the new default quality — MSAA 4x, bloom
-on, ACES — minimum over 500 frames at 1600x900:
+Phases 0-3 and 4a are done. Frame budget at the default quality — clipmap LOD,
+MSAA 4x, bloom, ACES — minimum over 500 frames at 1600x900:
 
-| span | min ms |
-|------|--------|
-| ocean  | 1.865 |
-| upload | 0.576 |
-| bloom  | 0.114 |
-| sky    | 0.086 |
-| post   | 0.001 |
-| **total** | **2.684** |
+| span | min ms | share |
+|------|--------|-------|
+| **upload** | **0.575** | **53%** |
+| ocean  | 0.279 | 26% |
+| bloom  | 0.113 | 10% |
+| sky    | 0.094 | 9% |
+| post   | 0.011 | 1% |
+| **total** | **1.085** | |
 
-Against 2.225 ms before any of it: **+0.46 ms for MSAA 4x, a five-level bloom
-chain and a filmic tone curve.** The prediction that the shading could afford
-to be far more ambitious has held so far — the whole of Phase 2 costs 0.114 ms,
-and every bit of what was added lands in the part of the frame that was
-measured as cheap.
+The frame started this work at 2.225 ms with nothing on it. It now costs
+**1.085 ms with MSAA 4x, a five-level bloom chain, a filmic tone curve and six
+times finer water under the camera.** The Phase 0 prediction held: everything
+added landed in the part of the frame measured as cheap, and the one thing
+attacked for cost — the geometry — was 62% of the frame and is now 26%.
+
+**The upload is now the largest item in the frame by some way**, which makes
+Phase 4b the next thing to do rather than a footnote. Nothing about it has
+changed; everything around it got faster.
+
+Remaining, in measured order: halve the upload (4b), then the prefiltered sky
+(4c), then SSR, shadows and the shading corrections — all of which are fragment
+work being charged against a tenth of the frame.
 
 `--msaa`, `--bloom` and `--tonemap` each turn their feature off completely, so
 the tier machinery in Phase 9 already has something to drive.
@@ -209,7 +217,7 @@ The boat casts nothing onto the water. One shadow map over the props.
 - Aerial perspective with sun-direction-dependent in-scatter, instead of one
   fog colour.
 
-### Phase 8 · Clipmap LOD
+### Phase 8 · Clipmap LOD  — **done as Phase 4a (ADR-025)**
 
 6.42M triangles per frame of uniform grid, most of them sub-pixel at distance.
 This is the wall for older hardware, and it buys back the budget Phases 2-6
