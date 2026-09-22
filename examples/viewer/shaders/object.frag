@@ -76,10 +76,15 @@ void main()
     float gloss  = mix(40.0, 180.0, wet);
     float spec   = mix(0.10, 0.45, wet);
 
-    vec3 col = albedo * (vec3(1.0, 0.95, 0.86) * (ndl + trans) + ambient);
+    // The sun's own colour, from the sky model rather than a constant, so the
+    // hull reddens as the sun sets exactly as the water it is floating in
+    // does. A hardcoded warm-white here was the last place in the scene where
+    // the direct beam ignored the sky (common.glsl, sun_radiance).
+    vec3 sunRad = sun_radiance(L);
+    vec3 col = albedo * (sunRad * (ndl + trans) + ambient);
 
     vec3 H = normalize(L + V);
-    col += vec3(1.0) * pow(max(dot(N, H), 0.0), gloss) * spec * ndl;
+    col += sunRad * pow(max(dot(N, H), 0.0), gloss) * spec * ndl;
 
     float dist = length(g.camPos.xyz - vWorld);
     if (g.water.x > 0.0) {
