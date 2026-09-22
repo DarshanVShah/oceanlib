@@ -181,9 +181,15 @@ Left click ray-marches against the *displaced* surface - not the flat y = 0
 plane - and drops a rock where it lands. `I` isolates the interaction field
 from the swell so the ripples can be read on their own.
 
-Flags: `--size N --mesh M --tiles T --wind U --chop C --foam F --wireframe
---screenshot out.bmp --frames N --interaction N --splash FRAME --isolate
---impulse S --impulse-radius R --cam-x/y/z V --cam-yaw/--cam-pitch V`.
+Flags: `--size N --wind U --chop C --foam F --wireframe --screenshot out.bmp
+--frames N --interaction N --splash FRAME --isolate --impulse S
+--impulse-radius R --cam-x/y/z V --cam-yaw/--cam-pitch V`.
+
+Rendering, each of which turns its feature off or down so it can be measured
+against itself: `--rings N --cell S` (clipmap LOD, ADR-025), `--msaa N`,
+`--bloom F`, `--tonemap 0|1`, `--fp32` (RGBA32F upload instead of RGBA16F,
+ADR-026). A `--screenshot` run also prints the per-pass GPU breakdown and the
+CPU staging cost, so a capture run is a measurement run.
 
 ![splash](docs/v3-splash.png)
 

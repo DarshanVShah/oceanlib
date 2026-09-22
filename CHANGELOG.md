@@ -59,9 +59,43 @@ reflects, and gameplay queries see it. See ARCHITECTURE.md ADR-021.
   hull-centred source rather than one per probe, because four corner sources
   emit a ripple at the hull's own beam and drove a self-excited roll resonance
   into its clamp.
+- **HDR pipeline and post chain.** The scene renders to `R16G16B16A16_SFLOAT`
+  and is resolved through a fullscreen pass: a five-level progressive bloom
+  (13-tap Jimenez downsample with a Karis average on the first step, 9-tap tent
+  upsample) and a choice of tone curve, defaulting to the ACES RRT+ODT fit.
+  Composited as a `mix` rather than an add, because the sun path is already
+  brighter than the sea by orders of magnitude. `--bloom 0` and `--tonemap 0`
+  are the A/B controls.
+- **MSAA on the scene pass**, through dynamic rendering's resolve attachment
+  with a `TRANSIENT_ATTACHMENT` target so the multisampled image can live in
+  tile memory. 4x by default, clamped to what the device supports. The rigging
+  needed it: partially-covered edge pixels went from 4.7% to 36.5% of the
+  boat's silhouette.
+- **Geometry clipmap LOD** (ADR-025), replacing the uniform tiled grid.
+  Concentric rings from the camera, each snapped to its own cell size, joined
+  by a per-frame stitch band and geomorphed across their outer fraction so
+  T-junctions close by construction rather than being hidden by a skirt. LOD
+  and cascade scale are now independent axes. **6.42M triangles to 54k, a 119x
+  reduction, with the cell under the camera going from 3.1 m to 0.5 m** - six
+  times finer near water for a hundredth of the geometry. `--rings` and
+  `--cell` replace `--mesh` and `--tiles`.
+- **The simulation uploads as RGBA16F** (ADR-026), halving the per-frame
+  staging traffic from 7.00 to 3.50 MiB. The upload was 53% of the frame after
+  the clipmap landed, and at 12.8 GB/s it was the PCIe link, not the GPU.
+  99.42% of colour channels are bit-identical to the fp32 path and 100% are
+  within 1/255. `--fp32` is the A/B control, and the CPU-side fill is now
+  reported next to the GPU spans.
 
 
 ### Fixed
+
+- **The persistent-foam alpha patch was costing ~0.9 ms of CPU per frame**
+  (ADR-026), in code that had only ever been measured as part of a larger
+  total. It rewrote one component of every displacement texel in a second pass
+  over write-combined staging memory, so every 64-byte line was sent across the
+  bus twice, the second time 16 bytes full. Fused into the conversion pass, so
+  the destination is written once, sequentially: CPU staging fill dropped from
+  0.572 ms to 0.328 ms, on top of the format change's saving.
 
 - **The demo boat floated with four centimetres of freeboard** (ADR-024). Its
   waterline was sized against the hull's bounding box, but a double-ender's

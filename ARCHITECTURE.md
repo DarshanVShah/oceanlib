@@ -2396,3 +2396,109 @@ either: rings are concentric squares centred on the camera, so a substantial
 fraction of every ring is behind it. Frustum-culling ring quadrants would cut
 the remaining vertex cost further, and at 0.279 ms it is not yet worth the
 complexity.
+
+---
+
+## ADR-026 - Uploading the simulation: RGBA16F, and one pass over the buffer
+
+Viewer-only. After the clipmap (ADR-025) the frame's largest single span was
+not any kind of shading - it was the staging-buffer-to-texture copy, at
+**0.575 ms of a 1.085 ms frame, 53%**. Seven MiB per frame across three
+cascades and the interaction field, in 0.575 ms, is 12.8 GB/s: that is a PCIe
+4.0 x8 link running at its width. No GPU work is happening there at all, so no
+amount of shader tuning was ever going to touch it.
+
+There is exactly one lever on a bandwidth wall, which is to send fewer bytes.
+
+### Why half precision is not a compromise here
+
+ADR-004 chose RGBA32F output so the library's buffers could go to the GPU
+untouched - no repacking, no conversion. That was the right call and it is why
+the integration is still five lines. But "untouched" was a means, not the goal,
+and it stopped being free the moment the copy became the frame's bottleneck.
+
+Half has 11 bits of mantissa: about 0.05% relative, so 2 mm on a 4 m
+displacement and 8 mm at 16 m. Normals and the interaction field live in
+[-1, 1] and a few centimetres respectively, where it is finer still. Against a
+surface whose own spectrum is resolved at 256 texels across a 25 m patch, that
+is far below the discretisation already present.
+
+Measured rather than argued: **99.42% of colour channels in a 1600x900 frame
+are bit-identical between the two formats, and 100% are within 1/255.** Twenty
+channel samples out of 4.32 million differ by more than 2, all of them on
+specular glints where a sharp highlight moves by a pixel.
+
+### The finding that mattered more than the format
+
+The first implementation halved the GPU span exactly as predicted - 0.575 to
+0.297 ms - and made the frame *worse*, because the CPU cost of preparing the
+staging buffer went from 0.572 ms to 1.002 ms. Converting 1.8M floats should
+not cost half a millisecond, so the number was wrong about something.
+
+Splitting the timer found it, and it was not the conversion. It was the
+**persistent-foam alpha patch** (ADR-022), which overwrites one component of
+every displacement texel after the copy:
+
+| | conversion | alpha patch |
+|---|---|---|
+| RGBA32F | 1.030 ms | 0.807 ms |
+| RGBA16F | 0.391 ms | 0.985 ms |
+
+The conversion was never the problem - it is *cheaper* than the memcpy it
+replaces, because it writes half as many bytes. The second pass was the
+problem, and it was costing nearly a millisecond a frame **before any of this
+work started**, in code that had been measured only as part of a larger total.
+
+The cause is that the staging buffer is `HOST_VISIBLE | HOST_COHERENT`, which
+on a discrete GPU is write-combined memory: writes accumulate in a handful of
+line-sized buffers and are flushed whole. The first pass fills each 64-byte
+line and flushes it. The second pass comes back later and writes 16 bytes of
+every one of those lines, so each is sent again, mostly empty. Halving the
+texel size doubles how many texels share a line, which makes the second pass
+relatively worse - which is why the format change appeared to cause a
+regression it had merely exposed.
+
+### Fusing the two passes
+
+The alpha value is substituted **during** the conversion rather than after it,
+so the destination is written once, sequentially, in full lines. The kernel
+reads four source vectors and one vector of eight foam values, routes those to
+lanes 3 and 7 of each source vector with a single cross-lane permute and a
+blend, and converts. It is in `half.cpp`, the one translation unit compiled
+with AVX2 and F16C enabled, behind a CPUID check that lives in the baseline
+header - so a CPU with neither still runs, on a scalar path written to be
+sequential in the destination for the same reason.
+
+### Measured
+
+Minimum over 500 frames, RTX 4070 Laptop at 1600x900, all other settings at
+their defaults:
+
+| | before | after |
+|---|---|---|
+| bytes uploaded per frame | 7.00 MiB | **3.50 MiB** |
+| GPU upload span | 0.575 ms | **0.297 ms** |
+| CPU staging fill | 0.572 ms | **0.328 ms** |
+| GPU frame total | 1.085 ms | **0.721 ms** |
+
+Both sides of the trade improved, which was not the expected outcome: the plan
+was to spend CPU time to buy bus bandwidth. What actually happened is that
+looking closely enough at the CPU side to price the trade turned up a defect
+worth more than the trade was.
+
+`--fp32` restores the old format, and the CPU fill is reported next to the GPU
+spans, because an optimisation that moves work between processors is not
+honestly described by a number from only one of them.
+
+### What this does not do
+
+The upload is still the largest span in the frame at 41%, and it is still
+bandwidth. Beyond this the options are to stop sending what has not changed -
+the interaction field is quiescent whenever nothing has disturbed the water,
+though never in this demo, where the boat's wake runs continuously - or to move
+the FFT itself onto the GPU, which is a different project and would cost the
+library its bit-exactness across backends.
+
+Nothing here touches the library. `tools/half_check.cpp` verifies the scalar
+and vector paths agree over all 2^32 float bit patterns, for both kernels; it
+is not in `tests/`, which is about the library and stays that way.

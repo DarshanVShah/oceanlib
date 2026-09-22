@@ -114,12 +114,10 @@ above:
 
 - **Phase 4a · Clipmap LOD** — **done**, see ADR-025. 1.38 ms of vertex work on
   triangles that are mostly sub-pixel, and the largest single item in the frame.
-- **Phase 4b · Halve the upload.** `R16G16B16A16_SFLOAT` instead of
-  `R32G32B32A32_SFLOAT` for the cascade and interaction textures — worth about
-  0.29 ms at the measured rate, against the cost of a float-to-half conversion
-  on the CPU that wants measuring against what it saves. Skipping the
-  interaction upload entirely while the field is quiescent is nearly free and
-  worth doing first.
+- **Phase 4b · Halve the upload** — **done**, see ADR-026. Predicted 0.29 ms
+  and delivered 0.278. The part that was not predicted: pricing the CPU side of
+  the trade turned up a pre-existing 0.9 ms/frame defect in the foam alpha
+  patch, so the CPU fill got *faster* too rather than paying for the saving.
 - **Phase 4c · Prefiltered sky**, demoted from Phase 4. Worth doing for the
   roughness-aware reflection it enables — ADR-023's stated limitation — which
   is a *quality* argument. It was sold on performance, and at 7% fragment cost
@@ -127,34 +125,49 @@ above:
 
 ### Where it stands
 
-Phases 0-3 and 4a are done. Frame budget at the default quality — clipmap LOD,
-MSAA 4x, bloom, ACES — minimum over 500 frames at 1600x900:
+Phases 0-4b are done. Frame budget at the default quality — clipmap LOD, MSAA
+4x, bloom, ACES, RGBA16F upload — minimum over 500 frames at 1600x900:
 
 | span | min ms | share |
 |------|--------|-------|
-| **upload** | **0.575** | **53%** |
-| ocean  | 0.279 | 26% |
-| bloom  | 0.113 | 10% |
-| sky    | 0.094 | 9% |
-| post   | 0.011 | 1% |
-| **total** | **1.085** | |
+| **upload** | **0.297** | **41%** |
+| ocean  | 0.200 | 28% |
+| bloom  | 0.110 | 15% |
+| sky    | 0.084 | 12% |
+| post   | 0.014 | 2% |
+| **total** | **0.721** | |
 
-The frame started this work at 2.225 ms with nothing on it. It now costs
-**1.085 ms with MSAA 4x, a five-level bloom chain, a filmic tone curve and six
-times finer water under the camera.** The Phase 0 prediction held: everything
-added landed in the part of the frame measured as cheap, and the one thing
-attacked for cost — the geometry — was 62% of the frame and is now 26%.
+Plus 0.328 ms of CPU preparing the staging buffer, which is reported alongside
+because an optimisation that moves work between processors is not honestly
+described by a number from only one of them.
 
-**The upload is now the largest item in the frame by some way**, which makes
-Phase 4b the next thing to do rather than a footnote. Nothing about it has
-changed; everything around it got faster.
+The frame started this work at **2.225 ms with nothing on it**. It now costs
+**0.721 ms with MSAA 4x, a five-level bloom chain, a filmic tone curve and six
+times finer water under the camera** — 3.1x faster while carrying four
+features it did not have. The Phase 0 prediction held throughout: everything
+added landed in the part of the frame measured as cheap, and the two things
+attacked for cost were the two the measurement named.
 
-Remaining, in measured order: halve the upload (4b), then the prefiltered sky
-(4c), then SSR, shadows and the shading corrections — all of which are fragment
-work being charged against a tenth of the frame.
+| | start | now |
+|---|---|---|
+| geometry (ocean pass) | 62% of frame | 28% |
+| upload | 26% | 41% |
+| CPU staging fill | 0.572 ms | 0.328 ms |
+| triangles/frame | 6.42M | 54k |
 
-`--msaa`, `--bloom` and `--tonemap` each turn their feature off completely, so
-the tier machinery in Phase 9 already has something to drive.
+The upload is still the largest span, and it is still bandwidth rather than
+GPU work. What is left of it is genuinely needed data: the next honest lever is
+not sending what has not changed, and after that moving the FFT onto the GPU,
+which is a different project and would cost the library its bit-exactness
+across backends. Neither is worth doing before the quality work below.
+
+Remaining, in measured order: the prefiltered sky (4c), then SSR, shadows and
+the shading corrections — all of which are fragment work being charged
+against a seventh of the frame.
+
+`--msaa`, `--bloom`, `--tonemap`, `--rings` and `--fp32` each turn their
+feature off or down completely, so the tier machinery in Phase 9 already has
+something to drive.
 
 ---
 
