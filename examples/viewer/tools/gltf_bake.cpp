@@ -626,6 +626,96 @@ int main(int argc, char** argv)
     const double draft    = waterline - (-half.y);
     const double buoyancy = 9.81 / draft;
 
+    // The hull's SECTION TABLE: half-beam on a (station, level) grid covering
+    // the whole hull, bow to stern and keel to sheer.
+    //
+    // This is what the ocean shader carves itself away with, so that the sea
+    // stops at the hull instead of running straight through it and filling the
+    // boat (ADR-028). An open boat is the case where that shows: a decked hull
+    // hides the water inside it behind its own deck, and this one has nothing
+    // to hide it with.
+    //
+    // WHY A TABLE and not a waterline profile plus an analytic taper. That was
+    // tried, twice. A single half-beam per station, scaled toward the keel by
+    // sqrt(depth), carves a shape far fatter than a sharp-bilged faering below
+    // the waterline - and the error is invisible while the boat sits level,
+    // because the sea is then AT the waterline where the profile is exact. It
+    // shows the moment the hull lifts on a crest: the sea under it is then well
+    // below the waterline, the over-wide carve reaches past the planking, and a
+    // wedge of sky opens up alongside the hull. Guessing the section shape is
+    // guessing at the very thing the mesh already knows, so this reads it.
+    constexpr int kStations = 16;   // along the length
+    constexpr int kLevels   = 8;    // keel to sheer
+    // SIGNED bounds, not a symmetric half-beam.
+    //
+    // A half-beam assumes the hull is symmetric about the bounding box's
+    // centreline, and this one is not: a faering carries its steering oar on
+    // one quarter, which pushes the box's centre off the hull's own centreline
+    // and makes one side of every section wider than the other. Carving with
+    // the wider of the two over-carves the narrow side by the difference, and
+    // that showed as a wedge of sky opening along one side of the hull and not
+    // the other - the asymmetry of the artifact being the clue to the
+    // asymmetry of the cause.
+    double zlo[kStations][kLevels], zhi[kStations][kLevels];
+    bool   seen[kStations][kLevels] = {};
+    for (int st = 0; st < kStations; ++st)
+        for (int lv = 0; lv < kLevels; ++lv) { zlo[st][lv] = 0.0; zhi[st][lv] = 0.0; }
+
+    for (const Vec3& raw : hull_shell_positions) {
+        const Vec3 q = remap(raw);
+        const double lx = q.x - center.x, ly = q.y - center.y, lz = q.z - center.z;
+        int st = static_cast<int>((lx + half.x) / (2.0 * half.x) * (kStations - 1) + 0.5);
+        int lv = static_cast<int>((ly + half.y) / (2.0 * half.y) * (kLevels - 1) + 0.5);
+        st = st < 0 ? 0 : (st >= kStations ? kStations - 1 : st);
+        lv = lv < 0 ? 0 : (lv >= kLevels ? kLevels - 1 : lv);
+        if (!seen[st][lv]) { zlo[st][lv] = zhi[st][lv] = lz; seen[st][lv] = true; }
+        else { if (lz < zlo[st][lv]) zlo[st][lv] = lz;
+               if (lz > zhi[st][lv]) zhi[st][lv] = lz; }
+    }
+    // A cell can be empty simply because no vertex landed in it, and an empty
+    // cell would carve nothing where the hull is solid. Widen upward first: a
+    // hull does not narrow as it rises from the keel, so the level below is a
+    // sound bound on both sides. Then fill along the length from both ends,
+    // for the stations the stem and stern posts leave bare.
+    for (int st = 0; st < kStations; ++st) {
+        for (int lv = 1; lv < kLevels; ++lv) {
+            if (!seen[st][lv] && seen[st][lv - 1]) {
+                zlo[st][lv] = zlo[st][lv - 1]; zhi[st][lv] = zhi[st][lv - 1];
+                seen[st][lv] = true;
+            } else if (seen[st][lv] && seen[st][lv - 1]) {
+                zlo[st][lv] = std::min(zlo[st][lv], zlo[st][lv - 1]);
+                zhi[st][lv] = std::max(zhi[st][lv], zhi[st][lv - 1]);
+            }
+        }
+    }
+    for (int lv = 0; lv < kLevels; ++lv) {
+        for (int st = 1; st < kStations; ++st)
+            if (!seen[st][lv] && seen[st - 1][lv]) {
+                zlo[st][lv] = zlo[st - 1][lv]; zhi[st][lv] = zhi[st - 1][lv];
+                seen[st][lv] = true;
+            }
+        for (int st = kStations - 2; st >= 0; --st)
+            if (!seen[st][lv] && seen[st + 1][lv]) {
+                zlo[st][lv] = zlo[st + 1][lv]; zhi[st][lv] = zhi[st + 1][lv];
+                seen[st][lv] = true;
+            }
+    }
+
+    // The end stations are the stem and stern posts, where the hull is a knife
+    // edge - but they are also the stations most likely to have been empty and
+    // filled from a neighbour, which hands a knife edge its neighbour's beam.
+    // A boat comes to a point at both ends, so say so.
+    for (int lv = 0; lv < kLevels; ++lv) {
+        zlo[0][lv] = zhi[0][lv] = 0.0;
+        zlo[kStations - 1][lv] = zhi[kStations - 1][lv] = 0.0;
+    }
+
+    // Report the asymmetry, because it is the whole reason these are signed.
+    double worst_asym = 0.0;
+    for (int st = 0; st < kStations; ++st)
+        for (int lv = 0; lv < kLevels; ++lv)
+            worst_asym = std::max(worst_asym, std::fabs(zhi[st][lv] + zlo[st][lv]));
+
     auto finalize = [&](const BakedVertex& v) {
         Vec3 p = remap({v.px, v.py, v.pz}) - center;
         Vec3 n = swap_xz ? Vec3{-v.nz, v.ny, v.nx} : Vec3{v.nx, v.ny, v.nz};
@@ -652,6 +742,22 @@ int main(int argc, char** argv)
     out << "inline constexpr float kHalfExtent[3] = {" << half.x << "f, " << half.y << "f, "
        << half.z << "f};\n";
     out << "inline constexpr float kBuoyancy = " << buoyancy << "f;\n\n";
+    out << "// Hull-local Y of the waterline at rest, and the hull's SIGNED z bounds on\n"
+           "// a " << kStations << " x " << kLevels << " (station, level) grid spanning the whole hull:\n"
+           "// station 0 is one end, level 0 the keel, level " << (kLevels - 1) << " the sheer. Signed\n"
+           "// because the hull is not symmetric about its box centre. Pairs, lo then hi.\n"
+           "// The ocean shader carves itself away inside this. See ADR-028.\n";
+    out << "inline constexpr int kSectionStations = " << kStations << ";\n";
+    out << "inline constexpr int kSectionLevels = " << kLevels << ";\n";
+    out << "inline constexpr float kWaterlineY = " << waterline << "f;\n";
+    out << "inline constexpr float kHullSection[" << (kStations * kLevels * 2) << "] = {";
+    for (int st = 0; st < kStations; ++st) {
+        for (int lv = 0; lv < kLevels; ++lv) {
+            const int i = (st * kLevels + lv) * 2;
+            out << (i ? "," : "") << "\n    " << zlo[st][lv] << "f, " << zhi[st][lv] << "f";
+        }
+    }
+    out << "};\n\n";
 
     for (const auto& [name, g] : std::vector<std::pair<const char*, const Group*>>{
              {"Hull", &hull}, {"Sail", &sail}}) {
@@ -670,10 +776,11 @@ int main(int argc, char** argv)
     std::fprintf(stderr,
                  "gltf_bake: hull %zu verts / %zu indices, sail %zu verts / %zu indices, "
                  "half-extent (%.3f, %.3f, %.3f) m\n"
+                 "gltf_bake: hull section asymmetry about the box centreline %.3f m\n"
                  "gltf_bake: amidships depth %.3f m, waterline %+.3f m from hull centre, "
                  "draft %.3f m, freeboard %.3f m, buoyancy %.2f (heave period %.2f s)\n",
                  hull.verts.size(), hull.idx.size(), sail.verts.size(), sail.idx.size(), half.x,
-                 half.y, half.z, mid_depth, waterline, draft,
+                 half.y, half.z, worst_asym, mid_depth, waterline, draft,
                  (mid_keel + mid_depth) - waterline, buoyancy,
                  6.283185307 / std::sqrt(buoyancy));
     return 0;
