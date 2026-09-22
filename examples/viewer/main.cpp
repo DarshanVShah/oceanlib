@@ -18,6 +18,8 @@
 //                     specular lobe, leaving the distant sea a mirror (ADR-023)
 //   --tonemap C       tone curve: aces (default) or reinhard
 //   --bloom F         bloom mix, 0 disables the chain (default 0.06)
+//   --fp32            upload cascades as RGBA32F instead of RGBA16F, which
+//                     doubles the bytes crossing the bus (the A/B for ADR-026)
 //   --msaa N          samples per pixel: 1, 2, 4 or 8 (default 4)
 //   --foam-decay R    foam decay rate, 1/s (default 0.30, half-life 2.3 s)
 //   --foam-gain G     how fast breaking injects foam, 1/s (default 4)
@@ -121,6 +123,10 @@ struct Options {
     // little goes a long way, and the sun path is already brighter than the
     // sea around it by orders of magnitude. 0 skips the chain entirely.
     float         bloom = 0.06f;
+    // RGBA16F for the cascade and interaction textures. The upload was 53% of
+    // the frame after the clipmap landed and it is bandwidth-bound, so halving
+    // the bytes is the whole optimisation (ADR-026).
+    bool          half_textures = true;
     // Samples per pixel for the scene pass. 4 is the usual sweet spot; the
     // device clamps anything it cannot do.
     std::uint32_t msaa = 4;
@@ -169,6 +175,7 @@ Options parse_args(int argc, char** argv)
         else if (a == "--no-detail-fade") o.no_detail_fade = true;
         else if (a == "--no-slope-var")   o.no_slope_var = true;
         else if (a == "--bloom")   o.bloom = std::strtof(next(), nullptr);
+        else if (a == "--fp32")    o.half_textures = false;
         else if (a == "--msaa")    o.msaa  = std::strtoul(next(), nullptr, 10);
         else if (a == "--tonemap") {
             const std::string m = next();
@@ -755,7 +762,8 @@ int main(int argc, char** argv)
                 opt.wind, depth_desc, ocean_simd_level());
 
     viewer::OceanView view;
-    if (!view.init(ctx, levels, opt.rings, opt.cell, idesc.size)) {
+    if (!view.init(ctx, levels, opt.rings, opt.cell, idesc.size,
+                   opt.half_textures)) {
         ctx.shutdown();
         glfwDestroyWindow(window);
         glfwTerminate();
@@ -944,7 +952,10 @@ int main(int argc, char** argv)
         // Drop the warm-up out of the GPU averages: the first frames pay for
         // pipeline creation, first-touch allocation and a cold clock state,
         // none of which is what a steady-state measurement is asking about.
-        if (frame_counter == 60) ctx.gpu_reset_stats();
+        if (frame_counter == 60) {
+            ctx.gpu_reset_stats();
+            view.reset_staging_stat();
+        }
 
         boat.update(water, input.paused ? 0.0f : static_cast<float>(dt));
 
@@ -1160,6 +1171,19 @@ int main(int argc, char** argv)
                     std::printf("  %-8s %6.3f  [%6.3f .. %6.3f]\n",
                                 st.name ? st.name : "?", st.mean(), st.min, st.max);
                 }
+            }
+            // The upload has two halves and only one of them is on the GPU.
+            // Narrowing to RGBA16F moves work onto the CPU to take bytes off
+            // the bus, so reporting the GPU span alone would be reporting only
+            // the side of the trade that improves (ADR-026).
+            {
+                const viewer::GpuStat& st = view.staging_stat();
+                const double mb = static_cast<double>(view.upload_bytes()) /
+                                  (1024.0 * 1024.0);
+                std::printf("  %-8s %6.3f  [%6.3f .. %6.3f]  cpu, %s, "
+                            "%.2f MB/frame\n",
+                            "staging", st.mean(), st.min, st.max,
+                            view.half_textures() ? "RGBA16F" : "RGBA32F", mb);
             }
             for (std::size_t i = 0; i < foam_fields.size(); ++i) {
                 const ocean::Buffers lb = stack.buffers(i);

@@ -1,5 +1,7 @@
 #include "ocean_view.hpp"
 
+#include "half.hpp"
+
 #include <array>
 
 #include "object_frag.h"
@@ -13,6 +15,7 @@
 #include "sky_frag.h"
 #include "sky_vert.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -74,12 +77,16 @@ static_assert(kPropPushSize <= 128,
 
 bool OceanView::init(VkContext& ctx, const std::vector<ocean::OceanDesc>& levels,
                      std::uint32_t rings, float base_cell,
-                     std::uint32_t interaction_size)
+                     std::uint32_t interaction_size, bool half_textures)
 {
     ring_layout_.ring_count =
         (rings < 1u) ? 1u : ((rings > kMaxRings) ? kMaxRings : rings);
     ring_layout_.base_cell_size = (base_cell > 0.0f) ? base_cell : 0.5f;
     interaction_size_ = interaction_size;
+    half_textures_    = half_textures;
+    texel_format_     = half_textures_ ? VK_FORMAT_R16G16B16A16_SFLOAT
+                                       : VK_FORMAT_R32G32B32A32_SFLOAT;
+    comp_bytes_       = half_textures_ ? 2 : 4;
     level_count_ = levels.size();
     if (level_count_ == 0 || level_count_ > kMaxCascades) {
         std::fprintf(stderr,
@@ -173,10 +180,11 @@ bool OceanView::create_textures(VkContext& ctx)
                           VkDeviceMemory& memory, VkImageView& view) {
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ci.imageType = VK_IMAGE_TYPE_2D;
-        // R32G32B32A32_SFLOAT because that is literally what the library
-        // hands us. No conversion, no quantisation, no repacking - which was
-        // the entire point of choosing that output layout.
-        ci.format        = VK_FORMAT_R32G32B32A32_SFLOAT;
+        // RGBA32F is literally what the library hands us - no conversion, no
+        // repacking, which was the point of choosing that output layout. It is
+        // no longer the default anyway: the copy, not the conversion, was the
+        // frame's largest cost, and RGBA16F halves it (ADR-026).
+        ci.format        = texel_format_;
         ci.extent        = {size, size, 1};
         ci.mipLevels     = 1;
         ci.arrayLayers   = 1;
@@ -212,14 +220,15 @@ bool OceanView::create_textures(VkContext& ctx)
         VkDeviceSize total_bytes = 0;
         for (std::size_t i = 0; i < level_count_; ++i) {
             const VkDeviceSize bytes = static_cast<VkDeviceSize>(level_sizes_[i]) *
-                                       level_sizes_[i] * 4 * sizeof(float);
+                                       level_sizes_[i] * 4 * comp_bytes_;
             f.staging_offset[i] = total_bytes;  // displacement starts here
             total_bytes += bytes;                // normal follows immediately after
             total_bytes += bytes;
         }
         f.interaction_offset = total_bytes;
         total_bytes += static_cast<VkDeviceSize>(interaction_size_) *
-                       interaction_size_ * 4 * sizeof(float);
+                       interaction_size_ * 4 * comp_bytes_;
+        upload_bytes_ = total_bytes;
 
         for (std::size_t i = 0; i < level_count_; ++i) {
             make_image(level_sizes_[i], f.levels[i].displacement,
@@ -276,14 +285,18 @@ bool OceanView::create_textures(VkContext& ctx)
         auto upload_texel = [&](VkImage image, const float texel[4]) {
             VkBuffer staging = VK_NULL_HANDLE;
             VkDeviceMemory staging_mem = VK_NULL_HANDLE;
-            const VkDeviceSize bytes = 4 * sizeof(float);
+            const VkDeviceSize bytes = 4 * comp_bytes_;
             ctx.create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                               staging, staging_mem);
             void* mapped = nullptr;
             vkMapMemory(ctx.device, staging_mem, 0, bytes, 0, &mapped);
-            std::memcpy(mapped, texel, static_cast<std::size_t>(bytes));
+            if (half_textures_) {
+                pack_half(static_cast<std::uint16_t*>(mapped), texel, 4);
+            } else {
+                std::memcpy(mapped, texel, static_cast<std::size_t>(bytes));
+            }
             vkUnmapMemory(ctx.device, staging_mem);
 
             VkCommandBuffer cmd = ctx.begin_one_shot();
@@ -793,49 +806,83 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
 {
     FrameResources& f = frames_[frame];
 
-    // THE ENTIRE INTEGRATION WITH THE LIBRARY IS THESE MEMCPYS, ONE PAIR PER
-    // CASCADE LEVEL.
+    // THE ENTIRE INTEGRATION WITH THE LIBRARY IS THIS LOOP, ONE PAIR OF
+    // BUFFERS PER CASCADE LEVEL.
     //
-    // No repacking, no per-component conversion, no interleave pass, for any
-    // level: each cascade's output buffers are already laid out exactly as
-    // RGBA32F textures (ADR-004), regardless of that level's own resolution.
+    // No repacking, no interleave pass, no per-level special case: each
+    // cascade's output buffers are already laid out exactly as RGBA textures
+    // (ADR-004), whatever that level's own resolution. Every write below is a
+    // single sequential sweep of the destination - a memcpy where nothing has
+    // to change, a streaming narrowing conversion where it does (ADR-026).
+    const auto staging_start = std::chrono::steady_clock::now();
+
+    // Writes `count` floats from `src` at `byte_off` in the staging buffer,
+    // in whichever format the textures were created with.
+    auto put = [&](VkDeviceSize byte_off, const float* src, std::size_t count) {
+        auto* dst = static_cast<std::uint8_t*>(f.staging_mapped) + byte_off;
+        if (half_textures_) {
+            pack_half(reinterpret_cast<std::uint16_t*>(dst), src, count);
+        } else {
+            std::memcpy(dst, src, count * sizeof(float));
+        }
+    };
+
     for (std::size_t i = 0; i < level_count_; ++i) {
         const ocean::Buffers b = stack.buffers(i);
-        const VkDeviceSize bytes = static_cast<VkDeviceSize>(b.size) * b.size *
-                                   4 * sizeof(float);
-        auto* dst = static_cast<std::uint8_t*>(f.staging_mapped) + f.staging_offset[i];
-        std::memcpy(dst, b.displacement, static_cast<std::size_t>(bytes));
-        std::memcpy(dst + bytes, b.normal, static_cast<std::size_t>(bytes));
+        const std::size_t  cells = static_cast<std::size_t>(b.size) * b.size;
+        const VkDeviceSize bytes =
+            static_cast<VkDeviceSize>(cells) * 4 * comp_bytes_;
+        const VkDeviceSize off = f.staging_offset[i];
+        auto* dst = static_cast<std::uint8_t*>(f.staging_mapped) + off;
 
-        // Overwrite the displacement texture's ALPHA channel with the
-        // persistent foam.
+        // The displacement texture's ALPHA channel carries the PERSISTENT foam
+        // in place of the FFT's instantaneous Jacobian value.
         //
-        // displacement.w already carries the FFT's instantaneous Jacobian
-        // foam, and every shader that reads foam reads it from there. Swapping
-        // the value in the staging copy therefore upgrades the whole pipeline
-        // to advected, persistent foam without a new texture, a new binding or
-        // a single line of shader change - and it cannot desynchronise, since
-        // both come from the same cascade level at the same instant.
+        // displacement.w already carries the instantaneous foam, and every
+        // shader that reads foam reads it from there. Substituting the value
+        // on the way to the GPU therefore upgrades the whole pipeline to
+        // advected, persistent foam without a new texture, a new binding or a
+        // single line of shader change - and it cannot desynchronise, since
+        // both come from the same cascade level at the same instant. The
+        // library's own buffer is untouched.
         //
-        // The library's own buffer is untouched; this writes into the staging
-        // copy the GPU is about to receive.
-        if (i < foam.size() && foam[i] != nullptr) {
-            const float* src = foam[i]->data();
-            auto* texels = reinterpret_cast<float*>(dst);
-            const std::size_t cells = static_cast<std::size_t>(b.size) * b.size;
-            for (std::size_t c = 0; c < cells; ++c) texels[4 * c + 3] = src[c];
+        // It is substituted DURING the copy, not after it. Writing it
+        // afterwards means revisiting one component of every texel in
+        // write-combined memory, which measured at more than the cost of
+        // converting the entire frame - see half.hpp.
+        const float* persistent_foam =
+            (i < foam.size() && foam[i] != nullptr) ? foam[i]->data() : nullptr;
+
+        if (half_textures_) {
+            pack_rgba16(reinterpret_cast<std::uint16_t*>(dst), b.displacement,
+                        persistent_foam, cells);
+        } else {
+            pack_rgba32(reinterpret_cast<float*>(dst), b.displacement,
+                        persistent_foam, cells);
         }
+        put(off + bytes, b.normal, cells * 4);
     }
 
-    // One more memcpy for the interaction field - same story as the cascades,
-    // because InteractionBuffers uses the same RGBA32F-shaped layout.
+    // One more for the interaction field - same story as the cascades, because
+    // InteractionBuffers uses the same RGBA-shaped layout.
     {
         const ocean::InteractionBuffers ib = field.buffers();
-        const VkDeviceSize bytes = static_cast<VkDeviceSize>(ib.size) * ib.size *
-                                   4 * sizeof(float);
-        std::memcpy(static_cast<std::uint8_t*>(f.staging_mapped) +
-                        f.interaction_offset,
-                    ib.field, static_cast<std::size_t>(bytes));
+        put(f.interaction_offset, ib.field,
+            static_cast<std::size_t>(ib.size) * ib.size * 4);
+    }
+
+    {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - staging_start)
+                              .count();
+        GpuStat& st = staging_stat_;
+        if (st.count == 0) { st.min = ms; st.max = ms; }
+        else {
+            st.min = (ms < st.min) ? ms : st.min;
+            st.max = (ms > st.max) ? ms : st.max;
+        }
+        st.sum += ms;
+        ++st.count;
     }
 
     std::memcpy(f.uniform_mapped, &globals, sizeof(Globals));
@@ -843,7 +890,7 @@ void OceanView::record(VkContext& ctx, VkCommandBuffer cmd,
     for (std::size_t i = 0; i < level_count_; ++i) {
         LevelTextures& lvl = f.levels[i];
         const VkDeviceSize bytes = static_cast<VkDeviceSize>(level_sizes_[i]) *
-                                   level_sizes_[i] * 4 * sizeof(float);
+                                   level_sizes_[i] * 4 * comp_bytes_;
 
         // Transition both textures for the upload. The source layout is
         // UNDEFINED on the very first use (nothing to preserve) and

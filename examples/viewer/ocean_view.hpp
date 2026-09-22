@@ -68,9 +68,12 @@ public:
     // `rings` is the clipmap's ring count and `base_cell` ring 0's cell size
     // in metres; together they set both the near detail and the far range
     // (ADR-025). They are independent of cascade scale by design.
+    // `half_textures` picks RGBA16F over RGBA32F for the cascade and
+    // interaction textures, halving the per-frame upload (ADR-026). Exposed
+    // rather than hardcoded so the two can be measured against each other.
     bool init(VkContext& ctx, const std::vector<ocean::OceanDesc>& levels,
               std::uint32_t rings, float base_cell,
-              std::uint32_t interaction_size);
+              std::uint32_t interaction_size, bool half_textures);
     void shutdown(VkContext& ctx);
 
     // Copies every cascade level's buffers into this frame's textures and
@@ -105,6 +108,14 @@ public:
     }
     [[nodiscard]] const RingLayout& rings() const { return ring_layout_; }
 
+    // What one frame actually pushes across the bus, and what the CPU spends
+    // preparing it. The upload was the largest span in the frame after the
+    // clipmap landed, and neither half of its cost is guessable.
+    [[nodiscard]] VkDeviceSize upload_bytes() const { return upload_bytes_; }
+    [[nodiscard]] const GpuStat& staging_stat() const { return staging_stat_; }
+    void reset_staging_stat() { staging_stat_ = GpuStat{"staging"}; }
+    [[nodiscard]] bool half_textures() const { return half_textures_; }
+
 private:
     bool create_mesh(VkContext& ctx);
     bool create_props(VkContext& ctx);
@@ -116,6 +127,17 @@ private:
     std::array<std::uint32_t, kMaxCascades> level_sizes_{};
     std::uint32_t interaction_size_ = 0;
     bool          wireframe_       = false;
+
+    // --- upload format (ADR-026) -----------------------------------------
+    // RGBA16F halves the bytes crossing the bus; RGBA32F is what the library
+    // hands over untouched. `comp_bytes_` is the size of ONE component, and it
+    // is the single number every piece of staging arithmetic reads, so the two
+    // paths differ in exactly one place.
+    bool          half_textures_ = true;
+    VkFormat      texel_format_  = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkDeviceSize  comp_bytes_    = 2;
+    VkDeviceSize  upload_bytes_  = 0;
+    GpuStat       staging_stat_{"staging"};
 
     // --- clipmap (ADR-025) ------------------------------------------------
     RingLayout  ring_layout_{};
@@ -175,8 +197,8 @@ private:
         void*          staging_mapped = nullptr;
         std::array<VkDeviceSize, kMaxCascades> staging_offset{};
 
-        // The interaction field: one more RGBA32F texture, uploaded from the
-        // same persistently-mapped staging buffer.
+        // The interaction field: one more texture in the same format as the
+        // cascades, uploaded from the same persistently-mapped staging buffer.
         VkImage        interaction             = VK_NULL_HANDLE;
         VkDeviceMemory interaction_memory      = VK_NULL_HANDLE;
         VkImageView    interaction_view        = VK_NULL_HANDLE;

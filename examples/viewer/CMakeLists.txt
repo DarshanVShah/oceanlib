@@ -101,6 +101,13 @@ add_custom_target(ocean_viewer_shaders DEPENDS ${ALL_HEADERS})
 # for what it does and does not support.
 add_executable(gltf_bake tools/gltf_bake.cpp)
 
+# Not built by default and not run by the build: an exhaustive verifier for the
+# float->half conversion on the upload path (ADR-026), sweeping all 2^32 float
+# bit patterns to show the scalar and F16C paths agree with each other and with
+# the hardware. Seconds to run, so it is a thing you run when you touch
+# half.hpp, not a thing every build pays for.
+add_executable(half_check EXCLUDE_FROM_ALL tools/half_check.cpp half.cpp)
+
 set(OCEAN_BOAT_GLB "${CMAKE_SOURCE_DIR}/assets/gislinge_viking_boat (1).glb")
 set(OCEAN_BOAT_HDR "${OCEAN_SHADER_DIR}/boat_mesh.h")
 add_custom_command(
@@ -117,7 +124,18 @@ add_executable(ocean_viewer
   vk_context.cpp
   ocean_view.cpp
   clipmap.cpp
+  half.cpp
 )
+
+# half.cpp, and ONLY half.cpp, is built with AVX2 enabled.
+#
+# Confining the flag to one file is what lets the viewer still run on a CPU
+# that has no AVX at all: the CPUID check that guards these kernels lives in
+# half.hpp, which every other file compiles at the baseline, and half.hpp's
+# scalar path is what runs when the answer is no. Widening the flag to the
+# whole target would let the compiler emit AVX into that very check.
+set_source_files_properties(half.cpp PROPERTIES COMPILE_OPTIONS
+  "$<IF:$<BOOL:${MSVC}>,/arch:AVX2,-mavx2;-mf16c>")
 add_dependencies(ocean_viewer ocean_viewer_shaders ocean_viewer_boat_mesh)
 target_link_libraries(ocean_viewer PRIVATE ocean Vulkan::Vulkan glfw)
 target_include_directories(ocean_viewer PRIVATE
