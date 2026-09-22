@@ -137,6 +137,8 @@ Phases 0-4b are done. Frame budget at the default quality — clipmap LOD, MSAA
 | post   | 0.014 | 2% |
 | **total** | **0.721** | |
 
+After ADR-027's shading work the ocean pass is 0.272 ms and the total 0.811 ms.
+
 Plus 0.328 ms of CPU preparing the staging buffer, which is reported alongside
 because an optimisation that moves work between processors is not honestly
 described by a number from only one of them.
@@ -161,9 +163,15 @@ not sending what has not changed, and after that moving the FFT onto the GPU,
 which is a different project and would cost the library its bit-exactness
 across backends. Neither is worth doing before the quality work below.
 
-Remaining, in measured order: the prefiltered sky (4c), then SSR, shadows and
-the shading corrections — all of which are fragment work being charged
-against a seventh of the frame.
+**Phase 7's shading corrections are done** (ADR-027), pulled forward because
+they were what the picture actually needed: subsurface scattering, a complete
+microfacet BRDF, sun colour from the sky model, and the removal of a second
+sun that had been quietly defeating ADR-023. 0.09 ms, taking the frame to
+0.811 ms.
+
+Remaining, in measured order: the prefiltered sky (4c), then SSR and shadows —
+the boat still does not appear in the water it is floating in, which is now the
+most visible thing wrong with the image.
 
 `--msaa`, `--bloom`, `--tonemap`, `--rings` and `--fp32` each turn their
 feature off or down completely, so the tier machinery in Phase 9 already has

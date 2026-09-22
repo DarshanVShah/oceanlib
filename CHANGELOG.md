@@ -85,9 +85,38 @@ reflects, and gameplay queries see it. See ARCHITECTURE.md ADR-021.
   99.42% of colour channels are bit-identical to the fp32 path and 100% are
   within 1/255. `--fp32` is the A/B control, and the CPU-side fill is now
   reported next to the GPU spans.
+- **Subsurface scattering on the water** (ADR-027), following the Atlas water
+  model (Mihelich, GDC 2019). Backlit crests transmit light instead of
+  rendering as flat navy, factored into height, view-vs-sun and
+  face-vs-sun terms so the effect appears as you turn toward the sun and
+  vanishes as you turn away. Tinted green, because red is absorbed within
+  centimetres and blue scatters forward, so what comes back out is not the
+  colour that went in.
+- **A complete microfacet BRDF for the sun** (ADR-027): height-correlated Smith
+  visibility and a roughness-corrected Fresnel, where there had been a
+  distribution term alone. Fixes a horizon that stayed too bright however rough
+  it was made.
+- **The sun's colour comes from the sky model** (`sun_radiance`, ADR-027), so
+  the beam reddens and dims as it sets - in the water's specular and on the
+  boat, both of which previously used a hardcoded warm white while everything
+  around them went orange.
+- **Bicubic B-spline reconstruction of the cascade textures** in the band where
+  each one is being faded out (ADR-027). These textures have no mips, so the
+  reconstruction filter is the only thing band-limiting them under
+  minification: 6.7% less high-frequency energy in the far field for 3% of the
+  near field's detail, both measured.
 
 
 ### Fixed
+
+- **The water reflected two suns** (ADR-027). `sky_color()` draws a
+  mirror-sharp solar disc, the surface reflected it, and the GGX lobe added a
+  second highlight on top. Worse than a double-count: the sharp one won
+  wherever they disagreed, which silently defeated ADR-023 - the whole point of
+  driving roughness from sub-pixel slope variance is that the distant sun path
+  should broaden, and a mirror disc arriving through the reflection path is not
+  broadened by anything. The reflection now samples the sky without the disc,
+  and the direct beam exists only as the BRDF's light source.
 
 - **The persistent-foam alpha patch was costing ~0.9 ms of CPU per frame**
   (ADR-026), in code that had only ever been measured as part of a larger

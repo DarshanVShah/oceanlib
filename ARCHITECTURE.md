@@ -2502,3 +2502,155 @@ library its bit-exactness across backends.
 Nothing here touches the library. `tools/half_check.cpp` verifies the scalar
 and vector paths agree over all 2^32 float bit patterns, for both kernels; it
 is not in `tests/`, which is about the library and stays that way.
+
+---
+
+## ADR-027 - Water shading: scattering, a complete BRDF, and one sun
+
+Viewer-only. Phases 0-4b bought a frame budget; this spends some of it. The
+prompt was a comparison against [GodotOceanWaves][gow], whose lighting follows
+the Atlas water talk (Mihelich, *Wakes, Explosions and Lighting*, GDC 2019),
+and which does three things this renderer did not.
+
+[gow]: https://github.com/2Retr0/GodotOceanWaves
+
+Our simulation side is further along - a bit-exact CPU FFT, cascades, an iWave
+interaction field, advected foam - so what was worth taking was entirely in the
+shading, and it needed adapting rather than transcribing.
+
+### The water was opaque
+
+The clearest failure was a backlit sunset: every wave face turned away from the
+sun rendered as flat navy. Real water at that angle **glows**, because light
+enters the back of a crest, scatters, and leaves toward the eye. Without it the
+sea reads as a painted mirror, and no amount of work on the specular lobe fixes
+that, because the missing light is not specular.
+
+There was a subsurface term already, but it was keyed on
+`dot(-V, L) * 0.5 + 0.5`, which never reaches zero - so every wave in the scene
+carried a base glow regardless of where the sun was, and the effect read as a
+flat tint rather than as transmission. The Atlas factorisation is better
+because each factor is a thing that is physically true:
+
+- **height** - a taller crest is a longer path through water, and crests are
+  the only part thin enough to transmit at all.
+- **back** - `pow(max(dot(-V, L), 0), 4)`: the sun has to be behind the wave
+  from the eye's point of view. This is what makes the effect appear as you
+  turn toward the sun and vanish as you turn away.
+- **away** - `pow(max(0.5 - 0.5 * dot(L, N), 0), 3)`: the face is turned away
+  from the sun, so the light is arriving through the back of the wave rather
+  than reflecting off the front.
+
+Their product is near zero almost everywhere and large exactly on backlit
+crests. The outgoing light is tinted green, which is not an art choice: red is
+absorbed within centimetres and blue is scattered forward and largely keeps
+going, so what turns around and comes back out is biased to green.
+
+### There were two suns
+
+`sky_color()` draws a mirror-sharp solar disc on top of the scattered sky. The
+water reflected that **and** added its own GGX highlight, so every pixel had
+two suns in it, and the sharp one won wherever they disagreed.
+
+That is worse than double-counting, because it silently defeats ADR-023. The
+entire point of driving roughness from sub-pixel slope variance is that the
+distant sun path should broaden into a sheen; a mirror disc arriving through
+the reflection path is not broadened by anything, so the mechanism was being
+overridden precisely where it was supposed to act.
+
+The reflection now samples `sky_color_turbid()` - the environment without the
+disc - and the direct beam exists only as the BRDF's light source. One sun.
+
+### The specular lobe was a distribution, not a BRDF
+
+It was `D * 0.35 * NdotL`: no Fresnel, no geometry term. D alone says how many
+microfacets point at the half-vector and nothing about how many of those are
+shadowed by their neighbours or hidden from the eye. At the grazing angles that
+dominate a sea seen from near its own level that omission is most of the
+answer. Now the height-correlated Smith visibility (Heitz 2014) and a
+roughness-corrected Fresnel, which also stops the roughened horizon from
+turning into a hard white band - a rough surface never reaches a perfect
+grazing mirror, because some of its microfacets face the wrong way.
+
+One thing deliberately **not** copied: the reference calls its
+masking-shadowing function as `smith_masking_shadowing(roughness, dot_nv)`
+against a `(cos_theta, alpha)` signature, so its two arguments are swapped, and
+it passes roughness where the GGX derivation wants alpha.
+
+### The sun was the wrong colour
+
+`sun_radiance()` now derives the direct beam from the sky model, so it reddens
+and dims as the sun sets. Previously the sky went orange, the water's scattered
+light went orange, and the specular highlight - the one part of the image that
+should most obviously be the sun's colour - stayed a hardcoded warm white. The
+same constant was in `object.frag`, so the boat did not redden either.
+
+Its magnitude is a **tuned** constant and the comment says so. The tempting
+move is to derive it from the disc `sky_color()` already draws, so that the sun
+and its reflection agree by construction; that was the first value here and it
+made the sun road disappear. The reason is that the disc is not physically
+calibrated either - real solar radiance exceeds clear-zenith sky radiance by
+about five orders of magnitude, and in this renderer the ratio is 120, because
+that number was chosen to look right after tone mapping. Deriving one
+un-calibrated constant from another does not produce a physical one.
+
+### Bicubic filtering, and being wrong about why
+
+The cascades are 256x256 over patches of 800, 150 and 25 m, so the largest
+cascade's texels are 3.1 m across and the near field magnifies them hard. The
+textbook argument follows immediately: bilinear reconstructs a C0 surface, its
+slope steps at every texel boundary, and on something this specular those steps
+show as diamond faceting. A cubic B-spline is C2. So: bicubic under
+magnification.
+
+That is what the code said it did. It is not what the code did - the blend was
+built on `detail_fade`'s ratio, whose comment called it "texels per pixel" when
+it is the reciprocal, so the sense was inverted and bicubic was being applied
+under *minification* instead. The images improved anyway, which is the part
+worth recording, because it meant the explanation was wrong rather than the
+change.
+
+Measured on a fixed frame, high-frequency energy in a near band (where more is
+real detail) and a far band (where more is aliasing):
+
+| | near, higher better | far, lower better |
+|---|---|---|
+| bilinear everywhere | 0.972 | 8.298 |
+| **bicubic under minification** | 0.943 (-3%) | **7.743 (-6.7%)** |
+| bicubic under magnification | 0.867 (**-11%**) | 8.275 (-0.3%) |
+
+The textbook case loses badly: it costs 11% of the near field's detail and
+removes essentially no aliasing. The B-spline is *approximating*, not
+interpolating, so it blurs as well as smooths, and on an FFT surface - already
+band-limited by construction - the faceting it targets is not the dominant
+artifact. Under minification it wins, because these textures have **no mips**,
+so the reconstruction filter is the only thing band-limiting them and a wider
+kernel is a better low-pass.
+
+The metric cannot fully separate "detail" from "faceting" in the near band, so
+the 11% is an upper bound on what magnification-bicubic costs. It agrees with
+the picture, where that variant visibly waxes over the near water.
+
+It is also the cheaper choice, because the expensive path now covers the far
+field, which is a small part of the screen, rather than the near field, which
+is most of it. Cascades already faded to nothing skip the extra taps entirely -
+worth 0.14 ms, and provably free, since the output is bit-identical.
+
+### Measured
+
+Minimum over 500 frames, RTX 4070 Laptop at 1600x900, defaults:
+
+| span | before | after |
+|---|---|---|
+| ocean | 0.200 ms | 0.272 ms |
+| **frame total** | **0.721 ms** | **0.811 ms** |
+
+0.09 ms for scattering, a complete microfacet BRDF, sun colour that matches the
+sky and one fewer sun. The frame is still 2.7x faster than it was before any of
+the optimisation work, which is what that work was for.
+
+### What this does not do
+
+There is still no reflection of anything that is not sky: the boat does not
+appear in the water. Nothing casts a shadow. Both are the next phases, and both
+are now affordable.
