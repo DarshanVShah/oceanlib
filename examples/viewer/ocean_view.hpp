@@ -57,6 +57,20 @@ struct Globals {
     float     slope_var[4];      // x,y,z = mean-square slope of cascades 0,1,2
                                  // (both axes summed); w = the BRDF's own base
                                  // roughness, as alpha
+
+    // --- hull carve (ADR-028) --------------------------------------------
+    // The ocean is one continuous sheet, so it runs straight through an open
+    // boat and fills it. These describe the hull's waterline section in its
+    // own space, and the shader discards sea inside it.
+    vkm::Mat4 hull_inv_model;    // world -> hull local
+    float     hull_section[256]; // signed z bounds (lo, hi) on a 16 x 8
+                                 // (station, level) grid. MUST be read as
+                                 // vec4[64] in GLSL: std140 gives a float[] a
+                                 // 16-byte stride, so a float[256] there would
+                                 // be 4 KB, not 1 KB.
+    float     hull_params[4];    // x = hull half-length, 0 disables the carve;
+                                 // y = keel local Y, z = hull top local Y,
+                                 // w = unused
 };
 
 class OceanView {

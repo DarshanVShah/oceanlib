@@ -347,11 +347,20 @@ public:
     // offset is needed - unlike the old three-box hull, which needed a
     // separate offset per part because it had no single sculpted shape to
     // draw instead.
+    // The hull's world transform. Exposed because the ocean shader needs its
+    // inverse to carve the sea out of the boat's interior (ADR-028), and that
+    // carve has to ride the hull exactly - a hull-local test against a
+    // transform that is one frame stale shows as water sloshing through the
+    // planking as the boat rolls.
+    [[nodiscard]] vkm::Mat4 body() const
+    {
+        return vkm::translate(position) * vkm::rotate_y(yaw) *
+               vkm::rotate_z(pitch) * vkm::rotate_x(roll);
+    }
+
     void append(std::vector<PropInstance>& out) const
     {
-        const vkm::Mat4 body =
-            vkm::translate(position) * vkm::rotate_y(yaw) *
-            vkm::rotate_z(pitch) * vkm::rotate_x(roll);
+        const vkm::Mat4 body = this->body();
 
         auto add = [&](PropMesh mesh, float r, float g, float b, float translucency,
                        float band) {

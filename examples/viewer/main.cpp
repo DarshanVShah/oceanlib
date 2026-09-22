@@ -20,6 +20,8 @@
 //   --bloom F         bloom mix, 0 disables the chain (default 0.06)
 //   --fp32            upload cascades as RGBA32F instead of RGBA16F, which
 //                     doubles the bytes crossing the bus (the A/B for ADR-026)
+//   --no-hull-carve   let the ocean run through the boat's hull instead of
+//                     terminating at its waterline (the A/B for ADR-028)
 //   --msaa N          samples per pixel: 1, 2, 4 or 8 (default 4)
 //   --foam-decay R    foam decay rate, 1/s (default 0.30, half-life 2.3 s)
 //   --foam-gain G     how fast breaking injects foam, 1/s (default 4)
@@ -127,6 +129,9 @@ struct Options {
     // the frame after the clipmap landed and it is bandwidth-bound, so halving
     // the bytes is the whole optimisation (ADR-026).
     bool          half_textures = true;
+    // Carve the sea out of the hull's interior. On by default because without
+    // it the boat is simply full of water (ADR-028).
+    bool          hull_carve = true;
     // Samples per pixel for the scene pass. 4 is the usual sweet spot; the
     // device clamps anything it cannot do.
     std::uint32_t msaa = 4;
@@ -176,6 +181,7 @@ Options parse_args(int argc, char** argv)
         else if (a == "--no-slope-var")   o.no_slope_var = true;
         else if (a == "--bloom")   o.bloom = std::strtof(next(), nullptr);
         else if (a == "--fp32")    o.half_textures = false;
+        else if (a == "--no-hull-carve") o.hull_carve = false;
         else if (a == "--msaa")    o.msaa  = std::strtoul(next(), nullptr, 10);
         else if (a == "--tonemap") {
             const std::string m = next();
@@ -1098,6 +1104,24 @@ int main(int argc, char** argv)
         globals.water[1] = opt.tonemap;
         globals.water[2] = 0.0f;
         globals.water[3] = 0.0f;
+
+        // The hull carve (ADR-028). The inverse of the SAME transform the
+        // boat is drawn with, taken this frame: a stale one shows as the sea
+        // cutting through the planking as the hull rolls.
+        {
+            globals.hull_inv_model = vkm::inverse(boat.body());
+            static_assert(viewer::boat_mesh::kSectionStations *
+                              viewer::boat_mesh::kSectionLevels * 2 == 256,
+                          "the shader's section lookup is hardcoded to 16 x 8 pairs");
+            for (std::size_t i = 0; i < 256; ++i) {
+                globals.hull_section[i] = viewer::boat_mesh::kHullSection[i];
+            }
+            globals.hull_params[0] =
+                opt.hull_carve ? viewer::boat_mesh::kHalfExtent[0] : 0.0f;
+            globals.hull_params[1] = -viewer::boat_mesh::kHalfExtent[1];
+            globals.hull_params[2] = viewer::boat_mesh::kHalfExtent[1];
+            globals.hull_params[3] = 0.0f;
+        }
 
         const ocean::InteractionBuffers ib = field.buffers();
         globals.interaction[0] = ib.origin_x;

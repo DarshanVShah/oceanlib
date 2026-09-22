@@ -25,6 +25,13 @@ layout(location = 0) out vec4 outColor;
 
 void main()
 {
+    // Before anything else: the sea does not exist inside the boat.
+    //
+    // Discarding costs this draw its early-Z, which is why it is worth
+    // measuring rather than assuming - see ADR-028. It is first in the shader
+    // so that the fragments it rejects pay for nothing else.
+    if (hull_carves(vWorld)) discard;
+
     vec3 L = normalize(g.sunDir.xyz);
     vec3 V = normalize(g.camPos.xyz - vWorld);
 

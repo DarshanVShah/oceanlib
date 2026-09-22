@@ -49,7 +49,80 @@ layout(set = 0, binding = 0) uniform Globals {
                        // summed - a property of the SPECTRUM, so it is
                        // measured once per sea state rather than per frame;
                        // w   = the BRDF's base roughness, as GGX alpha
+
+    mat4 hullInvModel;    // world -> hull local (ADR-028)
+    vec4 hullSection[64]; // signed z bounds (lo, hi) per cell of a 16 x 8
+                          // (station, level) grid - signed because the hull is
+                          // not symmetric about its box centreline
+    vec4 hullParams;      // x = hull half-length (0 disables the carve),
+                          // y = keel local Y, z = hull top local Y
 } g;
+
+vec2 hull_z_bounds_at(int station, int level)
+{
+    int i = (station * 8 + level) * 2;
+    int j = i + 1;
+    return vec2(g.hullSection[i >> 2][i & 3], g.hullSection[j >> 2][j & 3]);
+}
+
+// True where the ocean should not be drawn because the hull is there.
+//
+// The sea is one continuous sheet and the boat is an OPEN hull, so without
+// this the surface runs straight through the planking and the boat is full of
+// water to its gunwales. A decked hull would hide that behind its own deck;
+// this one has nothing to hide it with.
+//
+// The test is the hull's waterline section, in hull space, which is exactly
+// the curve the water plane cuts on the hull - so the sea terminates where it
+// physically would. Bounded in Y as well as in the section, and that bound is
+// what keeps it honest at attitude: when the bow lifts clear, the water under
+// it falls below the keel and is drawn again, instead of leaving a hole in the
+// sea in the shape of a boat. Likewise water above the hull's top is drawn,
+// so a swamped boat is under the sea rather than inside a bubble in it.
+bool hull_carves(vec3 worldPos)
+{
+    float halfLen = g.hullParams.x;
+    if (halfLen <= 0.0) return false;
+
+    vec3  local = (g.hullInvModel * vec4(worldPos, 1.0)).xyz;
+    float keelY = g.hullParams.y, topY = g.hullParams.z;
+    if (local.y <= keelY || local.y >= topY) return false;
+    if (abs(local.x) >= halfLen) return false;
+
+    // Bilinear lookup into the baked section table: the hull's own half-beam
+    // at this station and this height. 16 stations over a 9 m hull is one
+    // every 60 cm and 8 levels over 1.4 m is one every 20 cm, and the section
+    // varies smoothly between them, so linear is well inside the error the
+    // mesh already carries.
+    float u = (local.x + halfLen) / (2.0 * halfLen) * 15.0;
+    float v = (local.y - keelY) / max(topY - keelY, 1e-4) * 7.0;
+
+    float su = floor(u), sv = floor(v);
+    int   s0 = clamp(int(su), 0, 15), s1 = min(s0 + 1, 15);
+    int   l0 = clamp(int(sv), 0, 7),  l1 = min(l0 + 1, 7);
+    float fu = u - su, fv = v - sv;
+
+    vec2 zb = mix(mix(hull_z_bounds_at(s0, l0), hull_z_bounds_at(s1, l0), fu),
+                  mix(hull_z_bounds_at(s0, l1), hull_z_bounds_at(s1, l1), fu), fv);
+
+    // Inset, and deliberately biased to carve slightly LESS than the hull.
+    //
+    // The two failure modes are not symmetric. Carving a little too little
+    // leaves a sliver of sea in the turn of the bilge, which on an open boat
+    // reads as water shipped aboard - plausible, and arguably true. Carving a
+    // little too much opens a hole in the sea with sky behind it, which reads
+    // as a bug, because it is one.
+    //
+    // Too much happens more easily than the footprint suggests. A view ray
+    // that enters the hull just inside the near sheer runs nearly tangent to
+    // the inner planking and can pass the whole length of an OPEN hull and out
+    // over the bow without ever meeting geometry - so the carved water under
+    // it has nothing behind it. The inset pulls the volume inside the planking
+    // far enough that those grazing rays land on wood.
+    const float kInset = 0.90;
+    return local.z > zb.x * kInset && local.z < zb.y * kInset;
+}
+
 
 // How much of a cascade survives at this distance, in [0,1].
 //
