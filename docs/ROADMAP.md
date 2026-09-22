@@ -169,6 +169,9 @@ microfacet BRDF, sun colour from the sky model, and the removal of a second
 sun that had been quietly defeating ADR-023. 0.09 ms, taking the frame to
 0.811 ms.
 
+The boat no longer sails full of water (ADR-028): the ocean carves itself away
+inside the hull, for no measurable cost.
+
 Remaining, in measured order: the prefiltered sky (4c), then SSR and shadows —
 the boat still does not appear in the water it is floating in, which is now the
 most visible thing wrong with the image.

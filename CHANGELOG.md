@@ -105,9 +105,19 @@ reflects, and gameplay queries see it. See ARCHITECTURE.md ADR-021.
   reconstruction filter is the only thing band-limiting them under
   minification: 6.7% less high-frequency energy in the far field for 3% of the
   near field's detail, both measured.
+- **`gltf_bake` emits the hull's section** as a 16 x 8 grid of signed z bounds
+  from keel to sheer, alongside the waterline it already computed (ADR-028).
 
 
 ### Fixed
+
+- **The sea ran straight through the boat and filled it** (ADR-028). The ocean
+  is one continuous sheet and the demo hull is open, so from any camera high
+  enough to look into the boat it was full of water to the gunwales - and depth
+  testing cannot help, because that water really is nearer the eye than the
+  hull's inner bottom. The ocean shader now discards inside a volume read from
+  the hull's own baked section. Free: the ocean pass measures 0.270 ms with the
+  carve against 0.291 without. `--no-hull-carve` restores the old behaviour.
 
 - **The water reflected two suns** (ADR-027). `sky_color()` draws a
   mirror-sharp solar disc, the surface reflected it, and the GGX lobe added a

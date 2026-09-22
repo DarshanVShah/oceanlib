@@ -2654,3 +2654,108 @@ the optimisation work, which is what that work was for.
 There is still no reflection of anything that is not sky: the boat does not
 appear in the water. Nothing casts a shadow. Both are the next phases, and both
 are now affordable.
+
+---
+
+## ADR-028 - The sea does not go inside the boat
+
+Viewer-only. The ocean is one continuous displaced sheet and the demo boat is
+an **open** hull, so the sheet ran straight through the planking and the boat
+sailed full of water to its gunwales. A decked hull would hide this behind its
+own deck; a faering has nothing to hide it with, and from any camera high
+enough to look down into the boat it was the most obviously wrong thing in the
+frame.
+
+Depth testing cannot fix it. Looking down into an open boat, the water surface
+inside is genuinely nearer the eye than the hull's inner bottom, so it wins the
+depth test by being where it actually is. The water is not in the wrong place;
+it is water that should not exist.
+
+### A water exclusion volume
+
+The standard answer, and the one used here: the ocean shader tests each
+fragment against a volume in the hull's own space and discards inside it. The
+volume is the hull's own shape, read out of the mesh at bake time as a
+16 x 8 grid of signed z bounds - station along the length, level from keel to
+sheer. `gltf_bake` already had the hull-shell vertices for its waterline
+calculation, so this costs nothing at runtime and no new asset.
+
+Bounded in Y as well as in section, and that bound is what keeps it honest at
+attitude. When the bow lifts clear of a wave, the water under it falls below
+the keel and is drawn again rather than leaving a boat-shaped hole in the sea;
+when a wave washes above the sheer, that water is drawn too, so a swamped boat
+is under the sea rather than inside a bubble in it.
+
+### Three wrong shapes before the right one
+
+The section table is a table because two cheaper ideas failed, and the failures
+are worth recording because each looked fine until the boat moved.
+
+**A waterline profile, used at every depth.** One half-beam per station, taken
+at the waterline. Invisible while the boat sits level, because the sea is then
+*at* the waterline where the profile is exact. The hull lifts on a crest, the
+sea under it is well below the waterline, the profile is far wider than the
+hull is down there, and a wedge of sky opens alongside the planking.
+
+**The same, tapered by `sqrt(depth)`.** A round-bilge approximation. This hull
+is sharp-bilged, so `sqrt` is still far too fat near the keel; the wedge got
+smaller and stayed.
+
+**A symmetric half-beam per cell.** The artifact appeared on one side of the
+hull and not the other, which suggested the hull was asymmetric about its
+bounding box's centreline - plausible, since a faering carries its steering oar
+on one quarter. Measuring it reported an asymmetry of **0.000 m**: the
+hypothesis was wrong. The bounds are stored signed anyway, because it costs
+512 bytes and removes an assumption that merely happens to hold for this hull,
+but it fixed nothing and is not why the artifact went away.
+
+What actually remained was **grazing rays**. A view ray entering just inside
+the near sheer runs nearly tangent to the inner planking and, in an open hull,
+can pass the whole length of the boat and out over the bow without ever meeting
+geometry - so the carved water under it has nothing behind it and the sky shows
+through. The volume is therefore inset to 0.90 of the hull's own bounds, which
+pulls it inside the planking far enough that those rays land on wood, and the
+end stations are forced to a point, because the stem and stern are knife edges
+and the gap-filling pass had been handing them their neighbour's beam.
+
+**The two failure modes are not symmetric, and the inset is chosen on that.**
+Carving slightly too little leaves a sliver of sea in the turn of the bilge,
+which on an open boat reads as water shipped aboard - plausible, and arguably
+true. Carving slightly too much opens a hole in the sea with sky behind it,
+which reads as a bug, because it is one. So the volume is biased small.
+
+### What made the difference was rendering it, not reasoning about it
+
+Four hypotheses were wrong before the right one, and each was argued from the
+geometry rather than looked at. What ended it was two renders that removed the
+ambiguity instead of adding to it: colouring carved fragments instead of
+discarding them, and a plan view straight down, where the carve footprint has
+to match the hull's outline and any error is unmissable. The plan view showed
+the footprint was correct all along - which is what redirected the search from
+the volume's shape to what was behind it.
+
+### Measured
+
+Minimum over 500 frames, RTX 4070 Laptop at 1600x900:
+
+| | ocean pass | frame total |
+|---|---|---|
+| no carve | 0.291 ms | 0.806 ms |
+| carve | **0.270 ms** | **0.808 ms** |
+
+Free, and the ocean pass is if anything faster for shading fewer fragments.
+The `discard` costs this draw its early-Z, which was the reason to measure
+rather than assume - it does not show, because the test is the first thing in
+the shader and the ocean already draws before the props, so there was little
+early rejection to lose.
+
+`--no-hull-carve` restores the flooded behaviour.
+
+### What this does not do
+
+It is one hull, wired to one boat. A scene with several floating objects wants
+this as a list of volumes rather than a single uniform block, which is a
+different piece of plumbing and not worth building for one boat. It also
+carves a hard edge: MSAA antialiases the silhouette of the hull but not the
+carve boundary, since `discard` rejects every sample in a fragment. At the
+inset used the boundary is under the planking, so nothing sees it.
